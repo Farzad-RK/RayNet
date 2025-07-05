@@ -235,9 +235,106 @@ shutil.copytree('output', '/content/drive/MyDrive/headpose_output_backup', dirs_
 
 ---
 
-## 7. Evaluation & Benchmarking
+## 7. Testing the Model
 
-### 7.1 Performance Comparison on AFLW2000 Dataset
+### 7.1 Prerequisites
+
+1. Clone this repository:
+   ```bash
+   git clone https://github.com/Farzad-RK/headpose-estimation.git
+   cd headpose-estimation
+   ```
+
+2. Install the required dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. Download the pre-trained model weights (`.tar` file) to your working directory.
+
+### 7.2 Testing on AFLW2000-3D
+
+1. **Prepare the dataset**:
+   - Download the AFLW2000-3D dataset
+   - Extract it to `sixdrepnet/datasets/AFLW2000/`
+   - Generate the file list:
+     ```bash
+     python sixdrepnet/create_filename_list.py --root_dir sixdrepnet/datasets/AFLW2000/
+     ```
+
+2. **Run the test script**:
+   ```bash
+   python sixdrepnet/test.py \
+     --gpu 0 \
+     --data_dir sixdrepnet/datasets/AFLW2000 \
+     --filename_list sixdrepnet/datasets/AFLW2000/files.txt \
+     --snapshot /path/to/your/model_weights.tar \
+     --batch_size 64 \
+     --dataset AFLW2000 \
+     --backbone_type repnext
+   ```
+
+### 7.3 Testing on BIWI
+
+**Important Note:** The BIWI dataset is no longer publicly available. Researchers need to contact the original authors to request access. The following instructions are provided for reference in case you obtain the dataset through official channels.
+
+1. **Prepare the dataset** (if you have access):
+   - Contact the BIWI dataset authors for access
+   - Extract the dataset to `sixdrepnet/datasets/BIWI`
+   - Preprocess the dataset (resize to 256x256):
+     ```bash
+     python TYY_create_db_biwi.py --db sixdrepnet/datasets/BIWI --output sixdrepnet/datasets/BIWI_256_noTrack.npz --img_size 256
+     ```
+     *Note: The preprocessing script is available in the [FSA-Net repository](https://github.com/shamangary/FSA-Net/blob/master/data/TYY_create_db_biwi.py)*
+
+2. **Run the test script**:
+   ```bash
+   python sixdrepnet/test.py \
+     --gpu 0 \
+     --data_dir sixdrepnet/datasets/BIWI \
+     --filename_list sixdrepnet/datasets/BIWI_256_noTrack.npz \
+     --snapshot /path/to/your/model_weights.tar \
+     --batch_size 64 \
+     --dataset BIWI \
+     --backbone_type repnext
+   ```
+
+### 7.4 Google Colab Setup (Optional)
+
+For running tests in Google Colab:
+
+1. Mount your Google Drive:
+   ```python
+   from google.colab import drive
+   drive.mount('/content/drive')
+   ```
+
+2. Clone the repository and navigate to it:
+   ```bash
+   !git clone https://github.com/Farzad-RK/headpose-estimation.git
+   %cd headpose-estimation
+   ```
+
+3. Copy your model weights:
+   ```python
+   !cp /content/drive/MyDrive/path/to/your/model_weights.tar .
+   ```
+
+4. Follow the testing instructions above, adjusting paths as needed for Colab.
+
+### 7.5 Alternative Datasets
+
+Since BIWI is no longer publicly available, consider these alternative datasets for head pose estimation:
+- **AFLW2000** (included in testing)
+- **300W-LP** (used for training)
+- **AFLW** (Annotated Facial Landmarks in the Wild)
+- **Head Pose Image Database** (Pointing'04)
+
+---
+
+## 8. Evaluation & Benchmarking
+
+### 8.1 Performance Comparison on AFLW2000 Dataset
 
 | Model | Yaw (°) | Pitch (°) | Roll (°) | MAE (°) | Params (M) | Latency (ms) | Device |
 |-------|---------|-----------|----------|---------|------------|--------------|--------|
@@ -265,7 +362,7 @@ shutil.copytree('output', '/content/drive/MyDrive/headpose_output_backup', dirs_
 [6] King, D. E. "Dlib-ml: A Machine Learning Toolkit." JMLR 2009.
 [7] Su, Qilin, et al. "RepNeXt: Multi-Scale Reparameterized CNNs for Mobile Vision." arXiv preprint arXiv:2406.16004 (2024).
 
-### 7.2 Evaluation Protocol
+### 8.2 Evaluation Protocol
 
 To evaluate the model:
 
@@ -273,7 +370,7 @@ To evaluate the model:
 2. Run the evaluation script to compute MAE for yaw, pitch, and roll angles.
 3. The evaluation follows the same protocol as the original [6DRepNet evaluation](https://github.com/thohemp/6DRepNet).
 
-### 7.3 Metrics
+### 8.3 Metrics
 
 Key metrics for benchmarking:
 - **MAE (degrees)**: Mean Absolute Error for yaw, pitch, and roll angles
@@ -286,7 +383,7 @@ Key metrics for benchmarking:
 
 ---
 
-## 8. Contributions
+## 9. Contributions
 
 * First integration of RepNeXt-M4 into 6DRepNet pipeline
 * Establishes a new mobile-efficient SOTA for head pose estimation
@@ -295,7 +392,7 @@ Key metrics for benchmarking:
 
 ---
 
-## 9. References
+## 10. References
 
 * [6DRepNet: Category-Level 6D Pose Estimation via Rotation Representation and Geodesic Loss](https://arxiv.org/pdf/2502.14061)
 * [6DRepNet Official Repo](https://github.com/thohemp/6DRepNet)
@@ -315,7 +412,7 @@ Key metrics for benchmarking:
 
 ---
 
-## 10. Diagrams
+## 11. Diagrams
 
 ### Fig. 1. Pipeline Comparison
 
@@ -349,7 +446,7 @@ Input
 
 ---
 
-## 11. Changelog
+## 12. Changelog
 
 * **Added**: `SixDRepNet_RepNeXt` class and RepNeXt support in `model.py`
 * **Updated**: `train.py` to support backbone selection (`repvgg`/`repnext`) and custom weights path
@@ -358,7 +455,7 @@ Input
 
 ---
 
-## 12. How to Cite
+## 13. How to Cite
 
 If you use this code or findings, please cite the following:
 
@@ -379,7 +476,7 @@ If you use this code or findings, please cite the following:
 
 ---
 
-## 13. Contact & Acknowledgements
+## 14. Contact & Acknowledgements
 
 * For questions or collaboration, open an issue or contact the maintainers.
 * **Acknowledgements**: This project builds on the codebases and datasets of [6DRepNet](https://github.com/thohemp/6DRepNet) and [RepNeXt](https://github.com/suous/RepNeXt), as well as all original dataset providers.
