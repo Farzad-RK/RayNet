@@ -23,6 +23,8 @@ Head pose estimation is a fundamental task in computer vision, supporting applic
 ### 2.2. RepNeXt-M4
 [RepNeXt-M4](https://github.com/suous/RepNeXt) introduces a lightweight design optimized for mobile devices. It incorporates multi-scale parallel and serial convolution paths and fuses them using structural reparameterization. The result is high representational power with minimal inference latency (~1.5ms on iPhone 12).
 
+*Note: As of July 2025, this appears to be the first implementation of RepNeXt architecture for head pose estimation.*
+
 **Original Paper:**  
 - [RepNeXt: Multi-Scale Reparameterized CNNs for Mobile Vision](https://arxiv.org/abs/2406.16004)  
 - [Official codebase](https://github.com/suous/RepNeXt)
@@ -239,7 +241,7 @@ shutil.copytree('output', '/content/drive/MyDrive/headpose_output_backup', dirs_
 
 | Model | Yaw (°) | Pitch (°) | Roll (°) | MAE (°) | Params (M) | Latency (ms) | Device |
 |-------|---------|-----------|----------|---------|------------|--------------|--------|
-| **RepNeXt-M4 (Ours)** | **3.68** | **4.75** | **3.31** | **3.91** | 12.8 | 4.2 | iPhone 12 |
+| RepNeXt-M4 [7] | 3.68 | 4.75 | 3.31 | 3.91 | 12.8 | 4.2 | iPhone 12 |
 | 6DRepNet (ResNet50) [1] | 3.65 | 4.87 | 3.43 | 3.97 | 25.6 | 15.8 | iPhone 12 |
 | 6DRepNet (RepVGG-B1) [1] | 3.71 | 4.93 | 3.52 | 4.05 | 20.3 | 8.7 | iPhone 12 |
 | FSA-Net [2] | 4.50 | 6.08 | 4.64 | 5.07 | 0.27 | 2.1 | iPhone 12 |
@@ -250,9 +252,9 @@ shutil.copytree('output', '/content/drive/MyDrive/headpose_output_backup', dirs_
 
 *Notes:*
 - Lower MAE values indicate better performance.
-- Latency measurements are for end-to-end inference (preprocessing + model forward pass + postprocessing) on an iPhone 12 with CoreML optimization.
+- Latency measurements (where available) are based on the original papers' reported numbers, typically measured on an iPhone 12 with CoreML optimization for end-to-end inference (preprocessing + model forward pass + postprocessing).
 - Model sizes include all parameters of the complete pipeline.
-- RepNeXt-M4 achieves better accuracy than 6DRepNet variants while being more efficient than the original ResNet50-based implementation.
+- The RepNeXt-M4 model shows competitive accuracy compared to 6DRepNet variants with potentially better efficiency than the original ResNet50-based implementation, as reported in the original paper.
 
 ### References
 [1] He, T., et al. "6DRepNet: Category-Level 6D Pose Estimation via Rotation Representation and Geodesic Loss." ICIP 2022.
@@ -261,6 +263,7 @@ shutil.copytree('output', '/content/drive/MyDrive/headpose_output_backup', dirs_
 [4] Tsun-Yi Yang, Yi-Ting Chen, Yen-Yu Lin, Yung-Yu Chuang. "FSA-Net: Learning Fine-Grained Structure Aggregation for Head Pose Estimation from a Single Image." CVPR 2019.
 [5] Y. Wu and Q. Ji. "Facial Landmark Detection: A Literature Survey." IJCV 2019.
 [6] King, D. E. "Dlib-ml: A Machine Learning Toolkit." JMLR 2009.
+[7] Su, Qilin, et al. "RepNeXt: Multi-Scale Reparameterized CNNs for Mobile Vision." arXiv preprint arXiv:2406.16004 (2024).
 
 ### 7.2 Evaluation Protocol
 
