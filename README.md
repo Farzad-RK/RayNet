@@ -408,7 +408,6 @@ Key metrics for benchmarking:
 
 * [300W-LP Dataset](http://www.cbsr.ia.ac.cn/users/xiangyuzhu/projects/3DDFA/main.htm)
 * [AFLW2000 Dataset](http://www.cbsr.ia.ac.cn/users/xiangyuzhu/projects/3DDFA/main.htm)
-* [BIWI Dataset (Kaggle)](https://www.kaggle.com/datasets/kmader/biwi-kinect-head-pose-database)
 
 ---
 
