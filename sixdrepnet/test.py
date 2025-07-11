@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from model import SixDRepNet, SixDRepNet_RepNeXt
-from backbone.repnext import repnext_m4  # Import your RepNeXt backbone
+from shared.backbone.repnext import repnext_m4  # Import your RepNeXt backbone
 import utils
 import datasets
 

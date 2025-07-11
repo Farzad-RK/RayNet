@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 import datasets
-from backbone.repnext import repnext_m4
+from shared.backbone.repnext import repnext_m4
 from loss import GeodesicLoss
 from model import SixDRepNet, SixDRepNet_RepNeXt
 

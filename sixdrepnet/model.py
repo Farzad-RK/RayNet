@@ -3,12 +3,12 @@ import math
 import torch
 from torch import nn
 
-from backbone.repvgg import get_RepVGG_func_by_name
+from shared.backbone.repvgg import get_RepVGG_func_by_name
 import utils
 
 # Import repnext architectures
-from backbone.repnext import repnext_m0, repnext_m1, repnext_m2, repnext_m3, repnext_m4, repnext_m5
-from backbone.repnext_utils import replace_batchnorm
+from shared.backbone.repnext import repnext_m0, repnext_m1, repnext_m2, repnext_m3, repnext_m4, repnext_m5
+from shared.backbone.repnext_utils import replace_batchnorm
 
 
 class SixDRepNet(nn.Module):

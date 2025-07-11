@@ -2,7 +2,7 @@ import argparse
 
 import torch
 
-from backbone.repvgg import repvgg_model_convert
+from shared.backbone.repvgg import repvgg_model_convert
 from model import SixDRepNet
 
 parser = argparse.ArgumentParser(description='SixDRepNet Conversion')
