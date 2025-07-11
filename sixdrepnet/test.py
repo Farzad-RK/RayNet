@@ -69,7 +69,12 @@ if __name__ == '__main__':
                            deploy=True,
                            pretrained=False)
     elif args.backbone_type == 'repnext':
-        model = SixDRepNet_RepNeXt(backbone_fn=repnext_m4, pretrained=False, deploy=True)
+        model = SixDRepNet_RepNeXt(
+            model_type=args.model_type,
+            pretrained=False,
+            deploy=True,
+            backbone_weights_path=args.backbone_weights
+        )
         model = model.cuda(gpu)
         if args.backbone_weights:
             jit_model = torch.jit.load(args.backbone_weights, map_location=f"cuda:{gpu}")

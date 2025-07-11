@@ -55,6 +55,7 @@ def parse_args():
     parser.add_argument('--backbone_weights', type=str, default='RepVGG-B1g2-train.pth',
                         help='Path to the backbone weights file (.pth for repvgg, .pt for repnext)')
 
+
     args = parser.parse_args()
     return args
 
@@ -91,7 +92,12 @@ if __name__ == '__main__':
                            deploy=False,
                            pretrained=True)
     elif args.backbone_type == 'repnext':
-        model = SixDRepNet_RepNeXt(backbone_fn=repnext_m4, pretrained=False, deploy=True)
+        model = SixDRepNet_RepNeXt(
+            model_type=args.model_type,
+            pretrained=False,
+            deploy=True,
+            backbone_weights_path=args.backbone_weights
+        )
         model = model.cuda(args.gpu_id)
         jit_model = torch.jit.load(args.backbone_weights, map_location=f"cuda:{args.gpu_id}")
         state_dict = jit_model.state_dict()

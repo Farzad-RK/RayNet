@@ -7,7 +7,7 @@ from backbone.repvgg import get_RepVGG_func_by_name
 import utils
 
 # Import repnext architectures
-from backbone.repnext import repnext_m0, repnext_m1, repnext_m2, repnext_m3, repnext_m4, repnext_m5
+import backbone.repnext as repnext
 from backbone.repnext_utils import replace_batchnorm
 
 
@@ -130,12 +130,15 @@ class SixDRepNet_RepNeXt(nn.Module):
 
     def __init__(
             self,
-            backbone_fn=repnext_m4,  # Function or class constructor for the RepNeXt variant to use
+            model_type="repnext_m4",  # e.g., "repnext_m4", "repnext_m5"
             pretrained=False,  # If True, load ImageNet-pretrained weights (if available)
             deploy=False,  # If True, fuse BN layers for inference efficiency
             backbone_weights_path=None  # Optional: path to a fused backbone (e.g., torch.jit.load)
     ):
         super(SixDRepNet_RepNeXt, self).__init__()
+
+        # Dynamically get the model function from repnext
+        backbone_fn = getattr(repnext, model_type)
 
         # 1. Instantiate the backbone with num_classes=0 to disable the default classifier head.
         self.backbone = backbone_fn(pretrained=pretrained, num_classes=0)
