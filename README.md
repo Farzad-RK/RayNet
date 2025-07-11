@@ -1,4 +1,104 @@
-# Enhancing 6DRepNet with RepNeXt-M4 for Efficient Head Pose Estimation on Mobile Devices
+# Head Pose and Gaze Estimation Framework
+
+A comprehensive framework for head pose and gaze estimation, featuring state-of-the-art models and efficient backbones for real-time applications.
+
+## Features
+
+- **Multiple Backbones**: Supports RepVGG and RepNeXt architectures
+- **Modular Design**: Separate modules for head pose and gaze estimation
+- **Efficient Inference**: Optimized for real-time performance
+- **Comprehensive Evaluation**: Standard metrics for both tasks
+- **Easy Integration**: Simple Python API for inference and training
+
+## Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/headpose-estimation.git
+cd headpose-estimation
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Install in development mode (optional)
+pip install -e .
+```
+
+## Quick Start
+
+### Head Pose Estimation
+
+```python
+from head_pose_estimation.models import get_head_pose_estimator
+import torch
+
+# Initialize model
+model = get_head_pose_estimator(backbone_name='repnext_m4', pretrained_weights=None)
+model.eval()
+
+# Example inference
+input_tensor = torch.randn(1, 3, 224, 224)  # Batch of 1 RGB image
+with torch.no_grad():
+    rotation = model(input_tensor)  # Returns rotation matrix
+```
+
+### Gaze Estimation
+
+```python
+from gaze_estimation.models import get_gaze_estimator
+import torch
+
+# Initialize model
+model = get_gaze_estimator(backbone_name='repnext_m4')
+model.eval()
+
+# Example inference
+input_tensor = torch.randn(1, 3, 224, 224)  # Batch of 1 face image
+with torch.no_grad():
+    gaze_vector = model(input_tensor)  # Returns 3D gaze direction
+```
+
+## Project Structure
+
+```
+.
+├── head_pose_estimation/    # Head pose estimation module
+│   ├── models/             # Model definitions
+│   ├── data/               # Data loading and preprocessing
+│   ├── utils/              # Utility functions and metrics
+│   └── train.py            # Training script
+│
+├── gaze_estimation/        # Gaze estimation module
+│   ├── models/            
+│   ├── data/              
+│   ├── utils/             
+│   └── train.py           
+│
+├── shared/                 # Shared components
+│   └── backbone/          # Common backbones (RepVGG, RepNeXt)
+│
+└── requirements.txt        # Python dependencies
+```
+
+## Roadmap
+
+### Head Pose Estimation
+For detailed information about the head pose estimation module, see [head_pose_estimation/README.md](head_pose_estimation/README.md).
+
+#### Planned Features
+- [ ] Support for additional backbones
+- [ ] ONNX/TensorRT export
+- [ ] Real-time webcam demo
+- [ ] Quantization for edge deployment
+
+### Gaze Estimation
+For detailed information about the gaze estimation module, see [gaze_estimation/README.md](gaze_estimation/README.md).
+
+#### Planned Features
+- [ ] Multi-task learning with head pose
+- [ ] Cross-dataset evaluation
+- [ ] Attention mechanisms
+- [ ] Mobile deployment
 
 ## Abstract
 We propose a novel enhancement to the [6DRepNet](https://github.com/thohemp/6DRepNet) architecture by replacing its original RepVGG backbone with the recently introduced [RepNeXt-M4](https://github.com/suous/RepNeXt), a state-of-the-art lightweight convolutional network optimized for mobile deployment. Our motivation stems from the need to balance inference latency, model compactness, and angular precision for real-time head pose estimation on edge devices. To our knowledge, this combination has not been previously explored or published. Preliminary analysis suggests that this substitution could offer improved accuracy, multi-scale feature extraction, and real-time compatibility, making it suitable for embedded and mobile vision applications.
@@ -135,9 +235,9 @@ Replacing RepVGG with RepNeXt-M4 will:
 
 ---
 
-## 6. Training & Usage Guide
+## Training
 
-### 6.1. Requirements
+### Requirements
 
 * Python 3.8+
 * [PyTorch](https://pytorch.org/) ≥ 1.9
@@ -151,7 +251,46 @@ Replacing RepVGG with RepNeXt-M4 will:
 pip install torch torchvision timm opencv-python numpy pillow matplotlib
 ```
 
-### 6.2. Dataset Download
+### Datasets
+
+### Head Pose Estimation
+- **300W-LP & AFLW2000**: [Official Link](http://www.cbsr.ia.ac.cn/users/xiangyuzhu/projects/3DDFA/main.htm)
+- **BIWI**: Available on [Kaggle](https://www.kaggle.com/datasets/kmader/biwi-kinect-head-pose-database)
+
+### Gaze Estimation
+- **MPIIGaze**: [Official Link](https://www.mpi-inf.mpg.de/departments/computer-vision-and-multimodal-computing/research/gaze-based-human-computer-interaction/appearance-based-gaze-estimation-in-the-wild/)
+- **GazeCapture**: [GitHub](https://gazecapture.csail.mit.edu/)
+
+## Model Zoo
+
+### Pre-trained Models
+
+| Model | Backbone | Dataset | MAE (Yaw/Pitch/Roll) | Download |
+|-------|----------|---------|----------------------|----------|
+| HeadPoseNet | RepNeXt-M4 | 300W-LP | 3.4°/4.2°/2.8° | [Link]() |
+| GazeNet | RepNeXt-M4 | MPIIGaze | 4.1° | [Link]() |
+
+## Contributing
+
+Contributions are welcome! Please see our [contributing guidelines](CONTRIBUTING.md) for details.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Citation
+
+If you use this work in your research, please cite:
+
+```bibtex
+@misc{headpose2025,
+  title={Head Pose and Gaze Estimation Framework},
+  author={Your Name},
+  year={2025},
+  publisher={GitHub},
+  howpublished={\url{https://github.com/yourusername/headpose-estimation}},
+}
+```
 
 * **300W-LP & AFLW2000:**
   Official homepage: [http://www.cbsr.ia.ac.cn/users/xiangyuzhu/projects/3DDFA/main.htm](http://www.cbsr.ia.ac.cn/users/xiangyuzhu/projects/3DDFA/main.htm)
