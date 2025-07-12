@@ -13,6 +13,7 @@ This repository contains code for **gaze estimation** using the [ARGaze dataset]
 - [Training](#training)
 - [Testing/Evaluation](#testingevaluation)
 - [Logging and Results](#logging-and-results)
+- [File Organization & Naming Conventions](#file-organization--naming-conventions)
 - [Citations](#citations)
 - [Acknowledgements](#acknowledgements)
 - [References](#references)
@@ -31,7 +32,6 @@ This repository contains code for **gaze estimation** using the [ARGaze dataset]
 ## Repository Structure
 
 ```
-
 ARGaze-RepNeXt/
 │
 ├── dataset.py         # Dataset loader for ARGaze
@@ -44,9 +44,9 @@ ARGaze-RepNeXt/
 ├── repnext.py         # RepNeXt model implementation
 ├── requirements.txt   # Python dependencies
 ├── README.md
-└── ARGaze\_logs/       # Training/validation logs and checkpoints (created during training)
+└── ARGaze_logs/       # Training/validation logs and checkpoints (created during training)
 
-````
+```
 
 ---
 
@@ -56,7 +56,7 @@ ARGaze-RepNeXt/
 ```bash
 git clone https://github.com/yourusername/ARGaze-RepNeXt.git
 cd ARGaze-RepNeXt
-````
+```
 
 ### 2. **Install Requirements**
 
@@ -205,23 +205,159 @@ Additional arguments:
 
 ---
 
+## Visualization
+
+### Experiment 1: 200 Samples/Subject
+
+#### Training Curves
+Training progress for RepNeXt M3 model on ARGaze dataset (200 samples/subject, 30 epochs):
+
+#### Training Loss
+![Training Loss](training_results/experiment_1/plots/loss_c1_200samples_20250709.png)
+
+#### Validation MAE (degrees)
+![Validation MAE](training_results/experiment_1/plots/mae_c1_200samples_20250709.png)
+
+**Subject Analysis Results**:
+```
+Subject closest to average training loss: P24
+Subject closest to average validation MAE: P17
+```
+
+### Experiment 2: 2000 Samples/Subject
+
+#### Training Curves
+Training progress for RepNeXt M3 model on ARGaze dataset (2000 samples/subject, 30 epochs):
+
+#### Training Loss
+![Training Loss](training_results/experiment_2/plots/loss_c1_2000samples_20250713.png)
+
+#### Validation MAE (degrees)
+![Validation MAE](training_results/experiment_2/plots/mae_c1_2000samples_20250713.png)
+
+**Subject Analysis Results**:
+```
+Subject closest to average training loss: P17
+Subject closest to average validation MAE: P12
+```
+
+### Observations
+- Both experiments show significant decreases in training loss and validation MAE in the first 3 epochs
+- Largest improvements (cusps) consistently occur at epochs 2 and 3
+- After epoch 3, metrics stabilize with only minor improvements
+- Patterns are consistent across all subjects in both experiments
+
+### Subject Analysis
+The visualization script automatically identifies the subject whose training curve is closest to the average for both metrics:
+- **Training Loss**: Identifies the subject with the most representative loss curve
+- **Validation MAE**: Identifies the subject with the most typical validation performance
+
+These subjects can be particularly useful for:
+- Analyzing typical model behavior
+- Creating representative visualizations
+- Understanding the most common learning patterns
+
+### Generating Plots
+To generate these plots for your own training runs:
+
+```python
+from visualization import plot_argaze_training_curves
+
+plot_argaze_training_curves(
+    log_path="training_results/experiment_1/logs/your_log.csv",
+    output_dir="training_results/experiment_1/plots",
+    epoch_min=1,
+    epoch_max=30,
+    log_scale=True,
+    dpi=150
+)
+```
+
+### Command Line Usage
+```bash
+python visualization.py training_results/experiment_1/logs/your_log.csv \
+    --output_dir training_results/experiment_1/plots \
+    --epoch_min 1 \
+    --epoch_max 30 \
+    --log_scale \
+    --dpi 150
+```
+
 ## Logging and Results
 
-* **Training logs:**
-  CSV logs are saved under `./ARGaze_logs/` (default, can be configured).
-* **Checkpoints:**
-  Model weights are saved per subject, e.g., `model_P3.pth`, under `./ARGaze_logs/` or specified checkpoint directory.
-* **Validation metrics:**
-  Mean angular error (MAE) per subject is reported at the end of each training fold and collected in the log file.
-* **Example log output:**
+* **Training logs**:
+  CSV logs are saved under `training_results/experiment_{N}/logs/` (default path can be configured via `--save_dir`)
+* **Checkpoints**:
+  Model weights are saved in two locations:
+  - Best models: `training_results/experiment_{N}/models/{model_type}_best_{val_mae}mae.pth`
+  - Periodic checkpoints: `training_results/experiment_{N}/models/{model_type}_epoch{epoch}_{val_mae}mae.pth`
+* **Validation metrics**:
+  Mean angular error (MAE) is tracked per:
+  - Subject (in individual model filenames)
+  - Epoch (in training logs)
+  - Experiment (aggregated in log files)
+* **Example log structure**:
+  ```
+  | experiment | fold | epoch | train_loss | val_mae | timestamp          |
+  |------------|------|-------|------------|---------|--------------------|
+  | 1          | P1   | 1     | 0.328      | 5.12    | 2025-07-12 20:45:00|
+  | 1          | P1   | 2     | 0.224      | 4.89    | 2025-07-12 20:47:30|
+  ```
 
-  ```
-  | fold | epoch | train_loss | val_mae |
-  |------|-------|------------|---------|
-  | P1   | 1     | 0.328      | 5.12    |
-  | P1   | 2     | 0.224      | 4.89    |
-  ...
-  ```
+---
+
+## File Organization & Naming Conventions
+
+### Directory Structure
+```
+gaze_estimation/training_results/
+└── experiment_{N}/               # N = experiment number (1, 2, ...)
+    ├── logs/                    # For CSV training logs
+    ├── models/                  # For model checkpoints
+    └── plots/                   # For visualizations
+```
+
+### Naming Standards
+
+1. **Log Files (CSV)**:
+   `{camera}_{samples}_{type}_{timestamp}.csv`  
+   Example: `c1_200samples_train_20250712.csv`
+
+2. **Model Files**:
+   - Checkpoints: `{model_type}_epoch{epoch}_{val_mae}mae.pth`  
+     Example: `repnext_m3_epoch15_4.2mae.pth`
+   - Best Model: `{model_type}_best_{val_mae}mae.pth`
+
+3. **Plot Files**:
+   `{metric}_{camera}_{samples}_{timestamp}.png`  
+   Example: `mae_c1_200samples_20250712.png`
+
+4. **Experiment Folders**:
+   `experiment_{N}_[brief_description]`  
+   Example: `experiment_1_[repnext_m3_c1]`
+
+### Recommended Structure
+```
+experiment_1/
+├── README.md               # Experiment details
+├── logs/
+│   ├── c1_200samples_train.csv
+│   └── c1_200samples_test.csv
+├── models/
+│   ├── repnext_m3_epoch05_4.5mae.pth
+│   └── repnext_m3_best_3.8mae.pth
+└── plots/
+    ├── mae_c1_200samples.png
+    └── loss_c1_200samples.png
+```
+
+Include in each experiment's README.md:
+- Date
+- Model architecture
+- Camera configuration
+- Sample size
+- Key hyperparameters
+- Any special notes
 
 ---
 
