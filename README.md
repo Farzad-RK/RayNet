@@ -123,6 +123,35 @@ model = SixDRepNet_RepNeXt(
 
 You may select any RepNeXt variant (`repnext_m0` ... `repnext_m5`).
 
+## Using RepNext Models
+
+You can create a RepNext model by its name. For example:
+
+```python
+from backbone.repnext import create_repnext
+
+# Create a RepNext-M3 model
+model = create_repnext('repnext_m3')
+```
+
+Available model names: `repnext_m0`, `repnext_m1`, `repnext_m2`, `repnext_m3`, `repnext_m4`, `repnext_m5`.
+
+## Command-Line Usage
+
+### For Training (`train.py`):
+
+```bash
+python train.py --backbone_type repnext_m4  # Use RepNext-M4 backbone
+```
+
+### For Testing (`test.py`):
+
+```bash
+python test.py --backbone_type repnext_m4 --snapshot path/to/model.pth
+```
+
+Available backbone types: `RepVGG-B1g2`, `repnext_m0`, `repnext_m1`, `repnext_m2`, `repnext_m3`, `repnext_m4`, `repnext_m5`.
+
 ---
 
 ## 5. Hypothesis

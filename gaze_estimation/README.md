@@ -1,4 +1,3 @@
-
 # ARGaze-RepNeXt: Gaze Estimation with RepNeXt Backbone on the ARGaze Dataset
 
 This repository contains code for **gaze estimation** using the [ARGaze dataset](https://arxiv.org/abs/2207.02541) and [RepNeXt](https://arxiv.org/abs/2205.15018) backbone. The code is modular, supporting various training and evaluation methods including **LOSO cross-validation** and standard training/testing splits.
@@ -104,17 +103,86 @@ pip install -r requirements.txt
   RepNeXt is used as the backbone for the gaze estimation model.
   The model outputs a 6D representation for gaze direction.
 
+## Model Usage
+
+We now support creating RepNext models by name using the `create_repnext` function from `backbone.repnext`. For example:
+
+```python
+from backbone.repnext import create_repnext
+
+model = create_repnext('repnext_m3', pretrained=False, num_classes=6)
+```
+
+Available model names: `repnext_m0`, `repnext_m1`, `repnext_m2`, `repnext_m3`, `repnext_m4`, `repnext_m5`.
+
 ---
 
 ## Training
 
-To perform **LOSO cross-validation**:
+### Training with LOSO Cross-Validation
 
+The `train.py` script performs Leave-One-Subject-Out (LOSO) cross-validation for gaze estimation using RepNeXt models.
+
+#### Key Features
+- 🏗️ **Model Selection**: Choose from multiple RepNeXt variants (m0-m5)
+- 🔄 **Resumable Training**: Automatically skips completed folds
+- 💾 **Checkpointing**: Saves periodic checkpoints (every 5 epochs)
+- 📊 **Comprehensive Logging**: Tracks training loss and validation MAE
+- ⏱️ **Time Estimation**: Predicts remaining training time
+
+#### Command Line Arguments
 ```bash
-python train.py  # (runs main_loso.py logic, see config.py for details)
+python train.py \
+    --train_samples 2000 \
+    --test_samples 1000 \
+    --batch_size 32 \
+    --epochs 30 \
+    --model_type repnext_m3 \
+    --pretrained_weights path/to/weights.pt \
+    --save_dir ./ARGaze_logs \
+    --ckpt_dir ./ARGaze_checkpoints
 ```
 
-To train on all data or with a custom split, adjust `train.py` and `config.py` accordingly.
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--train_samples` | Samples per training subject | 2000 |
+| `--test_samples` | Samples per test subject | 1000 |
+| `--batch_size` | Training batch size | 32 |
+| `--epochs` | Number of training epochs | 30 |
+| `--model_type` | RepNeXt variant (m0-m5) | repnext_m3 |
+| `--pretrained_weights` | Path to pretrained weights | '' |
+| `--save_dir` | Directory for logs and models | ./ARGaze_logs |
+| `--ckpt_dir` | Directory for periodic checkpoints | ./ARGaze_checkpoints |
+
+#### Output Files
+- `training_log.csv`: CSV log of all training metrics
+- `model_{subject}.pth`: Best model for each subject
+- `{subject}_epoch{N}.pth`: Periodic checkpoints (every 5 epochs)
+
+#### Example Workflow
+1. **Start training**:
+```bash
+python train.py --model_type repnext_m4 --epochs 50
+```
+
+2. **Resume interrupted training**:
+```bash
+# Automatically skips completed folds
+python train.py --model_type repnext_m4 --epochs 50
+```
+
+3. **Analyze results**:
+```python
+import pandas as pd
+logs = pd.read_csv("./ARGaze_logs/training_log.csv")
+print(logs.groupby('fold')['val_mae'].min().mean())
+```
+
+#### Implementation Notes
+- Uses cosine annealing learning rate scheduling
+- Automatically fuses batchnorm layers for efficiency
+- Handles CUDA memory optimization when available
+- Provides detailed per-batch progress reporting
 
 ---
 
@@ -209,4 +277,3 @@ Open issues or contact [yourname](mailto:your@email.com) for questions, bugs, or
 ---
 
 If you have a specific log file, you can include a *log example* or visualization in the README as well. Let me know if you want that added!
-```

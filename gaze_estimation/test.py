@@ -9,10 +9,12 @@ from config import device, data_path, all_subjects  # import other config as nee
 from dataset import ARGazeDataset
 from transforms import test_tf
 from losses import angular_error
-from backbone.repnext import repnext_m3   # Or import your model appropriately
+# Import create_repnext for flexible model creation
+from backbone.repnext import create_repnext
 
 def load_model(checkpoint_path, device):
-    model = repnext_m3(pretrained=False, num_classes=6)
+    # Create a RepNext-M3 model
+    model = create_repnext('repnext_m3', pretrained=False, num_classes=6)
     state_dict = torch.load(checkpoint_path, map_location=device)
     # If checkpoint is dict with 'model_state_dict', get the inner dict
     if 'model_state_dict' in state_dict:

@@ -10,7 +10,6 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from model import SixDRepNet, SixDRepNet_RepNeXt
-from backbone.repnext import repnext_m4  # Import your RepNeXt backbone
 import utils
 import datasets
 
@@ -42,8 +41,9 @@ def parse_args():
                         default='AFLW2000', type=str)
 
     # ---- ADDED for backbone selection ----
-    parser.add_argument('--backbone_type', type=str, default='repvgg', choices=['repvgg', 'repnext'],
-                        help='Type of backbone to use: repvgg or repnext')
+    parser.add_argument('--backbone_type', type=str, default='RepVGG-B1g2', 
+                        choices=['RepVGG-B1g2', 'repnext_m0', 'repnext_m1', 'repnext_m2', 'repnext_m3', 'repnext_m4', 'repnext_m5'],
+                        help='Type of backbone to use. Choose from: RepVGG-B1g2, repnext_m0, repnext_m1, ...')
     parser.add_argument('--backbone_weights', type=str, default='', help='Path to the backbone weights file (.pth for repvgg, .pt for repnext)')
     # --------------------------------------
     args = parser.parse_args()
@@ -63,17 +63,16 @@ if __name__ == '__main__':
     snapshot_path = args.snapshot
 
     # ---------------- Model selection ----------------
-    if args.backbone_type == 'repvgg':
+    if args.backbone_type == 'RepVGG-B1g2':
         model = SixDRepNet(backbone_name='RepVGG-B1g2',
                            backbone_file='',
                            deploy=True,
                            pretrained=False)
-    elif args.backbone_type == 'repnext':
+    elif args.backbone_type.startswith('repnext'):
         model = SixDRepNet_RepNeXt(
-            model_type=args.model_type,
+            backbone_fn=args.backbone_type,  
             pretrained=False,
-            deploy=True,
-            backbone_weights_path=args.backbone_weights
+            deploy=True
         )
         model = model.cuda(gpu)
         if args.backbone_weights:
