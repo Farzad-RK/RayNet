@@ -92,16 +92,65 @@ pip install -r requirements.txt
 
 ## Model: RepNeXt Backbone
 
-* **Citation:**
+Our implementation uses a RepNeXt-based architecture with the following key features:
 
-  > Ding, X., Zhang, X., Han, J., Ding, G., & Xie, S. (2022).
-  > **RepNeXt: Making Convolutional Networks Greater with Re-parameterization**.
-  > *arXiv preprint arXiv:2205.15018*.
-  > [Paper link](https://arxiv.org/abs/2205.15018)
+- Multiple model sizes available (m0-m5)
+- Pretrained on ImageNet
+- Outputs 6D rotation representation for gaze estimation
+- Optimized for few-shot learning scenarios
 
-* **Usage:**
-  RepNeXt is used as the backbone for the gaze estimation model.
-  The model outputs a 6D representation for gaze direction.
+### Pretrained Models
+
+We provide pretrained models from our experiments on Hugging Face Hub:
+
+#### Available Models
+
+| Model | Training Samples | Test MAE | Link |
+|-------|------------------|----------|------|
+| RepNeXt M3 | 200 samples/subject | 8.2° | [Download](https://huggingface.co/phorosyne/6DRepNet-RepNeXt-M3-ARGaze/resolve/main/experiment_1_200samples_P17_epoch30.pth) |
+| RepNeXt M3 | 2000 samples/subject | 6.8° | [Download](https://huggingface.co/phorosyne/6DRepNet-RepNeXt-M3-ARGaze/resolve/main/experiment_2_2000samples_P12_epoch30.pth) |
+
+### Loading a Pretrained Model
+
+```python
+import torch
+from backbone.repnext import repnext_m3
+
+# Initialize model
+model = repnext_m3(pretrained=False, num_classes=6)
+
+# Load pretrained weights
+checkpoint = torch.load('path_to_downloaded_model.pth')
+model.load_state_dict(checkpoint['model_state_dict'])
+model.eval()
+```
+
+### Using the Model for Inference
+
+```python
+import torch
+from torchvision import transforms
+from PIL import Image
+
+def preprocess_image(image_path):
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                           std=[0.229, 0.224, 0.225])
+    ])
+    image = Image.open(image_path).convert('RGB')
+    return transform(image).unsqueeze(0)
+
+# Prepare input
+input_tensor = preprocess_image('path_to_eye_image.jpg')
+
+# Get prediction
+with torch.no_grad():
+    output = model(input_tensor)
+    # Convert 6D output to gaze vector
+    # (Implementation of 6D to rotation matrix conversion here)
+```
 
 ## Model Usage
 
@@ -114,6 +163,38 @@ model = create_repnext('repnext_m3', pretrained=False, num_classes=6)
 ```
 
 Available model names: `repnext_m0`, `repnext_m1`, `repnext_m2`, `repnext_m3`, `repnext_m4`, `repnext_m5`.
+
+
+ARGaze provides each sample’s gaze direction as a 3D vector (in camera or scene coordinates). However, **directly regressing a 3D vector** can be unstable and can suffer from discontinuities and singularities (gimbal lock).
+
+Recent state-of-the-art methods address this by using a **6D continuous representation** for 3D rotations, as proposed by Zhou et al., 2019. This approach makes neural network learning easier and leads to more stable and accurate results.
+
+### What is 6D Representation?
+
+* Instead of predicting a 3x3 rotation matrix (with orthogonality constraints), the network outputs a 6D vector, interpreted as two unconstrained 3D vectors.
+* This 6D vector is then orthogonalized to form a valid 3x3 rotation matrix.
+* The **z-axis** (third column) of the rotation matrix is used as the 3D gaze direction.
+
+**Math:**
+
+Given output vector $d6 = [a_1, a_2]$, with $a_1, a_2 \in \mathbb{R}^3$:
+
+$$
+\begin{align*}
+b_1 &= \frac{a_1}{\|a_1\|} \\
+b_2 &= \frac{a_2 - (b_1^\top a_2) b_1}{\|a_2 - (b_1^\top a_2) b_1\|} \\
+b_3 &= b_1 \times b_2 \\
+R &= [b_1, b_2, b_3] \in \mathbb{R}^{3 \times 3}
+\end{align*}
+$$
+
+* $b_3$ (the third column of $R$) is the predicted gaze direction.
+
+
+### Why `num_classes=6` in the Model?
+
+* Setting `num_classes=6` in RepNeXt ensures the final layer outputs a 6D vector for each sample.
+* This vector is converted to a rotation matrix and then to the 3D gaze vector during evaluation.
 
 ---
 
@@ -207,10 +288,18 @@ Additional arguments:
 
 ## Visualization
 
-### Experiment 1: 200 Samples/Subject
+### Experiment 1: 200 Training Samples/Subject
+
+#### Hyperparameters
+- **Model**: RepNeXt M3
+- **Epochs**: 30
+- **Batch Size**: 32
+- **Training Samples/Subject**: 200
+- **Test Samples/Subject**: 200
+- **Subjects**: P1-P25 (25 total)
 
 #### Training Curves
-Training progress for RepNeXt M3 model on ARGaze dataset (200 samples/subject, 30 epochs):
+Training progress on ARGaze dataset:
 
 #### Training Loss
 ![Training Loss](training_results/experiment_1/plots/loss_c1_200samples_20250709.png)
@@ -224,10 +313,18 @@ Subject closest to average training loss: P24
 Subject closest to average validation MAE: P17
 ```
 
-### Experiment 2: 2000 Samples/Subject
+### Experiment 2: 2000 Training Samples/Subject
+
+#### Hyperparameters
+- **Model**: RepNeXt M3
+- **Epochs**: 30
+- **Batch Size**: 32
+- **Training Samples/Subject**: 2000
+- **Test Samples/Subject**: 1000
+- **Subjects**: P1-P25 (25 total)
 
 #### Training Curves
-Training progress for RepNeXt M3 model on ARGaze dataset (2000 samples/subject, 30 epochs):
+Training progress on ARGaze dataset:
 
 #### Training Loss
 ![Training Loss](training_results/experiment_2/plots/loss_c1_2000samples_20250713.png)
@@ -401,9 +498,47 @@ If you use this code or results in your work, **please cite both ARGaze and RepN
 
 ---
 
+## Citation
+
+If you find this work useful for your research, please consider citing:
+
+```bibtex
+@misc{argaze_repnext_2024,
+  author = {Farzad R. Khanian},
+  title = {ARGaze-RepNeXt: Gaze Estimation with RepNeXt Backbone on the ARGaze Dataset},
+  year = {2024},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {\url{https://github.com/phorosyne/6DRepNet-RepNeXt-M3-ARGaze}}
+}
+```
+
+## Citation
+
+If you find this work useful for your research, please consider citing:
+
+```bibtex
+@misc{argaze_repnext_2024,
+  author = {Farzad R. Khanian},
+  title = {ARGaze-RepNeXt: Gaze Estimation with RepNeXt Backbone on the ARGaze Dataset},
+  year = {2024},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {\url{https://github.com/phorosyne/6DRepNet-RepNeXt-M3-ARGaze}}
+}
+```
+
 ## Contact
 
-Open issues or contact [yourname](mailto:your@email.com) for questions, bugs, or feature requests.
+Open issues or contact [Farzad Rahim Khanian](mailto:farzad.u235@gmail.com) for questions, bugs, or feature requests.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ---
 
