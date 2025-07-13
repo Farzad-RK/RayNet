@@ -107,8 +107,8 @@ We provide pretrained models from our experiments on Hugging Face Hub:
 
 | Model | Training Samples | Test MAE | Link |
 |-------|------------------|----------|------|
-| RepNeXt M3 | 200 samples/subject | 8.2° | [Download](https://huggingface.co/phorosyne/6DRepNet-RepNeXt-M3-ARGaze/resolve/main/experiment_1_200samples_P17_epoch30.pth) |
-| RepNeXt M3 | 2000 samples/subject | 6.8° | [Download](https://huggingface.co/phorosyne/6DRepNet-RepNeXt-M3-ARGaze/resolve/main/experiment_2_2000samples_P12_epoch30.pth) |
+| RepNeXt M3 | 200 samples/subject | 10.003739° | [Download](https://huggingface.co/phorosyne/6DRepNet-RepNeXt-M3-ARGaze/resolve/main/experiment_1_200samples_P17_epoch30.pth) |
+| RepNeXt M3 | 2000 samples/subject | 9.660695° | [Download](https://huggingface.co/phorosyne/6DRepNet-RepNeXt-M3-ARGaze/resolve/main/experiment_2_2000samples_P12_epoch30.pth) |
 
 ### Loading a Pretrained Model
 
