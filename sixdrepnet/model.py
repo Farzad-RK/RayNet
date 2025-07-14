@@ -7,7 +7,6 @@ from backbone.repvgg import get_RepVGG_func_by_name
 import utils
 
 # Import repnext architectures
-import backbone.repnext as repnext
 from backbone.repnext import create_repnext
 from backbone.repnext_utils import replace_batchnorm
 

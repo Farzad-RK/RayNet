@@ -1,4 +1,4 @@
-# Enhancing 6DRepNet with RepNeXt-M4 for Efficient Head Pose Estimation on Mobile Devices
+# Enhancing 6DRepNet with RepNeXt for Efficient Head Pose Estimation on Mobile Devices
 
 ## Abstract
 We propose a novel enhancement to the [6DRepNet](https://github.com/thohemp/6DRepNet) architecture by replacing its original RepVGG backbone with the recently introduced [RepNeXt-M4](https://github.com/suous/RepNeXt), a state-of-the-art lightweight convolutional network optimized for mobile deployment. Our motivation stems from the need to balance inference latency, model compactness, and angular precision for real-time head pose estimation on edge devices. To our knowledge, this combination has not been previously explored or published. Preliminary analysis suggests that this substitution could offer improved accuracy, multi-scale feature extraction, and real-time compatibility, making it suitable for embedded and mobile vision applications.
@@ -115,14 +115,42 @@ sixdrepnet/
 from model import SixDRepNet_RepNeXt
 from backbone.repnext import repnext_m4
 model = SixDRepNet_RepNeXt(
-            model_type=args.model_type, 
-            pretrained=False,
-            deploy=True,
-            backbone_weights_path=args.backbone_weights
-        )
+    backbone_fn=repnext_m4,
+    pretrained=True,
+    deploy=False
+)
 ```
 
 You may select any RepNeXt variant (`repnext_m0` ... `repnext_m5`).
+
+## Using RepNext Models
+
+You can create a RepNext model by its name. For example:
+
+```python
+from backbone.repnext import create_repnext
+
+# Create a RepNext-M3 model
+model = create_repnext('repnext_m3')
+```
+
+Available model names: `repnext_m0`, `repnext_m1`, `repnext_m2`, `repnext_m3`, `repnext_m4`, `repnext_m5`.
+
+## Command-Line Usage
+
+### For Training (`train.py`):
+
+```bash
+python train.py --backbone_type repnext_m4  # Use RepNext-M4 backbone
+```
+
+### For Testing (`test.py`):
+
+```bash
+python test.py --backbone_type repnext_m4 --snapshot path/to/model.pth
+```
+
+Available backbone types: `RepVGG-B1g2`, `repnext_m0`, `repnext_m1`, `repnext_m2`, `repnext_m3`, `repnext_m4`, `repnext_m5`.
 
 ---
 
