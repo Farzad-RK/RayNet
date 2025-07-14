@@ -352,6 +352,34 @@ class RepNext(nn.Module):
         fuse_children(self)
 
 
+# Dictionary mapping model names to their configurations
+MODEL_DICT = {
+    "repnext_m0": dict(embed_dim=(40, 80, 160, 320), depth=(2, 2, 9, 1)),
+    "repnext_m1": dict(embed_dim=(48, 96, 192, 384), depth=(3, 3, 15, 2)),
+    "repnext_m2": dict(embed_dim=(56, 112, 224, 448), depth=(3, 3, 15, 2)),
+    "repnext_m3": dict(embed_dim=(64, 128, 256, 512), depth=(3, 3, 13, 2)),
+    "repnext_m4": dict(embed_dim=(64, 128, 256, 512), depth=(5, 5, 25, 4)),
+    "repnext_m5": dict(embed_dim=(80, 160, 320, 640), depth=(7, 7, 35, 2)),
+}
+
+def create_repnext(model_name, pretrained=False, **kwargs):
+    """
+    Create a RepNext model by model name
+    
+    Args:
+        model_name (str): Name of the model (e.g., 'repnext_m3')
+        pretrained (bool): Load pretrained weights
+        **kwargs: Additional arguments for model configuration
+        
+    Returns:
+        torch.nn.Module: Created model
+    """
+    if model_name in MODEL_DICT:
+        return _create_repnext(model_name, pretrained=pretrained, **dict(MODEL_DICT[model_name], **kwargs))
+    else:
+        raise ValueError(f"Unknown model name: {model_name}")
+
+
 def _create_repnext(variant, pretrained=False, **kwargs):
     out_indices = kwargs.pop("out_indices", (0, 1, 2, 3))
     model = build_model_with_cfg(
@@ -363,39 +391,34 @@ def _create_repnext(variant, pretrained=False, **kwargs):
     )
     return model
 
+
 @register_model
 def repnext_m0(pretrained=False, **kwargs):
-    model_args = dict(embed_dim=(40, 80, 160, 320), depth=(2, 2, 9, 1))
-    return _create_repnext("repnext_m0", pretrained=pretrained, **dict(model_args, **kwargs))
+    return create_repnext("repnext_m0", pretrained=pretrained, **kwargs)
 
 @register_model
 def repnext_m1(pretrained=False, **kwargs):
-    model_args = dict(embed_dim=(48, 96, 192, 384), depth=(3, 3, 15, 2))
-    return _create_repnext("repnext_m1", pretrained=pretrained, **dict(model_args, **kwargs))
+    return create_repnext("repnext_m1", pretrained=pretrained, **kwargs)
 
 @register_model
 def repnext_m2(pretrained=False, **kwargs):
-    model_args = dict(embed_dim=(56, 112, 224, 448), depth=(3, 3, 15, 2))
-    return _create_repnext("repnext_m2", pretrained=pretrained, **dict(model_args, **kwargs))
+    return create_repnext("repnext_m2", pretrained=pretrained, **kwargs)
 
 @register_model
 def repnext_m3(pretrained=False, **kwargs):
-    model_args = dict(embed_dim=(64, 128, 256, 512), depth=(3, 3, 13, 2))
-    return _create_repnext("repnext_m3", pretrained=pretrained, **dict(model_args, **kwargs))
+    return create_repnext("repnext_m3", pretrained=pretrained, **kwargs)
 
 @register_model
 def repnext_m4(pretrained=False, **kwargs):
-    model_args = dict(embed_dim=(64, 128, 256, 512), depth=(5, 5, 25, 4))
-    return _create_repnext("repnext_m4", pretrained=pretrained, **dict(model_args, **kwargs))
+    return create_repnext("repnext_m4", pretrained=pretrained, **kwargs)
 
 @register_model
 def repnext_m5(pretrained=False, **kwargs):
-    model_args = dict(embed_dim=(80, 160, 320, 640), depth=(7, 7, 35, 2))
-    return _create_repnext("repnext_m5", pretrained=pretrained, **dict(model_args, **kwargs))
+    return create_repnext("repnext_m5", pretrained=pretrained, **kwargs)
 
 
 if __name__ == "__main__":
-    model = create_model("repnext_m3")
+    model = create_repnext("repnext_m3")
 
     model.eval()
     print(str(model))
@@ -405,4 +428,3 @@ if __name__ == "__main__":
         print(pytorch_model_summary.summary(model, x))
     except ModuleNotFoundError:
         pass
-
