@@ -5,7 +5,6 @@ This script allows exporting both Gaze Estimation and SixDRepNet models to ONNX 
 It handles model loading, input/output configuration, and ONNX export with proper metadata.
 """
 
-import os
 import argparse
 import torch
 import torch.nn as nn
@@ -14,21 +13,10 @@ import onnx
 import onnxruntime as ort
 import numpy as np
 from typing import Tuple, Dict, Optional
+from sixdrepnet.model import SixDRepNet, SixDRepNet_RepNeXt
+from  backbone.repnext import create_repnext
+from sixdrepnet.utils import compute_rotation_matrix_from_ortho6d,compute_euler_angles_from_rotation_matrices
 
-# Import model architectures
-try:
-    from sixdrepnet import SixDRepNet, SixDRepNet_RepNeXt
-    from sixdrepnet.model import create_repnext
-    from sixdrepnet.utils import compute_rotation_matrix_from_ortho6d
-    SIXDREPNET_AVAILABLE = True
-except ImportError:
-    SIXDREPNET_AVAILABLE = False
-
-try:
-    from gaze_estimation.model import GazeEstimationModel  # Adjust import path as needed
-    GAZE_ESTIMATION_AVAILABLE = True
-except ImportError:
-    GAZE_ESTIMATION_AVAILABLE = False
 
 class ModelExporter:
     """Base class for model exporters."""
@@ -103,9 +91,6 @@ class SixDRepNetExporter(ModelExporter):
                     - 'repnext_m0' to 'repnext_m5' for RepNeXt variants (recommended, default: 'repnext_m4')
                     - 'repvgg_a0' for RepVGG-A0
         """
-        if not SIXDREPNET_AVAILABLE:
-            raise ImportError("SixDRepNet is not available. Please install it first.")
-            
         if "repnext" in backbone.lower():
             # Validate RepNeXt version
             valid_versions = [f'repnext_m{i}' for i in range(6)]  # m0 to m5
@@ -184,19 +169,15 @@ class GazeEstimationExporter(ModelExporter):
     
     @staticmethod
     def load_model(weights_path: str, model_type: str = "repnext_m3") -> nn.Module:
-        """Load Gaze Estimation model from weights."""
-        if not GAZE_ESTIMATION_AVAILABLE:
-            raise ImportError("Gaze Estimation model is not available. Please install it first.")
-            
-        model = GazeEstimationModel(backbone=model_type)
+        model = create_repnext(model_type,pretrained=False)
         
         # Load weights
-        checkpoint = torch.load(weights_path, map_location='cpu')
+        checkpoint = torch.load(weights_path, map_location='cpu',weights_only=False)
         if 'state_dict' in checkpoint:
             state_dict = checkpoint['state_dict']
         else:
             state_dict = checkpoint
-            
+
         # Remove 'module.' prefix if present
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         model.load_state_dict(state_dict)
@@ -250,41 +231,6 @@ class GazeEstimationExporter(ModelExporter):
             **kwargs
         )
 
-
-def compute_euler_angles_from_rotation_matrices(rotation_matrices):
-    """
-    Convert rotation matrices to euler angles (pitch, yaw, roll).
-    
-    Args:
-        rotation_matrices: Tensor of shape (N, 3, 3) containing rotation matrices
-        
-    Returns:
-        Tensor of shape (N, 3) containing euler angles (pitch, yaw, roll) in radians
-    """
-    # Extract rotation matrix components
-    r00 = rotation_matrices[:, 0, 0]
-    r01 = rotation_matrices[:, 0, 1]
-    r02 = rotation_matrices[:, 0, 2]
-    r10 = rotation_matrices[:, 1, 0]
-    r11 = rotation_matrices[:, 1, 1]
-    r12 = rotation_matrices[:, 1, 2]
-    r20 = rotation_matrices[:, 2, 0]
-    r21 = rotation_matrices[:, 2, 1]
-    r22 = rotation_matrices[:, 2, 2]
-    
-    # Calculate pitch (y-axis rotation)
-    pitch = torch.atan2(r21, torch.sqrt(r00**2 + r01**2))
-    
-    # Calculate yaw (z-axis rotation)
-    yaw = torch.atan2(-r20, r22)
-    
-    # Calculate roll (x-axis rotation)
-    roll = torch.atan2(-r01, r11)
-    
-    # Stack angles
-    euler_angles = torch.stack([pitch, yaw, roll], dim=1)
-    
-    return euler_angles
 
 
 def parse_args():
