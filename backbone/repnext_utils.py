@@ -3,10 +3,12 @@ Utilities for RepNeXt backbone integration in SixDRepNet.
 
 Currently includes:
 - replace_batchnorm: Recursively fuses batchnorms using the .fuse() method
-  (if implemented by RepNeXt blocks).
+- load_pretrained_repnext: Loads a pretrained RepNeXt model and replaces batchnorm layers.
 
-You can add more RepNeXt-specific helpers here as your project grows.
 """
+import torch
+from backbone.repnext import create_repnext
+
 
 def replace_batchnorm(net):
     """
@@ -26,3 +28,12 @@ def replace_batchnorm(net):
         else:
             # Recursively look for fuse-able submodules
             replace_batchnorm(child)
+
+def load_pretrained_repnext(backbone_name,weight_path):
+    jit_model = torch.jit.load(weight_path, map_location="cpu")
+    state_dict = jit_model.state_dict()
+    state_dict = {k: v for k, v in state_dict.items() if
+                  not k.startswith("head.head") and not k.startswith("head.head_dist")}
+    model = create_repnext(model_name=backbone_name, pretrained=False)
+    model.load_state_dict(state_dict, strict=False)
+    replace_batchnorm(model)
