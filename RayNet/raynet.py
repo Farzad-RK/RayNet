@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from backbone.repnext_utils import  load_pretrained_repnext
 from panet import PANet
+from fusion import MultiScaleFusion
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
