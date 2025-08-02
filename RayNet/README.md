@@ -214,6 +214,97 @@ PANet output P5: torch.Size([B, 256, 14, 14])
 
 ---
 
+# RayNet: Multi-Task Gaze and Head Pose Estimation Pipeline
+
+## Overview
+
+**RayNet** is a modular deep learning framework for joint estimation of head pose, gaze vector/point, and eye mesh from multi-view face images.  
+This documentation details the mid/high-level pipeline **from PANet fusion onwards**, up to the state-of-the-art head pose regression head, including key architectural components and channel mapping.
+
+---
+
+## Architectural Blocks
+
+### 1. PANet Feature Pyramid
+
+**PANet** (Path Aggregation Network) is used to fuse multi-scale feature maps from a backbone (e.g., RepNeXt) into four outputs: P2, P3, P4, P5.
+
+- **Inputs:** Backbone features `[C2, C3, C4, C5]` (from highest to lowest resolution).
+- **Output Channels:** All PANet outputs are set to a unified channel size (default: 256).
+- **Purpose:** Multi-scale context aggregation for downstream tasks.
+
+#### Output Shapes (Example: 448x448 input, PANet out_channels=256)
+- P2: `[B, 256, 112, 112]`
+- P3: `[B, 256, 56, 56]`
+- P4: `[B, 256, 28, 28]`
+- P5: `[B, 256, 14, 14]`
+
+---
+
+### 2. Multi-Scale Fusion
+
+**MultiScaleFusion** module fuses the outputs `[P2, P3, P4, P5]` to produce a single, spatially aligned feature map. This step is essential for:
+- **Capturing both fine and coarse information** across all scales.
+- **Preparing a unified tensor** for subsequent attention and regression heads.
+
+#### Typical Fusion Procedure
+
+1. **Upsample all PANet outputs to P2 resolution** (`112x112`).
+2. **Concatenate along channel dimension** (result: `[B, 4*256, 112, 112]`).
+3. **Reduce to 256 channels** via a 1x1 convolution (optional BatchNorm + activation).
+
+#### Output Shape
+
+- `fused`: `[B, 256, 112, 112]`
+
+---
+
+### 3. Coordinate Attention
+
+After fusion, **Coordinate Attention** (CoordAtt) is applied to further enhance the feature representation by encoding precise spatial information efficiently.
+
+- **CoordAtt module** is lightweight, mobile-friendly, and boosts spatial selectivity.
+- The attention module is applied *before* each task-specific head (here: head pose).
+
+---
+
+## Head Pose Regression Head
+
+### Location
+
+- **Implementation:** `head_pose/model.py`
+- **Loss function:** `head_pose/loss.py` (Geodesic loss)
+
+### Description
+
+This regression head takes the fused, coordinate-attended feature map and regresses to a 6D representation of the rotation matrix, which is later converted to a full 3x3 rotation matrix for loss computation.
+
+#### Architecture
+
+1. **CoordAtt:** Processes `[B, 256, 112, 112]` → `[B, 256, 112, 112]`.
+2. **AdaptiveAvgPool2d:** Pools to `[B, 256, 1, 1]`.
+3. **MLP:** 
+    - FC1: `[B, 256] → [B, 128]`
+    - ReLU
+    - FC2: `[B, 128] → [B, 6]`
+4. **Output:** `[B, 6]`  (6D representation for rotation, robust for regression)
+
+#### Conversion and Loss
+
+- **During training**: Convert `[B, 6]` → `[B, 3, 3]` via `compute_rotation_matrix_from_ortho6d`.
+- **Loss**: Use **Geodesic Loss** (minimizes angle between predicted and ground truth rotation matrices).
+
+---
+
+## Code Snippets
+
+### Fusion Example
+
+```python
+# fusion = MultiScaleFusion(in_channels=256, n_scales=4, out_channels=256)
+fused = fusion([P2, P3, P4, P5])  # [B, 256, 112, 112]
+```
+
 ## Theory and Design Rationale
 
 * **Why multi-scale features?**
@@ -261,6 +352,9 @@ The four output feature maps (P2-P5) can be passed to custom task-specific heads
 * **Eye mesh (vertex regression or heatmap)**
 
 Simply add separate head modules to the RayNet model as required.
+
+
+
 
 ---
 
