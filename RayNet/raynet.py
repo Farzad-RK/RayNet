@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from ..backbone.repnext_utils import  load_pretrained_repnext
+from backbone.repnext_utils import  load_pretrained_repnext
 from panet import PANet
 from fusion import MultiScaleFusion
 
