@@ -25,7 +25,7 @@ class RayNet(nn.Module):
         self.fusion = MultiScaleFusion(in_channels=panet_out_channels, n_scales=4, out_channels=256)
 
         # --- Head pose regression head ---
-        self.head_pose_head = HeadPoseRegressionHead(in_channels=256, hidden_dim=128, attn_groups=32)
+        self.head_pose_head = HeadPoseRegressionHead(in_channels=256, hidden_dim=128, reduction=32)
 
         # TODO: Add gaze/mesh heads later as needed
 

@@ -9,7 +9,7 @@ class HeadPoseRegressionHead(nn.Module):
     Zhou et al., "On the Continuity of Rotation Representations in Neural Networks", ECCV 2019.
     """
 
-    def __init__(self, in_channels=256, hidden_dim=128, attn_groups=32):
+    def __init__(self, in_channels=256, hidden_dim=128,reduction=32):
         """
         Args:
             in_channels (int): Number of input feature channels from the fused feature map.
@@ -17,7 +17,7 @@ class HeadPoseRegressionHead(nn.Module):
             attn_groups (int): Number of groups for CoordAtt (usually 32 or 64).
         """
         super().__init__()
-        self.coord_att = CoordAtt(in_channels, in_channels, groups=attn_groups)
+        self.coord_att = CoordAtt(in_channels, in_channels, reduction=reduction)  # Efficient CoordAtt block
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.fc1 = nn.Linear(in_channels, hidden_dim)
         self.act = nn.ReLU(inplace=True)

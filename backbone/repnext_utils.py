@@ -37,3 +37,4 @@ def load_pretrained_repnext(backbone_name,weight_path):
     model = create_repnext(model_name=backbone_name, pretrained=False)
     model.load_state_dict(state_dict, strict=False)
     replace_batchnorm(model)
+    return model
