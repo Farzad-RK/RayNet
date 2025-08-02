@@ -6,6 +6,7 @@ class HeadPoseRegressionHead(nn.Module):
     """
     SOTA Head Pose Regression Head with Coordinate Attention.
     Accepts feature maps, applies coordinate attention, pools, then regresses 6D pose.
+    Zhou et al., "On the Continuity of Rotation Representations in Neural Networks", ECCV 2019.
     """
 
     def __init__(self, in_channels=256, hidden_dim=128, attn_groups=32):

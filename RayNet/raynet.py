@@ -5,6 +5,9 @@ from backbone.repnext_utils import  load_pretrained_repnext
 from panet import PANet
 from fusion import MultiScaleFusion
 
+
+from head_pose.model import HeadPoseRegressionHead
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -21,6 +24,11 @@ class RayNet(nn.Module):
         # P2, P3, P4, P5 are the outputs of PANet
         self.fusion = MultiScaleFusion(in_channels=panet_out_channels, n_scales=4, out_channels=256)
 
+        # --- Head pose regression head ---
+        self.head_pose_head = HeadPoseRegressionHead(in_channels=256, hidden_dim=128, attn_groups=32)
+
+        # TODO: Add gaze/mesh heads later as needed
+
     def forward(self, x):
         c0 = self.backbone.stem(x)  # stride=4
         c1 = self.backbone.stages[0](c0)  # stride=4
@@ -31,9 +39,21 @@ class RayNet(nn.Module):
         # All four stages used
         features = [c1, c2, c3, c4]
 
-        panet_features = self.panet(features)
+        # --- PANet & Fusion ---
+        panet_features = self.panet(features)  # List of [B, C, H, W]
+        fused = self.fusion(panet_features)  # [B, 256, H_fused, W_fused]
 
-        return panet_features  # List of multi-scale fused features
+        # --- Head pose head ---
+        head_pose_6d = self.head_pose_head(fused)     # [B, 6] (6D pose vector)
+
+        # Optional: return other heads, intermediate features, etc.
+        return {
+            "head_pose_6d": head_pose_6d,
+            # "gaze": ...,       # To be added
+            # "mesh": ...,       # To be added
+            "features": panet_features, # Optional for debug/visualization
+            "fused": fused
+        }
 
 
 if __name__ == '__main__':
@@ -57,5 +77,7 @@ if __name__ == '__main__':
 
     x = torch.randn(2, 3, 448, 448).to(device)  # <-- put input on the right device!
     features = raynet_model(x)
-    for idx, f in enumerate(features):
+    print("Head pose 6D shape:", features["head_pose_6d"].shape)  # Should be [2, 6]
+    print("Fused features shape:", features["fused"].shape)       # Should be [2, 256, H, W]
+    for idx, f in enumerate(features["features"]):
         print(f"PANet output P{idx + 2}: {f.shape}")
