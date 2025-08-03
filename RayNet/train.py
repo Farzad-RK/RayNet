@@ -61,7 +61,7 @@ def main():
     dataset = GazeGeneDataset(
         args.base_dir,
         subject_ids=subject_ids,
-        samples_per_subject=args.samples_per_subject,       # Only 50 random frames per subject
+        samples_per_subject=args.samples_per_subject,
         transform=None,               # or your torchvision transforms
         balance_attributes=['ethicity']  # or other attribute(s) from subject_label.pkl
     )
@@ -202,7 +202,7 @@ def main():
                 )
 
         # -- Save checkpoint
-        if (epoch + 1) % args.checkpoint_freq == 0:
+        if (epoch + 1) % args.checkpoint_freq == 0 or (epoch + 1) == args.epochs:
             ckpt_path = os.path.join(args.checkpoint_dir, f"raynet_epoch{epoch+1}.pth")
             torch.save({
                 'model': model.state_dict(),
