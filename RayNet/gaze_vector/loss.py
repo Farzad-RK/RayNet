@@ -80,7 +80,6 @@ def multiview_gaze_vector_geodesic_losses(gaze6d_pred, gaze_vec_gt):
 
     # 4. Consistency loss: distance to sample mean
     mean_pred = pred_rotmat.mean(dim=1)  # [B, 3, 3]
-    mean_pred = ortho6d_to_rotmat(mean_pred)
     cons_loss = geo(
         pred_rotmat.reshape(-1, 3, 3),
         mean_pred.unsqueeze(1).expand(-1, N, -1, -1).reshape(-1, 3, 3)

@@ -11,6 +11,8 @@ from gaze_vector.model import GazeVectorRegressionHead
 from gaze_point.model import GazePointRegressionHead
 from pupil_center.model import PupilCenterRegressionHead
 
+from torch.utils.checkpoint import checkpoint
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -41,11 +43,11 @@ class RayNet(nn.Module):
 
 
     def forward(self, x):
-        c0 = self.backbone.stem(x)  # stride=4
-        c1 = self.backbone.stages[0](c0)  # stride=4
-        c2 = self.backbone.stages[1](c1)  # stride=8
-        c3 = self.backbone.stages[2](c2)  # stride=16
-        c4 = self.backbone.stages[3](c3)  # stride=32
+        c0 = checkpoint(self.backbone.stem, x) # stride=4
+        c1 = checkpoint(self.backbone.stages[0], c0) # stride=4
+        c2 = checkpoint(self.backbone.stages[1], c1) # stride=8
+        c3 = checkpoint(self.backbone.stages[2], c2) # stride=16
+        c4 = checkpoint(self.backbone.stages[3], c3) # stride=32
 
         # All four stages used
         features = [c1, c2, c3, c4]
