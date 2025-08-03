@@ -33,35 +33,32 @@ class GeodesicLoss(nn.Module):
         theta = torch.acos(torch.clamp(cos, -1 + self.eps, 1 - self.eps))  # [B]
         return torch.mean(theta)
 
-def multiview_headpose_losses(rotmats_pred, rotmats_gt):
+def multiview_headpose_losses(pred_6d, gt_rotmats):
     """
-    Compute multi-view head pose loss for MGDA: per-view geodesic loss (accuracy) and
-    inter-view geodesic consistency loss.
-
     Args:
-        rotmats_pred: torch.Tensor, [B, 9, 3, 3]  (predicted rotation matrices for all views)
-        rotmats_gt:   torch.Tensor, [B, 9, 3, 3]  (ground truth)
-
+        pred_6d: [B, 9, 6]   (raw 6D head pose predictions)
+        gt_rotmats: [B, 9, 3, 3]  (ground truth rotmats)
     Returns:
-        dict:
-            - 'accuracy': mean geodesic loss between each predicted rotation and ground truth
-            - 'consistency': mean geodesic loss between each view prediction and the sample mean prediction
+        dict: { 'accuracy': ..., 'consistency': ... }
     """
-    B, N, _, _ = rotmats_pred.shape  # B=batch, N=views (usually 9)
+
+    B, N, _ = pred_6d.shape
     geo = GeodesicLoss()
 
-    # 1. Per-view accuracy loss
+    # 1. Convert 6D to rotmat
+    pred_rotmats = ortho6d_to_rotmat(pred_6d.reshape(-1, 6)).reshape(B, N, 3, 3)
+
+    # 2. Per-view accuracy
     acc_loss = geo(
-        rotmats_pred.reshape(-1, 3, 3),   # [B*N, 3, 3]
-        rotmats_gt.reshape(-1, 3, 3)      # [B*N, 3, 3]
+        pred_rotmats.reshape(-1, 3, 3),
+        gt_rotmats.reshape(-1, 3, 3)
     )
 
-    # 2. Consistency loss: distance to mean prediction (per sample)
-    mean_pred = rotmats_pred.mean(dim=1)  # [B, 3, 3]
-    mean_pred = ortho6d_to_rotmat(mean_pred)  # Optional, can skip for speed
+    # 3. Consistency: distance to mean prediction
+    mean_pred = pred_rotmats.mean(dim=1)  # [B, 3, 3]
     cons_loss = geo(
-        rotmats_pred.reshape(-1, 3, 3),                                   # [B*N, 3, 3]
-        mean_pred.unsqueeze(1).expand(-1, N, -1, -1).reshape(-1, 3, 3)    # [B*N, 3, 3]
+        pred_rotmats.reshape(-1, 3, 3),
+        mean_pred.unsqueeze(1).expand(-1, N, -1, -1).reshape(-1, 3, 3)
     )
 
     return {
@@ -70,6 +67,3 @@ def multiview_headpose_losses(rotmats_pred, rotmats_gt):
     }
 
 
-# Example usage in your training loop (MGDA-ready):
-# losses = multiview_headpose_losses(preds, gt)  # preds, gt: [B, 9, 3, 3]
-# mgda_losses = [losses['accuracy'], losses['consistency']]

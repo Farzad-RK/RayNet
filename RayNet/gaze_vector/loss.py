@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 
-from sixdrepnet.utils import compute_rotation_matrix_from_ortho6d, normalize_vector
+from sixdrepnet.utils import normalize_vector
 from RayNet.utils import ortho6d_to_rotmat
 
 class GeodesicLoss(nn.Module):
@@ -49,7 +49,7 @@ def gaze_vector_to_rotmat(gaze_vec):
 
 def multiview_gaze_vector_geodesic_losses(gaze6d_pred, gaze_vec_gt):
     """
-    Multi-view gaze vector loss for MGDA.
+    Multi-view gaze vector loss.
     Computes per-view geodesic loss (accuracy) and consistency loss.
 
     Args:
@@ -63,7 +63,7 @@ def multiview_gaze_vector_geodesic_losses(gaze6d_pred, gaze_vec_gt):
     geo = GeodesicLoss()
 
     # 1. Convert 6D to rotmat (predicted)
-    pred_rotmat = compute_rotation_matrix_from_ortho6d(
+    pred_rotmat = ortho6d_to_rotmat(
         gaze6d_pred.reshape(-1, 6)
     ).reshape(B, N, 3, 3)  # [B, N, 3, 3]
 

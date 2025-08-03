@@ -134,7 +134,6 @@ def main():
             N = 9
             # Head pose GT is [B*9, 3, 3], reshape to [B, N, 3, 3]
             head_pose_pred = outputs["head_pose_6d"].view(B, N, 6)
-            head_pose_pred = compute_rotation_matrix_from_ortho6d(head_pose_pred.view(-1, 6)).view(B, N, 3, 3)
             # Gaze vector GT is [B*9, 3], reshape to [B, N, 3]
             gaze_vector_pred = outputs["gaze_vector_6d"].view(B, N, 6)
             # Gaze point GT is [B*9, 3], reshape to [B, N, 3]
