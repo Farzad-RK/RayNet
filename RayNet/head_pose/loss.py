@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+from RayNet.utils import orthogonalize_rotmat
 
 class GeodesicLoss(nn.Module):
     """
@@ -68,24 +69,6 @@ def multiview_headpose_losses(rotmats_pred, rotmats_gt):
         'consistency': cons_loss
     }
 
-def orthogonalize_rotmat(rotmat):
-    """
-    Projects a batch of 3x3 matrices to the closest rotation matrix using SVD.
-
-    Args:
-        rotmat: [B, 3, 3]
-    Returns:
-        [B, 3, 3] (rotation matrices)
-    """
-    # SVD-based projection
-    U, _, Vt = torch.linalg.svd(rotmat)
-    R = torch.matmul(U, Vt)
-    # Enforce det(R) = +1 (rotation, not reflection)
-    det = torch.det(R)
-    det_sign = det.sign().unsqueeze(-1).unsqueeze(-1)
-    Vt = Vt * det_sign
-    R = torch.matmul(U, Vt)
-    return R
 
 # Example usage in your training loop (MGDA-ready):
 # losses = multiview_headpose_losses(preds, gt)  # preds, gt: [B, 9, 3, 3]
