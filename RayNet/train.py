@@ -8,18 +8,18 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from raynet import RayNet
-from mgda import mgda_loss
 from dataset import GazeGeneDataset, MultiViewBatchSampler
 
 from head_pose.loss import multiview_headpose_losses
 from gaze_vector.loss import multiview_gaze_vector_geodesic_losses
 from gaze_point.loss import multiview_gaze_point_losses
 from pupil_center.loss import multiview_pupil_center_losses
-
+from sixdrepnet.utils import compute_rotation_matrix_from_ortho6d
+from pcgrad import PCGrad
 # Optional: from utils import ... (for seeding, reproducibility, etc.)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="RayNet MGDA Multitask Training")
+    parser = argparse.ArgumentParser(description="RayNet PCGrad Multitask Training")
     parser.add_argument('--base_dir', type=str, required=True, help="Root of GazeGene dataset")
     parser.add_argument('--backbone_name', type=str, default="repnext_m3")
     parser.add_argument('--weight_path', type=str, default="./repnext_m3_pretrained.pt")
@@ -36,8 +36,6 @@ def parse_args():
                         help="Use official GazeGene train/test split")
 
 
-    # MGDA params
-    parser.add_argument('--mgda_eps', type=float, default=1e-7)
     # Add any other hyperparams here
     return parser.parse_args()
 
@@ -50,7 +48,7 @@ def main():
     args = parse_args()
 
     if args.split == "train":
-        subject_ids = [f"subject{i}" for i in range(46)]
+        subject_ids = [f"subject{i}" for i in range(1,46)]
     else:
         subject_ids = [f"subject{i}" for i in range(46, 56)]
 
@@ -61,12 +59,15 @@ def main():
 
     # -- Dataset and loader
     dataset = GazeGeneDataset(
-        base_dir=args.base_dir,
-        samples_per_subject=args.samples_per_subject
+        args.base_dir,
+        subject_ids=subject_ids,
+        samples_per_subject=args.samples_per_subject,       # Only 50 random frames per subject
+        transform=None,               # or your torchvision transforms
+        balance_attributes=['ethicity']  # or other attribute(s) from subject_label.pkl
     )
-    batch_sampler = MultiViewBatchSampler(dataset, shuffle=True)
-    loader = DataLoader(dataset, batch_sampler=batch_sampler,
-                        num_workers=args.num_workers, pin_memory=True)
+
+    batch_sampler = MultiViewBatchSampler(dataset, balance_attributes=['ethicity'], shuffle=True)
+    loader = DataLoader(dataset, batch_sampler=batch_sampler, num_workers=4)
 
     # -- Backbone, RayNet, etc.
     backbone_channels_dict = {
@@ -93,16 +94,9 @@ def main():
         "gaze_vector_acc", "gaze_vector_cons",
         "gaze_point_acc", "gaze_point_cons",
         "pupil_center_acc", "pupil_center_cons",
-        "mgda_lambda_head_pose", "mgda_lambda_gaze_vector",
-        "mgda_lambda_gaze_point", "mgda_lambda_pupil_center",
-        "mgda_total_loss"
     ])
     csv_writer.writeheader()
 
-    # -- MGDA config (log once)
-    print(f"Using MGDA with eps={args.mgda_eps}")
-    print("Writing MGDA config to log file.")
-    logfile.write("# MGDA config: eps={}, version='MGDA-UB'\n".format(args.mgda_eps))
 
     start_epoch = 0
     # --- Resume logic (if needed)
@@ -138,8 +132,12 @@ def main():
             # Reshape for multi-view [B, 9, ...]
             B = head_pose_gt.shape[0] // 9
             N = 9
+            # Head pose GT is [B*9, 3, 3], reshape to [B, N, 3, 3]
             head_pose_pred = outputs["head_pose_6d"].view(B, N, 6)
+            head_pose_pred = compute_rotation_matrix_from_ortho6d(head_pose_pred.view(-1, 6)).view(B, N, 3, 3)
+            # Gaze vector GT is [B*9, 3], reshape to [B, N, 3]
             gaze_vector_pred = outputs["gaze_vector_6d"].view(B, N, 6)
+            # Gaze point GT is [B*9, 3], reshape to [B, N, 3]
             gaze_point_pred = outputs["gaze_point_3d"].view(B, N, 3)
             pupil_center_pred = outputs["pupil_center_3d"].view(B, N, 2, 3)
 
@@ -166,11 +164,18 @@ def main():
                     continue
                 shared_params.append(p)
 
-            total_loss, lambdas = mgda_loss(per_task_total, shared_params, eps=args.mgda_eps)
+            # Instantiate PCGrad once, after you build your optimizer:
+            pc_optimizer = PCGrad(optimizer)
 
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
+            # … inside each training step …
+            # per_task_total is your list: [head_loss, gaze_vec_loss, gaze_point_loss, pupil_center_loss]
+            shared_params = [p for n, p in model.named_parameters() if p.requires_grad]
+
+            # 1) De‐conflict & accumulate grads:
+            pc_optimizer.pc_backward(per_task_total, shared_params, retain_graph=True)
+
+            # 2) Take the optimizer step:
+            pc_optimizer.step()
 
             # Logging step/epoch results
             log_dict = {
@@ -184,11 +189,6 @@ def main():
                 "gaze_point_cons": float(gaze_point_losses['consistency']),
                 "pupil_center_acc": float(pupil_center_losses['accuracy']),
                 "pupil_center_cons": float(pupil_center_losses['consistency']),
-                "mgda_lambda_head_pose": float(lambdas[0]),
-                "mgda_lambda_gaze_vector": float(lambdas[1]),
-                "mgda_lambda_gaze_point": float(lambdas[2]),
-                "mgda_lambda_pupil_center": float(lambdas[3]),
-                "mgda_total_loss": float(total_loss),
             }
             csv_writer.writerow(log_dict)
             logfile.flush()
@@ -200,8 +200,6 @@ def main():
                     f"GV: {log_dict['gaze_vector_acc']:.4f}/{log_dict['gaze_vector_cons']:.4f} | "
                     f"GP: {log_dict['gaze_point_acc']:.4f}/{log_dict['gaze_point_cons']:.4f} | "
                     f"PC: {log_dict['pupil_center_acc']:.4f}/{log_dict['pupil_center_cons']:.4f} | "
-                    f"MGDA lambdas: {[f'{w:.3f}' for w in lambdas]} | "
-                    f"Total: {total_loss:.4f}"
                 )
 
         # -- Save checkpoint

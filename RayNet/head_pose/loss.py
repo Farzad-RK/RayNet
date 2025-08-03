@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from RayNet.utils import orthogonalize_rotmat
+from RayNet.utils import ortho6d_to_rotmat
 
 class GeodesicLoss(nn.Module):
     """
@@ -58,7 +58,7 @@ def multiview_headpose_losses(rotmats_pred, rotmats_gt):
 
     # 2. Consistency loss: distance to mean prediction (per sample)
     mean_pred = rotmats_pred.mean(dim=1)  # [B, 3, 3]
-    mean_pred = orthogonalize_rotmat(mean_pred)  # Optional, can skip for speed
+    mean_pred = ortho6d_to_rotmat(mean_pred)  # Optional, can skip for speed
     cons_loss = geo(
         rotmats_pred.reshape(-1, 3, 3),                                   # [B*N, 3, 3]
         mean_pred.unsqueeze(1).expand(-1, N, -1, -1).reshape(-1, 3, 3)    # [B*N, 3, 3]

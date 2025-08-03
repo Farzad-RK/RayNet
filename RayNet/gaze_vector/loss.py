@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from sixdrepnet.utils import compute_rotation_matrix_from_ortho6d, normalize_vector
-from RayNet.utils import orthogonalize_rotmat
+from RayNet.utils import ortho6d_to_rotmat
 
 class GeodesicLoss(nn.Module):
     """
@@ -80,7 +80,7 @@ def multiview_gaze_vector_geodesic_losses(gaze6d_pred, gaze_vec_gt):
 
     # 4. Consistency loss: distance to sample mean
     mean_pred = pred_rotmat.mean(dim=1)  # [B, 3, 3]
-    mean_pred = orthogonalize_rotmat(mean_pred)
+    mean_pred = ortho6d_to_rotmat(mean_pred)
     cons_loss = geo(
         pred_rotmat.reshape(-1, 3, 3),
         mean_pred.unsqueeze(1).expand(-1, N, -1, -1).reshape(-1, 3, 3)
