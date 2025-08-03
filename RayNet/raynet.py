@@ -63,7 +63,7 @@ class RayNet(nn.Module):
         # --- Pupil center ---
         pupil_center = self.pupil_center_regression(fused) # [B, 2, 3] (left and right pupil centers in 3D space)
 
-        # Optional: return other heads, intermediate features, etc.
+
         return {
             "head_pose_6d": head_pose_6d,
             "gaze_vector_6d": gaze_vector,  # [B, 3] (gaze vector),

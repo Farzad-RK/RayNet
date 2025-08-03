@@ -4,7 +4,6 @@ import argparse
 import os
 import csv
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
@@ -33,6 +32,10 @@ def parse_args():
     parser.add_argument('--log_csv', type=str, default="train_log.csv")
     parser.add_argument('--checkpoint_freq', type=int, default=5)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--split', type=str, default="train", choices=["train", "test"],
+                        help="Use official GazeGene train/test split")
+
+
     # MGDA params
     parser.add_argument('--mgda_eps', type=float, default=1e-7)
     # Add any other hyperparams here
@@ -45,6 +48,12 @@ def get_backbone(backbone_name, weight_path, device):
 
 def main():
     args = parse_args()
+
+    if args.split == "train":
+        subject_ids = [f"subject{i}" for i in range(46)]
+    else:
+        subject_ids = [f"subject{i}" for i in range(46, 56)]
+
     torch.manual_seed(args.seed)
 
     # -- Device
