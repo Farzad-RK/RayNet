@@ -253,10 +253,12 @@ This documentation details the mid/high-level pipeline **from PANet fusion onwar
 2. **Concatenate along channel dimension** (result: `[B, 4*256, 112, 112]`).
 3. **Reduce to 256 channels** via a 1x1 convolution (optional BatchNorm + activation).
 
-#### Output Shape
+### Fusion Example
 
-- `fused`: `[B, 256, 112, 112]`
-
+```python
+# fusion = MultiScaleFusion(in_channels=256, n_scales=4, out_channels=256)
+fused = fusion([P2, P3, P4, P5])  # [B, 256, 112, 112]
+```
 ---
 
 ### 3. Coordinate Attention
@@ -268,7 +270,7 @@ After fusion, **Coordinate Attention** (CoordAtt) is applied to further enhance 
 
 ---
 
-## Head Pose Regression Head
+## Head Pose Regression
 
 ### Location
 
@@ -296,14 +298,207 @@ This regression head takes the fused, coordinate-attended feature map and regres
 
 ---
 
-## Code Snippets
 
-### Fusion Example
+## Gaze Vector Regression
 
-```python
-# fusion = MultiScaleFusion(in_channels=256, n_scales=4, out_channels=256)
-fused = fusion([P2, P3, P4, P5])  # [B, 256, 112, 112]
-```
+### Location
+
+- **Implementation:** `gaze_vector/model.py`
+- **Loss function:** `gaze_vector/loss.py` (Geodesic loss)
+
+### Description
+
+The **Gaze Vector Head** in RayNet is designed for efficient, multi-view, calibration-free gaze direction estimation. It leverages state-of-the-art neural rotation representations and loss functions, and is fully compatible with the GazeGene dataset and multi-task MGDA training.
+
+---
+
+## Architecture
+
+* **Input:**
+  Fused multi-scale feature maps (`[B, C, H, W]`) from RayNet’s backbone and PANet.
+* **Coordinate Attention:**
+  Efficiently highlights spatial and channel-wise information for robust directionality (see `coordatt.py`).
+* **MLP Regression:**
+  Coordinate-attended features are globally pooled and regressed via an MLP to a **6D rotation representation** (see below).
+* **Output:**
+  Each sample yields a 6D vector per view; convertible to a 3×3 rotation matrix using the `compute_rotation_matrix_from_ortho6d` utility.
+
+*For detailed code, see:*
+[`gaze_vector/model.py`](./head_gaze/model.py)
+
+---
+
+## 6D Rotation Representation
+
+* We use the **6D representation of rotations** (Zhou et al., ECCV 2019), which is:
+
+  * Continuous
+  * Unique
+  * Free from ambiguities of Euler angles or quaternions
+* The 6D vector is converted to a rotation matrix (`3×3`) before loss calculation, ensuring geometric correctness.
+
+---
+
+## Loss Function
+
+* **Geodesic Loss on SO(3):**
+
+  * Computes the angular distance between predicted and ground-truth gaze rotations.
+  * This is more meaningful for 3D orientation than L2 or cosine loss.
+* **Multi-View Loss Structure (MGDA-ready):**
+
+  * **Accuracy Loss:** Per-view geodesic error between each prediction and its ground truth.
+  * **Consistency Loss:** Geodesic error between each view’s prediction and the mean prediction across all 9 views (enforcing multi-view consistency).
+
+*For implementation, see:*
+[`gaze_vector/loss.py`](./head_gaze/loss.py)
+
+---
+
+
+## Gaze Point Regression
+
+### Location
+
+* **Implementation:** `gaze_point/model.py`
+* **Loss function:** `gaze_point/loss.py` (Multi-view L2 loss)
+
+### Description
+
+The **Gaze Point Head** in RayNet predicts the 3D intersection point of the gaze ray in camera space. It is optimized for calibration-free, multi-view gaze estimation, fully leveraging the rich geometry of the GazeGene dataset. The design enables direct regression of gaze intersection points in 3D space, supporting robust multi-task training and downstream applications like gaze-based UX or AR/VR annotation.
+
+---
+
+## Architecture
+
+* **Input:**
+  Fused multi-scale feature maps (`[B, C, H, W]`) from RayNet’s backbone and PANet.
+* **Coordinate Attention:**
+  Uses coordinate attention (`CoordAtt`) to efficiently aggregate spatial and channel cues relevant for accurate 3D localization (see `coordatt.py`).
+* **MLP Regression:**
+  The attended feature vector is globally pooled and regressed via an MLP to a 3D gaze point (`[x, y, z]`).
+* **Output:**
+  Each sample (or view) yields a **3D point in camera coordinates**.
+
+*For detailed code, see:*
+[`gaze_point/model.py`](./gaze_point/model.py)
+
+---
+
+## Loss Function
+
+* **Multi-View L2 (Euclidean) Loss:**
+
+  * **Accuracy Loss:** Per-view Euclidean distance between each predicted gaze point and its ground truth.
+  * **Consistency Loss:** Euclidean distance between each view’s prediction and the mean prediction across all 9 views (enforcing geometric consistency in 3D space).
+* **MGDA-Ready:**
+  Both losses are compatible with multi-task optimization (MGDA), allowing for joint and balanced learning with head pose and gaze direction.
+
+*For implementation, see:*
+[`gaze_point/loss.py`](./gaze_point/loss.py)
+
+---
+
+## Dataset Compatibility
+
+* **GazeGene Format:**
+
+  * Ground truth for each sample is a 3D point (`gaze_point` field) in **camera coordinates**.
+  * When using the `MultiViewBatchSampler`, both predictions and ground truth will be in `[B, 9, 3]` format for easy, batch-wise, multi-view loss computation.
+
+---
+
+## Theoretical Rationale
+
+* The use of **L2 loss in 3D space** directly optimizes the endpoint error, which is the standard metric for point-based gaze estimation in modern datasets (e.g., ETH-XGaze, Gaze360).
+* **Multi-view consistency loss** ensures predictions from all camera views converge to a common intersection point, leveraging the multi-camera structure of GazeGene for better generalization and robustness.
+* **Coordinate Attention** ensures the model is spatially aware and efficient, making the head lightweight and well-suited for mobile inference.
+
+---
+
+
+## Dataset Compatibility
+
+* **GazeGene Format:**
+
+  * Ground truth for each sample is a normalized 3D gaze vector (`gaze_C`).
+  * For loss calculation, this vector is converted to a rotation matrix using a canonical frame, ensuring predictions and targets are always compared in **3D camera coordinates**.
+
+    
+
+
+---
+
+## Pupil Center Regression
+
+### Location
+
+* **Implementation:** `pupil_center/model.py`
+* **Loss function:** `pupil_center/loss.py` (Multi-view L2/MSE loss)
+
+---
+
+### Description
+
+The **Pupil Center Head** in RayNet predicts the 3D location of both left and right pupil centers from fused multi-scale feature maps. It is designed for efficient, multi-view, calibration-free inference, fully compatible with the GazeGene dataset and MGDA-based multi-task learning.
+
+---
+
+## Architecture
+
+* **Input:**
+
+  * Fused multi-scale feature maps (`[B, C, H, W]`) from RayNet’s backbone and PANet.
+* **Coordinate Attention:**
+
+  * Efficiently encodes spatial and channel-wise cues (see `coordatt.py`).
+* **MLP Regression:**
+
+  * Features are globally pooled, then mapped via an MLP to a 6D vector (3D for each eye).
+* **Output:**
+
+  * Each sample yields a `[2, 3]` tensor: left and right pupil centers in 3D camera coordinates.
+
+*For detailed code, see:*
+[`pupil_center/model.py`](./pupil_center/model.py)
+
+---
+
+## Output Format
+
+* **Predicted:**
+  `[B, 2, 3]` for single-view, `[B, 9, 2, 3]` for multi-view batches
+* **Target (GazeGene):**
+  `'pupil_center_3D'` field, shape `[2, 3]` (left/right eye, 3D)
+
+---
+
+## Loss Function
+
+* **Multi-View L2 Loss:**
+
+  * **Accuracy:**
+
+    * Computes MSE (Euclidean) error for each view’s prediction to the ground truth.
+  * **Consistency:**
+
+    * Computes the error between each view’s prediction and the mean prediction across all views (enforces multi-view consistency).
+  * Fully MGDA-ready (losses provided as a dictionary).
+
+*For implementation, see:*
+[`pupil_center/loss.py`](./pupil_center/loss.py)
+
+---
+
+## Dataset Compatibility
+
+* **GazeGene Format:**
+
+  * Ground truth for each sample is `pupil_center_3D` (per eye, in 3D camera coordinates).
+  * Compatible with both single-view and multi-view (all 9 cameras) training strategies.
+  * Outputs are in a fully abstracted, camera-centric 3D space, suitable for further geometric operations or visualization.
+
+---
 
 ## Theory and Design Rationale
 
@@ -378,10 +573,7 @@ All PANet fusion logic adapts automatically to the channel widths of your select
 
 ---
 
-**Author:** *Your Name or Lab*
-**Last updated:** *YYYY-MM-DD*
+**Author:** *Farzad Rahim Khanian*
 
 ---
-
-Let me know if you want this as a separate README file, want additional figures/diagrams, or need inline code docstrings as well!
-
+## License

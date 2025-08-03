@@ -7,6 +7,9 @@ from fusion import MultiScaleFusion
 
 
 from head_pose.model import HeadPoseRegressionHead
+from gaze_vector.model import GazeVectorRegressionHead
+from gaze_point.model import GazePointRegressionHead
+from pupil_center.model import PupilCenterRegressionHead
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -25,9 +28,17 @@ class RayNet(nn.Module):
         self.fusion = MultiScaleFusion(in_channels=panet_out_channels, n_scales=4, out_channels=256)
 
         # --- Head pose regression head ---
-        self.head_pose_head = HeadPoseRegressionHead(in_channels=256, hidden_dim=128, reduction=32)
+        self.head_pose_regression = HeadPoseRegressionHead(in_channels=256, hidden_dim=128, reduction=32)
 
-        # TODO: Add gaze/mesh heads later as needed
+        # --- Gaze vector regression head ---
+        self.gaze_vector_regression = GazeVectorRegressionHead(in_channels=256, hidden_dim=128, reduction=32)
+
+        # --- Gaze point regression head ---
+        self.gaze_point_regression = GazePointRegressionHead(in_channels=256, hidden_dim=128, reduction=32)
+
+        # pupil_center_regression = PupilCenterRegressionHead(in_channels=256, hidden_dim=128, reduction=32)
+        self.pupil_center_regression = PupilCenterRegressionHead(in_channels=256, hidden_dim=128, reduction=32)
+
 
     def forward(self, x):
         c0 = self.backbone.stem(x)  # stride=4
@@ -43,16 +54,21 @@ class RayNet(nn.Module):
         panet_features = self.panet(features)  # List of [B, C, H, W]
         fused = self.fusion(panet_features)  # [B, 256, H_fused, W_fused]
 
-        # --- Head pose head ---
-        head_pose_6d = self.head_pose_head(fused)     # [B, 6] (6D pose vector)
+        # --- Head pose ---
+        head_pose_6d = self.head_pose_regression(fused)     # [B, 6] (6D pose vector)
+        # --- Gaze vector ---
+        gaze_vector = self.gaze_vector_regression(fused)    # [B, 3] (gaze vector)
+        # --- Gaze point ---
+        gaze_point = self.gaze_point_regression(fused)      # [B, 3] (gaze point in 3D space)
+        # --- Pupil center ---
+        pupil_center = self.pupil_center_regression(fused) # [B, 2, 3] (left and right pupil centers in 3D space)
 
         # Optional: return other heads, intermediate features, etc.
         return {
             "head_pose_6d": head_pose_6d,
-            # "gaze": ...,       # To be added
-            # "mesh": ...,       # To be added
-            "features": panet_features, # Optional for debug/visualization
-            "fused": fused
+            "gaze_vector_6d": gaze_vector,  # [B, 3] (gaze vector),
+            "gaze_point_3d": gaze_point,  # [B, 3] (gaze point in 3D space),
+            "pupil_center_3d": pupil_center,  # [B, 2, 3] (left and right pupil centers in 3D space),
         }
 
 
@@ -78,6 +94,9 @@ if __name__ == '__main__':
     x = torch.randn(2, 3, 448, 448).to(device)  # <-- put input on the right device!
     features = raynet_model(x)
     print("Head pose 6D shape:", features["head_pose_6d"].shape)  # Should be [2, 6]
+    print("Gaze vector 6D shape:", features["gaze_vector_6d"].shape)  # Should be [2, 6]
+    print("Gaze point 3D shape:", features["gaze_point_3d"].shape)  # Should be [2, 3]
+    print("Pupil center 3D shape:", features["pupil_center_3d"].shape)  # Should be [2, 2, 3]
     print("Fused features shape:", features["fused"].shape)       # Should be [2, 256, H, W]
     for idx, f in enumerate(features["features"]):
         print(f"PANet output P{idx + 2}: {f.shape}")
