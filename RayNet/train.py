@@ -14,9 +14,8 @@ from head_pose.loss import multiview_headpose_losses
 from gaze_vector.loss import multiview_gaze_vector_geodesic_losses
 from gaze_point.loss import multiview_gaze_point_losses
 from pupil_center.loss import multiview_pupil_center_losses
-from sixdrepnet.utils import compute_rotation_matrix_from_ortho6d
 from pcgrad import PCGrad
-# Optional: from utils import ... (for seeding, reproducibility, etc.)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="RayNet PCGrad Multitask Training")
@@ -66,8 +65,8 @@ def main():
         balance_attributes=['ethicity']  # or other attribute(s) from subject_label.pkl
     )
 
-    batch_sampler = MultiViewBatchSampler(dataset, balance_attributes=['ethicity'], shuffle=True)
-    loader = DataLoader(dataset, batch_sampler=batch_sampler, num_workers=4)
+    batch_sampler = MultiViewBatchSampler(dataset,batch_size=args.batch_size, balance_attributes=['ethicity'], shuffle=True)
+    loader = DataLoader(dataset, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
 
     # -- Backbone, RayNet, etc.
     backbone_channels_dict = {

@@ -116,14 +116,16 @@ class GazeGeneDataset(Dataset):
 
 class MultiViewBatchSampler(Sampler):
     """
-    Each batch consists of all 9 camera views for a given (subject, frame).
+    Each batch consists of all 9 camera views for multiple (subject, frame) samples.
     Optionally balances over attributes like skin color, eye color, etc.
+    Supports dynamic batch sizes.
     """
-    def __init__(self, dataset, balance_attributes=None, shuffle=True):
+    def __init__(self, dataset, batch_size=1, balance_attributes=None, shuffle=True):
         self.index_by_key = dataset.index_by_key  # (subject, frame_idx) -> [indices for all cameras]
         self.keys = list(self.index_by_key.keys())
         self.balance_attributes = balance_attributes
         self.shuffle = shuffle
+        self.batch_size = batch_size
 
         if balance_attributes:
             self.grouped_keys = defaultdict(list)
@@ -141,43 +143,44 @@ class MultiViewBatchSampler(Sampler):
         if self.grouped_keys:
             group_keys = self.groups.copy()
             if self.shuffle: random.shuffle(group_keys)
-            all_batches = []
+            all_keys = []
             for g in group_keys:
                 klist = self.grouped_keys[g]
                 if self.shuffle: random.shuffle(klist)
-                all_batches.extend(klist)
-            if self.shuffle: random.shuffle(all_batches)
-            for k in all_batches:
-                indices = self.index_by_key[k]
-                if len(indices) == 9:  # all cameras present
-                    yield indices
+                all_keys.extend(klist)
+            if self.shuffle: random.shuffle(all_keys)
         else:
-            keys = self.keys.copy()
-            if self.shuffle: random.shuffle(keys)
-            for k in keys:
-                indices = self.index_by_key[k]
-                if len(indices) == 9:
-                    yield indices
+            all_keys = self.keys.copy()
+            if self.shuffle: random.shuffle(all_keys)
+
+        batch = []
+        for k in all_keys:
+            indices = self.index_by_key[k]
+            if len(indices) == 9:  # Ensure all cameras present
+                batch.extend(indices)
+                if len(batch) == 9 * self.batch_size:
+                    yield batch
+                    batch = []
+
+        if batch:  # Yield remaining samples
+            yield batch
 
     def __len__(self):
-        if self.grouped_keys:
-            return sum(len(v) for v in self.grouped_keys.values())
-        return len(self.keys)
+        total_complete_samples = len(self.keys)
+        return total_complete_samples // self.batch_size
+
 
 # --- USAGE EXAMPLE ---
-if __name__ == '__main__':
-    base_dir = './GazeGene_FaceCrops'
-    dataset = GazeGeneDataset(
-        base_dir,
-        samples_per_subject=50,       # Only 50 random frames per subject
-        transform=None,               # or your torchvision transforms
-        balance_attributes=['ethicity']  # or other attribute(s) from subject_label.pkl
-    )
-
-    batch_sampler = MultiViewBatchSampler(dataset, balance_attributes=['ethicity'], shuffle=True)
-    loader = DataLoader(dataset, batch_sampler=batch_sampler, num_workers=4)
-
-    for batch in loader:
-        # batch['img'] is a list of 9 images (all cameras) per sample
-        print(batch['img'][0].shape, batch['gaze']['gaze_C'][0])
-        break  # just demo
+# batch_sampler = MultiViewBatchSampler(
+#     dataset,
+#     batch_size=args.batch_size,
+#     balance_attributes=['ethicity'],
+#     shuffle=True
+# )
+#
+# loader = DataLoader(
+#     dataset,
+#     batch_sampler=batch_sampler,
+#     num_workers=args.num_workers,
+#     pin_memory=True
+# )
