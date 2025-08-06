@@ -16,7 +16,7 @@ from gaze_vector.loss import multiview_gaze_vector_geodesic_losses
 from gaze_point.loss import multiview_gaze_point_losses
 from gaze_depth.loss import multiview_gaze_depth_losses
 from pupil_center.loss import multiview_pupil_center_losses
-from ray_consistency.loss import ray_consistency_loss
+from ray_consistency_loss import multiview_ray_consistency_loss
 from cagrad import CAGrad
 
 import matplotlib.pyplot as plt
@@ -177,7 +177,11 @@ def main():
             gaze_point_pred = outputs["gaze_point_3d"].view(B, N, 3)
             gaze_depth_pred = outputs["gaze_depth"].view(B, N)
             pupil_center_pred = outputs["pupil_center_3d"].view(B, N, 2, 3)
+            # Ray parameters
             gaze_point_from_ray = outputs["gaze_point_from_ray"].view(B, N, 3)
+            origin = outputs["origin"].view(B, N, 3)
+            direction = outputs["direction"].view(B, N, 3)
+
 
             # Compute all losses
             head_pose_losses = multiview_headpose_losses(head_pose_pred, head_pose_gt.view(B, N, 3, 3))
@@ -185,9 +189,12 @@ def main():
             gaze_point_losses = multiview_gaze_point_losses(gaze_point_pred, gaze_point_gt.view(B, N, 3))
             gaze_depth_losses = multiview_gaze_depth_losses(gaze_depth_pred, gaze_depth_gt.view(B, N))
             pupil_center_losses = multiview_pupil_center_losses(pupil_center_pred, pupil_center_gt.view(B, N, 2, 3))
-            ray_consist_loss = ray_consistency_loss(
-                gaze_point_from_ray, gaze_point_gt.view(B, N, 3)
-            )
+            ray_consist_loss = multiview_ray_consistency_loss(
+                origins=origin,  # [B, N, 3]
+                directions=direction,  # [B, N, 3]
+                gaze_depths=gaze_depth_pred,  # [B, N]
+                gaze_points_pred=gaze_point_pred  # [B, N, 3]
+            )["total"]  # Total loss
 
             # Normalize (online, running min/max)
             for key, loss_val in [

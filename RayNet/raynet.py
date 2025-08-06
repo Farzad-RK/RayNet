@@ -13,6 +13,7 @@ from pupil_center.model import PupilCenterRegressionHead
 from gaze_depth.model import GazeDepthRegressionHead
 
 from torch.utils.checkpoint import checkpoint
+from utils import ortho6d_to_rotmat
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -70,7 +71,9 @@ class RayNet(nn.Module):
         # --- Gaze depth ---
         gaze_depth = self.gaze_depth_regression(fused)  # [B]
         # Normalize gaze vector for direction
-        direction = gaze_vector / (gaze_vector.norm(dim=1, keepdim=True) + 1e-8)  # [B, 3]
+        rotmat = ortho6d_to_rotmat(gaze_vector)  # [B, 3, 3]
+        direction = rotmat[:, :, 2]  # [B, 3]  (the gaze direction)
+        direction = direction / (direction.norm(dim=1, keepdim=True) + 1e-8)
 
         # Use mean of left/right eyes as origin
         origin = pupil_center.mean(dim=1)            # [B, 3]

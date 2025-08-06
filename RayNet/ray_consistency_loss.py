@@ -1,27 +1,42 @@
 import torch
 import torch.nn.functional as F
 
-def multiview_ray_consistency_loss(origins, directions, gaze_points_from_ray):
+def multiview_ray_consistency_loss(origins, directions, gaze_depths, gaze_points_pred):
     """
-    Simplified ray consistency loss across multiple views.
+    Ray consistency loss: how well does the predicted ray (origin + d * direction) match the gaze point prediction,
+    and how consistent are reconstructed gaze points across all views.
 
     Args:
-        origins: [B, N, 3] - pupil centers (origins of rays).
-        directions: [B, N, 3] - normalized gaze directions.
-        gaze_points_from_ray: [B, N, 3] - gaze points reconstructed from ray equation.
-
+        origins:         [B, N, 3] - predicted origins of rays (pupil centers)
+        directions:      [B, N, 3] - predicted, normalized gaze directions
+        gaze_depths:     [B, N]    - predicted depths for each ray
+        gaze_points_pred:[B, N, 3] - predicted gaze point (direct regression, per view)
     Returns:
-        scalar: ray consistency loss.
+        dict: {
+            "reconstruction": loss between (origin + depth * direction) and predicted gaze_point,
+            "consistency": loss between all reconstructed gaze points and their mean,
+            "total": weighted sum of above
+        }
     """
-    B, N, _ = origins.shape
 
-    # Compute the mean gaze point reconstructed from rays across all views
-    mean_gaze_point = gaze_points_from_ray.mean(dim=1, keepdim=True)  # [B, 1, 3]
+    # [B, N, 3]: reconstruct the gaze point from the predicted ray
+    gaze_point_from_ray = origins + gaze_depths.unsqueeze(-1) * directions
 
-    # Consistency: reconstructed gaze points should be close to the mean across views
-    gaze_point_consistency = F.mse_loss(
-        gaze_points_from_ray,
-        mean_gaze_point.expand_as(gaze_points_from_ray)
-    )
+    # 1. Ray reconstruction loss: how close is reconstructed point to directly predicted point?
+    ray_reconstruction_loss = F.mse_loss(gaze_point_from_ray, gaze_points_pred)
 
-    return gaze_point_consistency
+    # 2. Ray consistency loss: are all reconstructed points in the batch aligned?
+    mean_recon = gaze_point_from_ray.mean(dim=1, keepdim=True)  # [B, 1, 3]
+    ray_consistency_loss = F.mse_loss(gaze_point_from_ray, mean_recon.expand_as(gaze_point_from_ray))
+
+    # 3. Optionally, add consistency between origins, directions, and depths themselves
+    # (For more advanced constraint, but usually the two above suffice.)
+
+    # 4. Combine with adjustable weights
+    total = ray_reconstruction_loss + ray_consistency_loss
+
+    return {
+        "reconstruction": ray_reconstruction_loss,
+        "consistency": ray_consistency_loss,
+        "total": total
+    }
