@@ -10,6 +10,7 @@ from head_pose.model import HeadPoseRegressionHead
 from gaze_vector.model import GazeVectorRegressionHead
 from gaze_point.model import GazePointRegressionHead
 from pupil_center.model import PupilCenterRegressionHead
+from gaze_depth.model import GazeDepthRegressionHead
 
 from torch.utils.checkpoint import checkpoint
 
@@ -40,6 +41,8 @@ class RayNet(nn.Module):
 
         # pupil_center_regression = PupilCenterRegressionHead(in_channels=256, hidden_dim=128, reduction=32)
         self.pupil_center_regression = PupilCenterRegressionHead(in_channels=256, hidden_dim=128, reduction=32)
+        # --- Gaze depth regression head ---
+        self.gaze_depth_regression = GazeDepthRegressionHead(in_channels=256, hidden_dim=128, reduction=32)
 
 
     def forward(self, x):
@@ -64,13 +67,27 @@ class RayNet(nn.Module):
         gaze_point = self.gaze_point_regression(fused)      # [B, 3] (gaze point in 3D space)
         # --- Pupil center ---
         pupil_center = self.pupil_center_regression(fused) # [B, 2, 3] (left and right pupil centers in 3D space)
+        # --- Gaze depth ---
+        gaze_depth = self.gaze_depth_regression(fused)  # [B]
+        # Normalize gaze vector for direction
+        direction = gaze_vector / (gaze_vector.norm(dim=1, keepdim=True) + 1e-8)  # [B, 3]
 
+        # Use mean of left/right eyes as origin
+        origin = pupil_center.mean(dim=1)            # [B, 3]
+        # Reconstruct gaze point from ray (origin + depth × direction)
+        gaze_point_from_ray = origin + gaze_depth.unsqueeze(-1) * direction  # [B, 3]
 
+        # Prepare output dictionary
         return {
             "head_pose_6d": head_pose_6d,
-            "gaze_vector_6d": gaze_vector,  # [B, 3] (gaze vector),
-            "gaze_point_3d": gaze_point,  # [B, 3] (gaze point in 3D space),
-            "pupil_center_3d": pupil_center,  # [B, 2, 3] (left and right pupil centers in 3D space),
+            "gaze_vector_6d": gaze_vector,
+            "gaze_vector_normalized": direction,
+            "gaze_point_3d": gaze_point,
+            "gaze_depth": gaze_depth,
+            "pupil_center_3d": pupil_center,
+            "gaze_point_from_ray": gaze_point_from_ray,
+            "origin": origin,
+            "direction": direction,
         }
 
 

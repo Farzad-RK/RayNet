@@ -1,5 +1,4 @@
 # train.py
-
 import argparse
 import os
 import csv
@@ -7,18 +6,24 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
+import numpy as np
+
 from raynet import RayNet
 from dataset import GazeGeneDataset, MultiViewBatchSampler
 
 from head_pose.loss import multiview_headpose_losses
 from gaze_vector.loss import multiview_gaze_vector_geodesic_losses
 from gaze_point.loss import multiview_gaze_point_losses
+from gaze_depth.loss import multiview_gaze_depth_losses
 from pupil_center.loss import multiview_pupil_center_losses
-from pcgrad import PCGrad
+from ray_consistency.loss import ray_consistency_loss
+from cagrad import CAGrad
 
+import matplotlib.pyplot as plt
+from collections import defaultdict
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="RayNet PCGrad Multitask Training")
+    parser = argparse.ArgumentParser(description="RayNet CAGrad Multitask Training")
     parser.add_argument('--base_dir', type=str, required=True, help="Root of GazeGene dataset")
     parser.add_argument('--backbone_name', type=str, default="repnext_m3")
     parser.add_argument('--weight_path', type=str, default="./repnext_m3_pretrained.pt")
@@ -31,17 +36,36 @@ def parse_args():
     parser.add_argument('--log_csv', type=str, default="train_log.csv")
     parser.add_argument('--checkpoint_freq', type=int, default=5)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--cagrad_alpha', type=float, default=0.5)
     parser.add_argument('--split', type=str, default="train", choices=["train", "test"],
                         help="Use official GazeGene train/test split")
+    parser.add_argument('--plot_live', action="store_true", help="Show live loss plot during training (Jupyter/Colab)")
 
-
-    # Add any other hyperparams here
     return parser.parse_args()
 
 def get_backbone(backbone_name, weight_path, device):
     from backbone.repnext_utils import load_pretrained_repnext
     model = load_pretrained_repnext(backbone_name, weight_path)
     return model.to(device)
+
+# Simple online normalizer
+class RunningNormalizer:
+    def __init__(self, init_min=1e8, init_max=-1e8):
+        self.min = init_min
+        self.max = init_max
+
+    def update(self, val):
+        v = float(val)
+        if v < self.min:
+            self.min = v
+        if v > self.max:
+            self.max = v
+
+    def normalize(self, val):
+        # If no spread, return 0.0
+        if self.max - self.min < 1e-8:
+            return 0.0
+        return (float(val) - self.min) / (self.max - self.min)
 
 def main():
     args = parse_args()
@@ -81,24 +105,42 @@ def main():
     backbone = get_backbone(args.backbone_name, args.weight_path, device)
     model = RayNet(backbone, in_channels_list, panet_out_channels=256).to(device)
 
-
-    # -- Optimizer
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    cagrad_optim = CAGrad(optimizer, alpha=args.cagrad_alpha)
 
-    # -- Logging
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     logfile = open(args.log_csv, "w", newline="")
     csv_writer = csv.DictWriter(logfile, fieldnames=[
-        "epoch", "step", "head_pose_acc", "head_pose_cons",
+        "epoch", "step", "batch_size",
+        "head_pose_acc", "head_pose_cons",
         "gaze_vector_acc", "gaze_vector_cons",
         "gaze_point_acc", "gaze_point_cons",
+        "gaze_depth_acc", "gaze_depth_cons",
         "pupil_center_acc", "pupil_center_cons",
+        "ray_consistency",
+        "norm_head_pose", "norm_gaze_vector", "norm_gaze_point",
+        "norm_gaze_depth", "norm_pupil_center", "norm_ray_consistency"
     ])
     csv_writer.writeheader()
 
+    # For normalization
+    normalizers = {
+        "head_pose": RunningNormalizer(),
+        "gaze_vector": RunningNormalizer(),
+        "gaze_point": RunningNormalizer(),
+        "gaze_depth": RunningNormalizer(),
+        "pupil_center": RunningNormalizer(),
+        "ray_consistency": RunningNormalizer(),
+    }
+
+    # For live plotting
+    if args.plot_live:
+        # %matplotlib inline   <-- REMOVE this line!
+        plt.ion()
+        fig, ax = plt.subplots(figsize=(12, 7))
+        loss_hist = defaultdict(list)
 
     start_epoch = 0
-    # --- Resume logic (if needed)
     checkpoint_files = sorted([f for f in os.listdir(args.checkpoint_dir) if f.endswith('.pth')])
     if checkpoint_files:
         last_ckpt = os.path.join(args.checkpoint_dir, checkpoint_files[-1])
@@ -112,21 +154,17 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         model.train()
         for step, batch in enumerate(loader):
-            images = batch['img'].to(device)  # [B*9, 3, H, W] or [B, 9, 3, H, W] depending on loader
-            # -- Repack for [B, 9, ...]
+            images = batch['img'].to(device)
             B = images.shape[0] // 9
             images = images.view(B, 9, images.shape[1], images.shape[2], images.shape[3])
-            images = images.reshape(B*9, images.shape[2], images.shape[3], images.shape[4])
-            images = images.to(device)
+            images = images.reshape(B*9, images.shape[2], images.shape[3], images.shape[4]).to(device)
 
-            # Forward pass
             outputs = model(images)
-            # You may need to unpack outputs as [B, 9, ...] for each
-            # Here: assuming each output is [B*9, ...]
-            head_pose_gt = batch['head_pose']['R'].to(device)  # [B*9, 3, 3]
-            gaze_vector_gt = batch['gaze']['gaze_C'].to(device)  # [B*9, 3]
-            gaze_point_gt = batch['gaze_point'].to(device)       # [B*9, 3]
-            pupil_center_gt = batch['mesh']['pupil_center_3D'].to(device) # [B*9, 2, 3]
+            head_pose_gt = batch['head_pose']['R'].to(device)
+            gaze_vector_gt = batch['gaze']['gaze_C'].to(device)
+            gaze_point_gt = batch['gaze_point'].to(device)
+            gaze_depth_gt = batch['gaze']['gaze_depth'].to(device)
+            pupil_center_gt = batch['mesh']['pupil_center_3D'].to(device)
 
             # Reshape for multi-view [B, 9, ...]
             B = head_pose_gt.shape[0] // 9
@@ -137,70 +175,101 @@ def main():
             gaze_vector_pred = outputs["gaze_vector_6d"].view(B, N, 6)
             # Gaze point GT is [B*9, 3], reshape to [B, N, 3]
             gaze_point_pred = outputs["gaze_point_3d"].view(B, N, 3)
+            gaze_depth_pred = outputs["gaze_depth"].view(B, N)
             pupil_center_pred = outputs["pupil_center_3d"].view(B, N, 2, 3)
+            gaze_point_from_ray = outputs["gaze_point_from_ray"].view(B, N, 3)
 
-            # Losses: multi-view for each head
+            # Compute all losses
             head_pose_losses = multiview_headpose_losses(head_pose_pred, head_pose_gt.view(B, N, 3, 3))
             gaze_vector_losses = multiview_gaze_vector_geodesic_losses(gaze_vector_pred, gaze_vector_gt.view(B, N, 3))
             gaze_point_losses = multiview_gaze_point_losses(gaze_point_pred, gaze_point_gt.view(B, N, 3))
+            gaze_depth_losses = multiview_gaze_depth_losses(gaze_depth_pred, gaze_depth_gt.view(B, N))
             pupil_center_losses = multiview_pupil_center_losses(pupil_center_pred, pupil_center_gt.view(B, N, 2, 3))
+            ray_consist_loss = ray_consistency_loss(
+                gaze_point_from_ray, gaze_point_gt.view(B, N, 3)
+            )
+
+            # Normalize (online, running min/max)
+            for key, loss_val in [
+                ("head_pose", head_pose_losses['accuracy'] + head_pose_losses['consistency']),
+                ("gaze_vector", gaze_vector_losses['accuracy'] + gaze_vector_losses['consistency']),
+                ("gaze_point", gaze_point_losses['accuracy'] + gaze_point_losses['consistency']),
+                ("gaze_depth", gaze_depth_losses['accuracy'] + gaze_depth_losses['consistency']),
+                ("pupil_center", pupil_center_losses['accuracy'] + pupil_center_losses['consistency']),
+                ("ray_consistency", ray_consist_loss),
+            ]:
+                normalizers[key].update(loss_val.item())
+
+            norm_head_pose = normalizers["head_pose"].normalize(head_pose_losses['accuracy'] + head_pose_losses['consistency'])
+            norm_gaze_vector = normalizers["gaze_vector"].normalize(gaze_vector_losses['accuracy'] + gaze_vector_losses['consistency'])
+            norm_gaze_point = normalizers["gaze_point"].normalize(gaze_point_losses['accuracy'] + gaze_point_losses['consistency'])
+            norm_gaze_depth = normalizers["gaze_depth"].normalize(gaze_depth_losses['accuracy'] + gaze_depth_losses['consistency'])
+            norm_pupil_center = normalizers["pupil_center"].normalize(pupil_center_losses['accuracy'] + pupil_center_losses['consistency'])
+            norm_ray_consist = normalizers["ray_consistency"].normalize(ray_consist_loss)
 
             per_task_total = [
-                head_pose_losses['accuracy'] + head_pose_losses['consistency'],
-                gaze_vector_losses['accuracy'] + gaze_vector_losses['consistency'],
-                gaze_point_losses['accuracy'] + gaze_point_losses['consistency'],
-                pupil_center_losses['accuracy'] + pupil_center_losses['consistency'],
+                torch.tensor(norm_head_pose, device=device),
+                torch.tensor(norm_gaze_vector, device=device),
+                torch.tensor(norm_gaze_point, device=device),
+                torch.tensor(norm_gaze_depth, device=device),
+                torch.tensor(norm_pupil_center, device=device),
+                torch.tensor(norm_ray_consist, device=device),
             ]
-            task_names = ["head_pose", "gaze_vector", "gaze_point", "pupil_center"]
 
-            # Get shared parameters (all except head-private)
-            shared_params = []
-            for n, p in model.named_parameters():
-                if any(h in n for h in [
-                    "head_pose_regression", "gaze_vector_regression", "gaze_point_regression", "pupil_center_regression"
-                ]):
-                    continue
-                shared_params.append(p)
-
-            # Instantiate PCGrad once, after you build your optimizer:
-            pc_optimizer = PCGrad(optimizer)
-
-            # … inside each training step …
-            # per_task_total is your list: [head_loss, gaze_vec_loss, gaze_point_loss, pupil_center_loss]
+            # CAGrad step
             shared_params = [p for n, p in model.named_parameters() if p.requires_grad]
+            cagrad_optim.pc_backward(per_task_total, shared_params, retain_graph=True)
+            cagrad_optim.step()
 
-            # 1) De‐conflict & accumulate grads:
-            pc_optimizer.pc_backward(per_task_total, shared_params, retain_graph=True)
-
-            # 2) Take the optimizer step:
-            pc_optimizer.step()
-
-            # Logging step/epoch results
+            # Logging
             log_dict = {
                 "epoch": epoch,
                 "step": step,
+                "batch_size": args.batch_size,
                 "head_pose_acc": float(head_pose_losses['accuracy']),
                 "head_pose_cons": float(head_pose_losses['consistency']),
                 "gaze_vector_acc": float(gaze_vector_losses['accuracy']),
                 "gaze_vector_cons": float(gaze_vector_losses['consistency']),
                 "gaze_point_acc": float(gaze_point_losses['accuracy']),
                 "gaze_point_cons": float(gaze_point_losses['consistency']),
+                "gaze_depth_acc": float(gaze_depth_losses['accuracy']),
+                "gaze_depth_cons": float(gaze_depth_losses['consistency']),
                 "pupil_center_acc": float(pupil_center_losses['accuracy']),
                 "pupil_center_cons": float(pupil_center_losses['consistency']),
+                "ray_consistency": float(ray_consist_loss),
+                "norm_head_pose": norm_head_pose,
+                "norm_gaze_vector": norm_gaze_vector,
+                "norm_gaze_point": norm_gaze_point,
+                "norm_gaze_depth": norm_gaze_depth,
+                "norm_pupil_center": norm_pupil_center,
+                "norm_ray_consistency": norm_ray_consist,
             }
             csv_writer.writerow(log_dict)
             logfile.flush()
 
+            # Live plot
+            if args.plot_live:
+                for key in ["head_pose_acc", "gaze_vector_acc", "gaze_point_acc", "gaze_depth_acc", "pupil_center_acc", "ray_consistency"]:
+                    loss_hist[key].append(log_dict[key])
+                ax.clear()
+                for key in ["head_pose_acc", "gaze_vector_acc", "gaze_point_acc", "gaze_depth_acc", "pupil_center_acc", "ray_consistency"]:
+                    ax.plot(loss_hist[key], label=key)
+                ax.legend()
+                ax.set_title(f"Epoch {epoch} Step {step} | Batch {args.batch_size}")
+                ax.set_xlabel("Iteration")
+                ax.set_ylabel("Loss")
+                plt.pause(0.01)
+
+            # Terminal log
             if (step+1) % 10 == 0:
                 print(
-                    f"Epoch {epoch} Step {step}: "
-                    f"HP: {log_dict['head_pose_acc']:.4f}/{log_dict['head_pose_cons']:.4f} | "
-                    f"GV: {log_dict['gaze_vector_acc']:.4f}/{log_dict['gaze_vector_cons']:.4f} | "
-                    f"GP: {log_dict['gaze_point_acc']:.4f}/{log_dict['gaze_point_cons']:.4f} | "
-                    f"PC: {log_dict['pupil_center_acc']:.4f}/{log_dict['pupil_center_cons']:.4f} | "
+                    f"Epoch {epoch} | Step {step+1}/{len(loader)} | Batch: {args.batch_size} | "
+                    f"HP: {log_dict['head_pose_acc']:.4f} | GV: {log_dict['gaze_vector_acc']:.4f} | "
+                    f"GP: {log_dict['gaze_point_acc']:.2f} | GD: {log_dict['gaze_depth_acc']:.2f} | "
+                    f"PC: {log_dict['pupil_center_acc']:.2f} | RayCons: {log_dict['ray_consistency']:.2f} |"
                 )
 
-        # -- Save checkpoint
+        # Save checkpoint
         if (epoch + 1) % args.checkpoint_freq == 0 or (epoch + 1) == args.epochs:
             ckpt_path = os.path.join(args.checkpoint_dir, f"raynet_epoch{epoch+1}.pth")
             torch.save({
@@ -213,6 +282,10 @@ def main():
 
     logfile.close()
     print("Training complete.")
+
+    if args.plot_live:
+        plt.ioff()
+        plt.show()
 
 if __name__ == "__main__":
     main()
