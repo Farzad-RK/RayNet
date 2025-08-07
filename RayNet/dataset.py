@@ -77,10 +77,9 @@ class GazeGeneDataset(Dataset):
                             'visual_axis_R': gaze_label['visual_axis_R'][idx],
                             'optic_axis_L': gaze_label['optic_axis_L'][idx],
                             'optic_axis_R': gaze_label['optic_axis_R'][idx],
-
+                            'gaze_depth': gaze_label['gaze_depth'][idx],
                         },
                         'gaze_point': gaze_label['gaze_target'][idx],
-                        'gaze_depth': gaze_label['gaze_depth'][idx],
                         'head_pose': {
                             'R': gaze_label['head_R_mat'][idx],
                             't': gaze_label['head_T_vec'][idx],
