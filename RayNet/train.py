@@ -1,10 +1,9 @@
-# train.py -- with GradNorm loss balancing
-
 import argparse
 import os
 import csv
 import torch
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 import numpy as np
@@ -65,7 +64,6 @@ class RunningNormalizer:
             self.max = v
 
     def normalize(self, val):
-        # If no spread, return 0.0
         if self.max - self.min < 1e-8:
             return 0.0
         return (float(val) - self.min) / (self.max - self.min)
@@ -108,9 +106,12 @@ def main():
     model = RayNet(backbone, in_channels_list, panet_out_channels=256).to(device)
 
     NUM_TASKS = 5
-    # Step 1: Learnable task weights
+    # Learnable task weights
     task_weights = torch.nn.Parameter(torch.ones(NUM_TASKS, device=device), requires_grad=True)
-    optimizer = optim.Adam(list(model.parameters()) + [task_weights], lr=args.lr)
+
+    # Separate optimizers: one for model, one for task weights
+    optimizer_model = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer_weights = optim.Adam([task_weights], lr=args.lr)
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     logfile = open(args.log_csv, "w", newline="")
@@ -123,7 +124,7 @@ def main():
         "pupil_center_acc", "pupil_center_cons",
         "ray_consistency",
         "norm_head_pose", "norm_gaze_vector", "norm_gaze_point",
-        "norm_gaze_depth", "norm_pupil_center", "norm_ray_consistency"
+        "norm_gaze_depth", "norm_pupil_center"
     ])
     csv_writer.writeheader()
 
@@ -134,7 +135,6 @@ def main():
         "gaze_point": RunningNormalizer(),
         "gaze_depth": RunningNormalizer(),
         "pupil_center": RunningNormalizer(),
-        "ray_consistency": RunningNormalizer(),
     }
 
     # For GradNorm bookkeeping
@@ -154,13 +154,15 @@ def main():
         print(f"Resuming from checkpoint: {last_ckpt}")
         checkpoint = torch.load(last_ckpt, map_location=device)
         model.load_state_dict(checkpoint['model'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
+        optimizer_model.load_state_dict(checkpoint['optimizer_model'])
+        optimizer_weights.load_state_dict(checkpoint['optimizer_weights'])
         start_epoch = checkpoint['epoch'] + 1
 
     # -- Training loop
     for epoch in range(start_epoch, args.epochs):
         model.train()
         for step, batch in enumerate(loader):
+            # -- Prepare batch
             images = batch['img'].to(device)
             B = images.shape[0] // 9
             images = images.view(B, 9, images.shape[1], images.shape[2], images.shape[3])
@@ -173,109 +175,93 @@ def main():
             gaze_depth_gt = batch['gaze']['gaze_depth'].to(device)
             pupil_center_gt = batch['mesh']['pupil_center_3D'].to(device)
 
-            B = head_pose_gt.shape[0] // 9
-            N = 9
-
-            head_pose_pred = outputs["head_pose_6d"].view(B, N, 6)
-            gaze_vector_pred = outputs["gaze_vector_6d"].view(B, N, 6)
-            gaze_point_pred = outputs["gaze_point_3d"].view(B, N, 3)
-            gaze_depth_pred = outputs["gaze_depth"].view(B, N)
-            pupil_center_pred = outputs["pupil_center_3d"].view(B, N, 2, 3)
-            gaze_point_from_ray = outputs["gaze_point_from_ray"].view(B, N, 3)
-            origin = outputs["origin"].view(B, N, 3)
-            direction = outputs["direction"].view(B, N, 3)
+            head_pose_pred = outputs["head_pose_6d"].view(B, 9, 6)
+            gaze_vector_pred = outputs["gaze_vector_6d"].view(B, 9, 6)
+            gaze_point_pred = outputs["gaze_point_3d"].view(B, 9, 3)
+            gaze_depth_pred = outputs["gaze_depth"].view(B, 9)
+            pupil_center_pred = outputs["pupil_center_3d"].view(B, 9, 2, 3)
+            origin = outputs["origin"].view(B, 9, 3)
+            direction = outputs["direction"].view(B, 9, 3)
 
             # Compute all losses
-            head_pose_losses = multiview_headpose_losses(head_pose_pred, head_pose_gt.view(B, N, 3, 3))
-            gaze_vector_losses = multiview_gaze_vector_geodesic_losses(gaze_vector_pred, gaze_vector_gt.view(B, N, 3))
-            gaze_point_losses = multiview_gaze_point_losses(gaze_point_pred, gaze_point_gt.view(B, N, 3))
-            gaze_depth_losses = multiview_gaze_depth_losses(gaze_depth_pred, gaze_depth_gt.view(B, N))
-            pupil_center_losses = multiview_pupil_center_losses(pupil_center_pred, pupil_center_gt.view(B, N, 2, 3))
-            ray_consist_loss = multiview_ray_consistency_loss(
-                origins=origin,  # [B, N, 3]
-                directions=direction,  # [B, N, 3]
-                gaze_depths=gaze_depth_pred,  # [B, N]
-                gaze_points_pred=gaze_point_pred  # [B, N, 3]
+            head_pose_losses   = multiview_headpose_losses(head_pose_pred, head_pose_gt.view(B, 9, 3, 3))
+            gaze_vector_losses = multiview_gaze_vector_geodesic_losses(gaze_vector_pred, gaze_vector_gt.view(B, 9, 3))
+            gaze_point_losses  = multiview_gaze_point_losses(gaze_point_pred, gaze_point_gt.view(B, 9, 3))
+            gaze_depth_losses  = multiview_gaze_depth_losses(gaze_depth_pred, gaze_depth_gt.view(B, 9))
+            pupil_center_losses= multiview_pupil_center_losses(pupil_center_pred, pupil_center_gt.view(B, 9, 2, 3))
+            ray_consist_loss   = multiview_ray_consistency_loss(
+                origins=origin, directions=direction,
+                gaze_depths=gaze_depth_pred, gaze_points_pred=gaze_point_pred
             )["total"]
 
-            # Normalize (online, running min/max)
-            for key, loss_val in [
-                ("head_pose", head_pose_losses['accuracy'] + head_pose_losses['consistency']),
-                ("gaze_vector", gaze_vector_losses['accuracy'] + gaze_vector_losses['consistency']),
-                ("gaze_point", gaze_point_losses['accuracy'] + gaze_point_losses['consistency']),
-                ("gaze_depth", gaze_depth_losses['accuracy'] + gaze_depth_losses['consistency']),
-                ("pupil_center", pupil_center_losses['accuracy'] + pupil_center_losses['consistency']),
-                # ("ray_consistency", ray_consist_loss),
+            # Update normalizers
+            for key, val in [
+                ("head_pose",   head_pose_losses['accuracy']+head_pose_losses['consistency']),
+                ("gaze_vector", gaze_vector_losses['accuracy']+gaze_vector_losses['consistency']),
+                ("gaze_point",  gaze_point_losses['accuracy']+gaze_point_losses['consistency']),
+                ("gaze_depth",  gaze_depth_losses['accuracy']+gaze_depth_losses['consistency']),
+                ("pupil_center",pupil_center_losses['accuracy']+pupil_center_losses['consistency']),
             ]:
-                normalizers[key].update(loss_val.item())
+                normalizers[key].update(val.item())
 
-            norm_head_pose = normalizers["head_pose"].normalize(
-                head_pose_losses['accuracy'] + head_pose_losses['consistency'])
-            norm_gaze_vector = normalizers["gaze_vector"].normalize(
-                gaze_vector_losses['accuracy'] + gaze_vector_losses['consistency'])
-            norm_gaze_point = normalizers["gaze_point"].normalize(
-                gaze_point_losses['accuracy'] + gaze_point_losses['consistency'])
-            norm_gaze_depth = normalizers["gaze_depth"].normalize(
-                gaze_depth_losses['accuracy'] + gaze_depth_losses['consistency'])
-            norm_pupil_center = normalizers["pupil_center"].normalize(
-                pupil_center_losses['accuracy'] + pupil_center_losses['consistency'])
-            # norm_ray_consist = normalizers["ray_consistency"].normalize(ray_consist_loss)
+            # Normalize losses
+            norm_vals = []
+            for key, losses in [
+                ("head_pose",   head_pose_losses),
+                ("gaze_vector", gaze_vector_losses),
+                ("gaze_point",  gaze_point_losses),
+                ("gaze_depth",  gaze_depth_losses),
+                ("pupil_center",pupil_center_losses),
+            ]:
+                total = losses['accuracy'] + losses['consistency']
+                norm_vals.append(normalizers[key].normalize(total))
 
             per_task_losses = torch.stack([
-                (head_pose_losses['accuracy'] + head_pose_losses['consistency']) * norm_head_pose,
-                (gaze_vector_losses['accuracy'] + gaze_vector_losses['consistency']) * norm_gaze_vector,
-                (gaze_point_losses['accuracy'] + gaze_point_losses['consistency']) * norm_gaze_point,
-                (gaze_depth_losses['accuracy'] + gaze_depth_losses['consistency']) * norm_gaze_depth,
-                (pupil_center_losses['accuracy'] + pupil_center_losses['consistency']) * norm_pupil_center,
-                # ray_consist_loss * norm_ray_consist,
+                (head_pose_losses['accuracy']+head_pose_losses['consistency']) * norm_vals[0],
+                (gaze_vector_losses['accuracy']+gaze_vector_losses['consistency']) * norm_vals[1],
+                (gaze_point_losses['accuracy']+gaze_point_losses['consistency']) * norm_vals[2],
+                (gaze_depth_losses['accuracy']+gaze_depth_losses['consistency']) * norm_vals[3],
+                (pupil_center_losses['accuracy']+pupil_center_losses['consistency']) * norm_vals[4],
             ])
 
-            # ----------- GRADNORM BLOCK -------------
-            # Compute the weighted sum of losses
-            # After optimizer.zero_grad()
-            weighted_losses = task_weights * per_task_losses
-            L = weighted_losses.sum()
-            optimizer.zero_grad()
-            L.backward(retain_graph=True)
-
-            # Pick a shared parameter to compute gradients with respect to
-            # (for GradNorm, pick e.g. the last layer's weights)
+            # -- GradNorm balancing --
+            # Compute first-order gradient norms
             shared_param = list(model.fusion.parameters())[0]
-
-            # Compute the gradient norm of each (task_weights[i] * per_task_losses[i])
-            G_norm = []
+            base_norms = []
             for i in range(NUM_TASKS):
-                optimizer.zero_grad()
-                # Create graph so task_weights get their gradients
-                g = torch.autograd.grad(task_weights[i] * per_task_losses[i], shared_param, retain_graph=True,
-                                        create_graph=True)[0]
-                G_norm.append(g.norm())
-            G_norm = torch.stack(G_norm)
+                g_i = torch.autograd.grad(per_task_losses[i], shared_param, retain_graph=True)[0]
+                base_norms.append(g_i.norm().detach())
+            base_norms = torch.stack(base_norms)
 
-            # Store the initial losses
+            # Phase 1: update model parameters (weights detached)
+            optimizer_model.zero_grad()
+            model_loss = (task_weights.detach() * per_task_losses).sum()
+            model_loss.backward()
+            optimizer_model.step()
+
+            # Initialize initial_losses
             if initial_losses is None:
                 initial_losses = per_task_losses.detach().clone()
 
+            # Compute target gradient norms
             loss_ratios = per_task_losses.detach() / (initial_losses + 1e-8)
             avg_loss_ratio = loss_ratios.mean()
-            target = G_norm.mean() * (loss_ratios / avg_loss_ratio) ** alpha
+            G_norm = task_weights * base_norms
+            target = G_norm.mean().detach() * (loss_ratios / avg_loss_ratio) ** alpha
 
-            gradnorm_loss = nn.L1Loss()(G_norm, target.detach())
-
-            # This backward will propagate into task_weights!
+            # Phase 2: update task weights
+            optimizer_weights.zero_grad()
+            gradnorm_loss = F.l1_loss(G_norm, target)
             gradnorm_loss.backward()
-            optimizer.step()
+            optimizer_weights.step()
 
-            # Optional: Normalize task weights (so they sum to NUM_TASKS)
+            # Normalize task_weights to sum to NUM_TASKS
             with torch.no_grad():
-                coef = NUM_TASKS / (task_weights.sum() + 1e-8)
-                task_weights.mul_(coef)
+                task_weights.mul_(NUM_TASKS / (task_weights.sum() + 1e-8))
 
-            # -------------- LOGGING AND PLOTTING ------------------
+            # -- Logging and plotting --
             log_dict = {
-                "epoch": epoch,
-                "step": step,
-                "batch_size": args.batch_size,
+                "epoch": epoch, "step": step, "batch_size": args.batch_size,
                 "head_pose_acc": float(head_pose_losses['accuracy']),
                 "head_pose_cons": float(head_pose_losses['consistency']),
                 "gaze_vector_acc": float(gaze_vector_losses['accuracy']),
@@ -287,45 +273,39 @@ def main():
                 "pupil_center_acc": float(pupil_center_losses['accuracy']),
                 "pupil_center_cons": float(pupil_center_losses['consistency']),
                 "ray_consistency": float(ray_consist_loss),
-                "norm_head_pose": norm_head_pose,
-                "norm_gaze_vector": norm_gaze_vector,
-                "norm_gaze_point": norm_gaze_point,
-                "norm_gaze_depth": norm_gaze_depth,
-                "norm_pupil_center": norm_pupil_center,
-                # "norm_ray_consistency": norm_ray_consist,
+                "norm_head_pose": norm_vals[0],
+                "norm_gaze_vector": norm_vals[1],
+                "norm_gaze_point": norm_vals[2],
+                "norm_gaze_depth": norm_vals[3],
+                "norm_pupil_center": norm_vals[4],
             }
             csv_writer.writerow(log_dict)
             logfile.flush()
 
-            # Live plot
             if args.plot_live:
-                for key in ["head_pose_acc", "gaze_vector_acc", "gaze_point_acc", "gaze_depth_acc", "pupil_center_acc",
-                            "ray_consistency"]:
-                    loss_hist[key].append(log_dict[key])
+                for k in log_dict.keys():
+                    if k in ["head_pose_acc","gaze_vector_acc","gaze_point_acc","gaze_depth_acc","pupil_center_acc","ray_consistency"]:
+                        loss_hist[k].append(log_dict[k])
                 ax.clear()
-                for key in ["head_pose_acc", "gaze_vector_acc", "gaze_point_acc", "gaze_depth_acc", "pupil_center_acc",
-                            "ray_consistency"]:
-                    ax.plot(loss_hist[key], label=key)
+                for k in loss_hist:
+                    ax.plot(loss_hist[k], label=k)
                 ax.legend()
                 ax.set_title(f"Epoch {epoch} Step {step} | Batch {args.batch_size}")
-                ax.set_xlabel("Iteration")
-                ax.set_ylabel("Loss")
                 plt.pause(0.01)
 
             if (step + 1) % 10 == 0:
-                print(
-                    f"Epoch {epoch} | Step {step + 1}/{len(loader)} | Batch: {args.batch_size} | "
-                    f"HP: {log_dict['head_pose_acc']:.4f} | GV: {log_dict['gaze_vector_acc']:.4f} | "
-                    f"GP: {log_dict['gaze_point_acc']:.2f} | GD: {log_dict['gaze_depth_acc']:.2f} | "
-                    f"PC: {log_dict['pupil_center_acc']:.2f} | RayCons: {log_dict['ray_consistency']:.2f} |"
-                )
+                print(f"Epoch {epoch} | Step {step+1}/{len(loader)} | "
+                      f"HP: {log_dict['head_pose_acc']:.4f} | GV: {log_dict['gaze_vector_acc']:.4f} | "
+                      f"GP: {log_dict['gaze_point_acc']:.2f} | GD: {log_dict['gaze_depth_acc']:.2f} | "
+                      f"PC: {log_dict['pupil_center_acc']:.2f} | Ray: {log_dict['ray_consistency']:.2f}")
 
         # Save checkpoint
         if (epoch + 1) % args.checkpoint_freq == 0 or (epoch + 1) == args.epochs:
-            ckpt_path = os.path.join(args.checkpoint_dir, f"raynet_epoch{epoch + 1}.pth")
+            ckpt_path = os.path.join(args.checkpoint_dir, f"raynet_epoch{epoch+1}.pth")
             torch.save({
                 'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
+                'optimizer_model': optimizer_model.state_dict(),
+                'optimizer_weights': optimizer_weights.state_dict(),
                 'epoch': epoch,
                 'args': vars(args)
             }, ckpt_path)
