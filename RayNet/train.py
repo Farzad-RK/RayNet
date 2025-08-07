@@ -296,8 +296,8 @@ def main():
             if (step + 1) % 10 == 0:
                 print(f"Epoch {epoch} | Step {step+1}/{len(loader)} | "
                       f"HP: {log_dict['head_pose_acc']:.4f} | GV: {log_dict['gaze_vector_acc']:.4f} | "
-                      f"GP: {log_dict['gaze_point_acc']:.2f} | GD: {log_dict['gaze_depth_acc']:.2f} | "
-                      f"PC: {log_dict['pupil_center_acc']:.2f} | Ray: {log_dict['ray_consistency']:.2f}")
+                      f"GP: {log_dict['gaze_point_acc']:.4f} | GD: {log_dict['gaze_depth_acc']:.4f} | "
+                      f"PC: {log_dict['pupil_center_acc']:.4f} | Ray: {log_dict['ray_consistency']:.4f}")
 
         # Save checkpoint
         if (epoch + 1) % args.checkpoint_freq == 0 or (epoch + 1) == args.epochs:
