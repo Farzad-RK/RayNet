@@ -433,7 +433,18 @@ The **Gaze Point Head** in RayNet predicts the 3D intersection point of the gaze
 
 ### Location
 
-* **Implementation:** `pupil_center/model.py`
+* **Implementation:**%run RayNet/train.py \
+    --base_dir ../GazeGene_FaceCrops \
+    --samples_per_subject 200 \
+    --epochs 30 \
+    --checkpoint_freq 5 \
+    --log_csv ./logs \
+    --checkpoint_dir /content/drive/MyDrive/RayNet_checkpoints \
+    --batch_size 3 \
+    --num_workers 16 \
+    --plot_live \
+    --split train \
+    --weight_path ../repnext_m3_pretrained.pt `pupil_center/model.py`
 * **Loss function:** `pupil_center/loss.py` (Multi-view L2/MSE loss)
 
 ---
@@ -499,7 +510,42 @@ The **Pupil Center Head** in RayNet predicts the 3D location of both left and ri
   * Outputs are in a fully abstracted, camera-centric 3D space, suitable for further geometric operations or visualization.
 
 ---
+### Results 
+## Experiment 1 
+We trained the RayNet model on the GazeGene dataset with the following parameters on Google Colab Pro T4 GPU:  
 
+```bash
+%run RayNet/train.py \
+    --base_dir ../GazeGene_FaceCrops \
+    --samples_per_subject 200 \
+    --epochs 30 \
+    --checkpoint_freq 5 \
+    --log_csv ./logs \
+    --checkpoint_dir /content/drive/MyDrive/RayNet_checkpoints \
+    --batch_size 3 \
+    --num_workers 16 \
+    --plot_live \
+    --split train \
+    --weight_path ../repnext_m3_pretrained.pt
+```
+Normalized training loss of the these tasks:
+- Gaze Vector
+- Gaze Point
+- Gaze Depth
+- Head Pose
+- Pupil Center
+
+The fluctuations observed in gaze depth and gaze point tasks shows that there are not enough visual cues to traing these regresion head properlu since it conflicts with
+other tasks. Pupil center regression has the fastest convergence rate compared to others and apparently could be compatible with head pose and 
+gaze vector tasks. 
+
+The hypothesis is that we have to breakdown the single backbone model into smaller models that have compatible tasks in this case 
+we for the next experiment we will modify the RayNet architecture to learn pupil center, head pose and gaze vector toegther, therefore depding on 
+how well they can perform we would freeze the model to feed the output to a second model responsible for ray reconstruction. 
+
+We have used Gradnorm to calculate optimized weights.
+![experiment_raynet_200_samples.png](training_results/experiment_1/plots/experiment_raynet_200_samples.png)
+---
 ## Theory and Design Rationale
 
 * **Why multi-scale features?**
