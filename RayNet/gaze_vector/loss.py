@@ -1,92 +1,71 @@
 # gaze_vector_loss.py
-
+import math
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 
-from sixdrepnet.utils import normalize_vector
-from RayNet.utils import ortho6d_to_rotmat
+def _normalize(v: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    return v / (v.norm(dim=-1, keepdim=True) + eps)
 
-class GeodesicLoss(nn.Module):
+def logC3_vmf(kappa: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
-    Geodesic Loss for 3x3 rotation matrices (batch-wise).
-    Computes the geodesic distance (angle, in radians) between rotation matrices.
+    log normalizer for vMF on S^2.
+    C_3(k) = k / (4π sinh k)  ->  logC = log k - log(4π) - log(sinh k)
+    Stable for large/small k using log1p.
     """
-    def __init__(self, eps=1e-7):
-        super().__init__()
-        self.eps = eps
+    k = kappa.clamp_min(0.0)
+    # log sinh k = k + log(1 - exp(-2k)) - log 2
+    two_k = (2.0 * k).clamp_max(50.0)  # avoid underflow in exp(-2k)
+    log_sinh = k + torch.log1p((-torch.exp(-two_k)).clamp_min(-0.999999)) - math.log(2.0)
+    return torch.log(k + eps) - math.log(4.0 * math.pi) - log_sinh
 
-    def forward(self, m1, m2):
-        """
-        Args:
-            m1: torch.Tensor, [B, 3, 3], predicted rotation matrices
-            m2: torch.Tensor, [B, 3, 3], ground-truth rotation matrices
-        Returns:
-            mean geodesic loss (scalar)
-        """
-        m = torch.bmm(m1, m2.transpose(1,2))  # [B, 3, 3]
-        cos = (m[:,0,0] + m[:,1,1] + m[:,2,2] - 1) / 2
-        theta = torch.acos(torch.clamp(cos, -1 + self.eps, 1 - self.eps))  # [B]
-        return torch.mean(theta)
-
-def gaze_vector_to_rotmat(gaze_vec):
+def vmf_nll(mu: torch.Tensor, kappa: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
-    Convert a batch of 3D gaze vectors into rotation matrices.
-    Args:
-        gaze_vec: torch.Tensor, [B, 3]
-    Returns:
-        rotmat: torch.Tensor, [B, 3, 3]
+    vMF negative log-likelihood on S^2.
+    mu:     [*,3] unit
+    kappa:  [*,1] >= 0
+    target: [*,3] unit
     """
-    z = normalize_vector(gaze_vec)
-    # Create an arbitrary "up" vector for cross product
-    up = torch.zeros_like(z)
-    up[:, 1] = 1
-    mask = (z[:, 1].abs() > 0.99)
-    up[mask] = torch.tensor([1, 0, 0], dtype=z.dtype, device=z.device)
-    x = normalize_vector(torch.cross(up, z, dim=1))
-    y = normalize_vector(torch.cross(z, x, dim=1))
-    rotmat = torch.stack([x, y, z], dim=2)
-    return rotmat
+    mu = _normalize(mu)
+    target = _normalize(target)
+    dot = (mu * target).sum(dim=-1, keepdim=True)                 # [*,1]
+    return -(logC3_vmf(kappa) + kappa * dot).mean()
 
-def multiview_gaze_vector_geodesic_losses(gaze6d_pred, gaze_vec_gt):
+def angular_error_rad(d_pred: torch.Tensor, d_ref: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    d_pred = _normalize(d_pred).reshape(-1, 3)
+    d_ref  = _normalize(d_ref).reshape(-1, 3)
+    cos = (d_pred * d_ref).sum(-1).clamp(-1 + eps, 1 - eps)
+    return torch.acos(cos).mean()
+
+@torch.no_grad()
+def spherical_mean_kappa(mu: torch.Tensor, kappa: torch.Tensor) -> torch.Tensor:
     """
-    Multi-view gaze vector loss.
-    Computes per-view geodesic loss (accuracy) and consistency loss.
-
-    Args:
-        gaze6d_pred: [B, 9, 6] predicted gaze in 6D rotation rep (per view)
-        gaze_vec_gt: [B, 9, 3] GT gaze direction in 3D (per view, normalized)
-
-    Returns:
-        dict: {'accuracy': ..., 'consistency': ...}
+    κ-weighted spherical mean for directions.
+    mu:    [B,N,3] (unit)
+    kappa: [B,N,1]
+    returns m: [B,3] (unit)
     """
-    B, N, _ = gaze6d_pred.shape
-    geo = GeodesicLoss()
+    m = (kappa * mu).sum(dim=1)           # [B,3]
+    return _normalize(m)
 
-    # 1. Convert 6D to rotmat (predicted)
-    pred_rotmat = ortho6d_to_rotmat(
-        gaze6d_pred.reshape(-1, 6)
-    ).reshape(B, N, 3, 3)  # [B, N, 3, 3]
+def multiview_gaze_vector_vmf_losses(pred: dict,
+                                     gaze_vec_gt: torch.Tensor,
+                                     w_cons: float = 0.2) -> dict:
+    """
+    vMF accuracy + spherical consistency (multi-view).
+    pred:        {"mu":[B,N,3], "kappa":[B,N,1]}
+    gaze_vec_gt: [B,N,3] (unit)
+    returns:     {"accuracy": nll, "consistency": w_cons * spread}
+    """
+    mu    = _normalize(pred["mu"])                 # [B,N,3]
+    kappa = pred["kappa"].clamp_min(0.0)           # [B,N,1]
+    target = _normalize(gaze_vec_gt)               # [B,N,3]
 
-    # 2. Convert GT gaze vectors to rotmat
-    gt_rotmat = gaze_vector_to_rotmat(
-        gaze_vec_gt.reshape(-1, 3)
-    ).reshape(B, N, 3, 3)
+    # vMF NLL for accuracy
+    nll = vmf_nll(mu.reshape(-1,3), kappa.reshape(-1,1), target.reshape(-1,3))
 
-    # 3. Accuracy loss: geodesic between prediction and GT
-    acc_loss = geo(
-        pred_rotmat.reshape(-1, 3, 3),
-        gt_rotmat.reshape(-1, 3, 3)
-    )
+    # spherical consistency around κ-weighted mean direction
+    m = spherical_mean_kappa(mu, kappa)            # [B,3]
+    m_rep = m.unsqueeze(1).expand_as(mu)           # [B,N,3]
+    spread = angular_error_rad(mu, m_rep)          # mean angular deviation (radians)
 
-    # 4. Consistency loss: distance to sample mean
-    mean_pred = pred_rotmat.mean(dim=1)  # [B, 3, 3]
-    cons_loss = geo(
-        pred_rotmat.reshape(-1, 3, 3),
-        mean_pred.unsqueeze(1).expand(-1, N, -1, -1).reshape(-1, 3, 3)
-    )
-
-    return {
-        'accuracy': acc_loss,
-        'consistency': cons_loss
-    }
-
+    return {"accuracy": nll, "consistency": w_cons * spread}
