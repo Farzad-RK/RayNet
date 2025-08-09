@@ -172,31 +172,24 @@ def main():
             # Forward
             out = model(images)  # Stage-1 output for each view, shapes [B*V, ...]
             # Head pose (6D), pupil center [B*V,2,3], gaze vMF {"mu":[B*V,3], "kappa":[B*V,1]}
+            # --- shapes ---
             hp_pred = out["head_pose_6d"].view(B, V, 6)
-            pc_pred = out["pupil_center_3d"].view(B, V, 2, 3)
+            gaze_mu = out["gaze"]["mu"].view(B, V, 3)
+            gaze_k = out["gaze"]["kappa"].view(B, V, 1)
 
-            # You might return vMF head as "gaze" dict or you may still have "gaze_vector_6d".
-            # Here we assume vMF dict is returned as below:
-            if "gaze" in out:
-                gaze_mu = out["gaze"]["mu"].view(B, V, 3)         # [B,V,3]
-                gaze_k  = out["gaze"]["kappa"].view(B, V, 1)      # [B,V,1]
-            else:
-                # If you kept the old 6D head by accident, raise clear error:
-                raise RuntimeError("Expected Stage-1 to return 'gaze' dict with vMF outputs (mu,kappa).")
+            pupil_pred = out["pupil"]  # {"ellipse":[B*V,2,5] or [B, V, 2, 5], "delta_cm":[...,2,3]}
+            gt_pupil_3d = batch['mesh']['pupil_center_3D'].to(device).view(B, V, 2, 3)
+            eye_ctr_3d = batch['mesh']['eyeball_center_3D'].to(device).view(B, V, 2, 3)
+            K = batch['intrinsic'].to(device).view(B, V, 3, 3)
+            iris_r_cm = batch['iris_radius_cm'].to(device).view(B, V)
 
-            # ---- Ground-truth ----
-            hp_gt = batch['head_pose']['R'].to(device).view(B, V, 3, 3)
-            gaze_vec_gt = batch['gaze']['gaze_C'].to(device).view(B, V, 3)          # unit vectors
-            pc_gt = batch['mesh']['pupil_center_3D'].to(device).view(B, V, 2, 3)
-
-            # ---- Per-task base losses (accuracy + consistency) ----
-            hp_losses = multiview_headpose_losses(hp_pred, hp_gt)  # {'accuracy','consistency'}
-            # vMF: {'accuracy': NLL, 'consistency': w_cons * spread}
+            # losses
+            hp_losses = multiview_headpose_losses(hp_pred, batch['head_pose']['R'].to(device).view(B, V, 3, 3))
             gaze_losses = multiview_gaze_vector_vmf_losses({"mu": gaze_mu, "kappa": gaze_k},
-                                                           gaze_vec_gt,
+                                                           batch['gaze']['gaze_C'].to(device).view(B, V, 3),
                                                            w_cons=args.gaze_cons_w)
-            # pupil center (plain). If you implemented robust, add flag here.
-            pc_losses = multiview_pupil_center_losses(pc_pred, pc_gt)
+            pc_losses = multiview_pupil_center_losses(pupil_pred, gt_pupil_3d, eye_ctr_3d, K, iris_r_cm,
+                                   w_3d=1.0, w_consistency=0.3, w_ellipse2d=0.2)
 
             # Combine accuracy + consistency per task
             L_hp   = hp_losses['accuracy']   + hp_losses['consistency']

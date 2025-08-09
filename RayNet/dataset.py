@@ -69,8 +69,10 @@ class GazeGeneDataset(Dataset):
                             'eyeball_center_3D': complex_label['eyeball_center_3D'][idx],
                             'pupil_center_3D': complex_label['pupil_center_3D'][idx],
                             'iris_mesh_3D': complex_label['iris_mesh_3D'][idx],
+                            'iris_mesh_2D': complex_label['iris_mesh_2D'][idx],
                         },
                         'intrinsic': complex_label['intrinsic_matrix_cropped'][idx],
+                        'iris_radius_cm': self.attr_dict[subj_num]['iris_radius'],
                         'gaze': {
                             'gaze_C': gaze_label['gaze_C'][idx],
                             'visual_axis_L': gaze_label['visual_axis_L'][idx],
@@ -112,6 +114,7 @@ class GazeGeneDataset(Dataset):
             'head_pose': {'R': to_tensor(s['head_pose']['R']), 't': to_tensor(s['head_pose']['t'])},
             'intrinsic': to_tensor(s['intrinsic']),
             'attributes': s['attributes'],
+            'iris_radius_cm': torch.tensor(s['iris_radius_cm'], dtype=torch.float32),
         }
         return out
 
