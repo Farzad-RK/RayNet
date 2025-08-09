@@ -2,8 +2,6 @@
 # Multi-view pupil-center loss with geometry lifting from ellipse+intrinsics.
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 from .model import PupilCenterRegressionHead as _Geom  # for geometry utilities
 
