@@ -59,20 +59,21 @@ class PupilCenterRegressionHead(nn.Module):
         nn.init.zeros_(self.fc_out.bias)
 
     @staticmethod
-    def _pack_ellipse(raw_eye: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+    def _pack_ellipse(self, t):
         """
-        raw_eye: [..., 8] or [..., 7] depending on predict_logvar
+        t: [..., D] per-eye vector. We assume:
+           0: cx, 1: cy, 2: ax_raw, 3: ay_raw, 4: theta, 5: dx, 6: dy, 7: dz, (8: logvar optional)
         Returns:
-          ellipse [...,6]  (cx,cy,a,b,cosθ,sinθ) with a,b > 0 and angle unit components normalized
-          delta_cm [...,1]
-          (optional logvar [...,1]) handled by caller
+           ellipse = [cx, cy, ax, ay, theta]   (ax, ay > 0)
+           delta   = [dx, dy, dz]
         """
-        cx, cy, log_a, log_b, cth, sth, delta = torch.split(raw_eye[..., :7], [1, 1, 1, 1, 1, 1, 1], dim=-1)
-        a = torch.exp(log_a).clamp_min(1e-3)
-        b = torch.exp(log_b).clamp_min(1e-3)
-        ang = torch.cat([cth, sth], dim=-1)
-        ang = _safe_norm(ang, dim=-1)  # normalize (cosθ, sinθ)
-        ellipse = torch.cat([cx, cy, a, b, ang[..., :1], ang[..., 1:2]], dim=-1)
+        cx = t[..., 0:1]
+        cy = t[..., 1:2]
+        ax = F.softplus(t[..., 2:3]) + 1e-6
+        ay = F.softplus(t[..., 3:4]) + 1e-6
+        theta = t[..., 4:5]
+        ellipse = torch.cat([cx, cy, ax, ay, theta], dim=-1)  # [..., 5]
+        delta = t[..., 5:8]  # [..., 3]
         return ellipse, delta
 
     @staticmethod
@@ -234,7 +235,7 @@ class PupilCenterRegressionHead(nn.Module):
         def unpack_eye(t):
             ellipse, delta = self._pack_ellipse(t)
             if self.predict_logvar:
-                logvar = t[..., 7:8]
+                logvar = t[..., 8:9]  # not 7:8
                 return ellipse, delta, logvar
             return ellipse, delta, None
 
