@@ -25,26 +25,38 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # ---------------------------
 # 2D sinusoidal positional encoding (lightweight)
 # ---------------------------
-def pos_enc_2d(h, w, dim, device):
-    assert dim % 4 == 0, "pos_enc_2d: dim must be multiple of 4"
-    pe = torch.zeros(1, dim, h, w, device=device)
+def pos_enc_2d(H: int, W: int, dim: int, device=None, dtype=torch.float32):
+    """
+    Returns [1, dim, H, W] 2D sinusoidal PE.
+    First half of channels encode Y, second half encode X.
+    dim must be divisible by 4.
+    """
+    assert dim % 4 == 0, "pos_enc_2d: dim must be divisible by 4"
+    pe = torch.zeros(1, dim, H, W, device=device, dtype=dtype)
+
     dim_half = dim // 2
-    dim_quarter = dim // 4
+    dim_quarter = dim_half // 2  # number of sin/cos pairs per axis
 
-    y = torch.arange(h, device=device).unsqueeze(1).float()  # [H,1]
-    x = torch.arange(w, device=device).unsqueeze(0).float()  # [1,W]
+    # --- Y (height) ---
+    y = torch.arange(H, device=device, dtype=dtype).unsqueeze(1)                          # [H,1]
+    div_y = torch.exp(torch.arange(0, dim_half, 2, device=device, dtype=dtype)
+                      * (-math.log(10000.0) / dim_half))                                  # [dim_quarter]
+    siny = torch.sin(y * div_y)                                                           # [H, dim_quarter]
+    cosy = torch.cos(y * div_y)                                                           # [H, dim_quarter]
+    # target slices: [1, dim_quarter, H, W] for sin, same for cos
+    pe[:, 0:dim_half:2, :, :] = siny.T.unsqueeze(0).unsqueeze(-1)                         # [1, dim_q, H, 1] -> broadcast W
+    pe[:, 1:dim_half:2, :, :] = cosy.T.unsqueeze(0).unsqueeze(-1)
 
-    div_term_y = torch.exp(torch.arange(0, dim_quarter, 2, device=device).float()
-                           * (-math.log(10000.0) / dim_quarter))
-    div_term_x = torch.exp(torch.arange(0, dim_quarter, 2, device=device).float()
-                           * (-math.log(10000.0) / dim_quarter))
+    # --- X (width) ---
+    x = torch.arange(W, device=device, dtype=dtype).unsqueeze(1)                          # [W,1]
+    div_x = torch.exp(torch.arange(0, dim_half, 2, device=device, dtype=dtype)
+                      * (-math.log(10000.0) / dim_half))                                  # [dim_quarter]
+    sinx = torch.sin(x * div_x)                                                           # [W, dim_quarter]
+    cosx = torch.cos(x * div_x)                                                           # [W, dim_quarter]
+    # target slices: [1, dim_quarter, H, W] living in the second half of channels
+    pe[:, dim_half:dim:2, :, :]     = sinx.T.unsqueeze(0).unsqueeze(2)                    # [1, dim_q, 1, W] -> broadcast H
+    pe[:, dim_half+1:dim:2, :, :]   = cosx.T.unsqueeze(0).unsqueeze(2)
 
-    pe[:, 0:dim_quarter:2, :, :] = torch.sin(y * div_term_y)[:, None, :, None]
-    pe[:, 1:dim_quarter:2, :, :] = torch.cos(y * div_term_y)[:, None, :, None]
-    pe[:, dim_quarter:dim_half:2, :, :] = torch.sin(x * div_term_x)[None, None, :, :]
-    pe[:, dim_quarter + 1:dim_half:2, :, :] = torch.cos(x * div_term_x)[None, None, :, :]
-
-    # second half kept zero; can be used for level embeddings if needed
     return pe
 
 
@@ -113,7 +125,8 @@ class CrossScaleAttention(nn.Module):
         Hq, Wq = math.ceil(H / self.query_stride), math.ceil(W / self.query_stride)
         q_map = F.interpolate(p2, size=(Hq, Wq), mode="bilinear", align_corners=False)
         q = self.q_proj(q_map)  # [B, d_model, Hq, Wq]
-        q = q + pos_enc_2d(Hq, Wq, q.shape[1], q.device)
+        pe = pos_enc_2d(Hq, Wq, q.size(1), device=q.device, dtype=q.dtype)
+        q = q + pe
         q = q.flatten(2).permute(2, 0, 1)  # [Hq*Wq, B, d_model]
 
         # Keys/Values from pooled tokens of each level
