@@ -1,3 +1,4 @@
+# train.py
 import argparse
 import os
 import csv
@@ -7,19 +8,17 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-import matplotlib
 # If you run headless (SSH), uncomment the next line:
 # matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from collections import defaultdict
 
-from raynet import RayNetStage1  # <-- new Stage-1 model
+from raynet import RayNetStage1
 from dataset import GazeGeneDataset, MultiViewBatchSampler
 
 from head_pose.loss import multiview_headpose_losses
-from gaze_vector.loss import multiview_gaze_vector_vmf_losses  # <-- vMF loss
-from pupil_center.loss import multiview_pupil_center_losses        # or _uncertainty if you enabled it
-# Stage-1: we don't use gaze point / depth or ray-consistency
+from gaze_vector.loss import multiview_gaze_vector_vmf_losses
+from pupil_center.loss import multiview_pupil_center_losses  # new SOTA multi-view loss
 
 # ----------------------------
 # Utils
@@ -42,14 +41,41 @@ def parse_args():
     p.add_argument('--plot_live', action="store_true")
     p.add_argument('--gradnorm_alpha', type=float, default=1.5)
     p.add_argument('--gaze_cons_w', type=float, default=0.2, help="Weight of spherical-consistency in gaze loss")
-    p.add_argument('--pc_robust', action="store_true", help="Use robust (Huber) pupil-center loss variant if implemented")
-    p.add_argument('--plot_png_every', type=int, default=100, help="Also save a PNG every N steps (helps when interactive fails)")
+    p.add_argument('--plot_png_every', type=int, default=100, help="Also save a PNG every N steps")
+    # Pupil-center loss weights
+    p.add_argument('--pc_w_3d', type=float, default=1.0)
+    p.add_argument('--pc_w_cons', type=float, default=0.3)
+    p.add_argument('--pc_w_ellipse2d', type=float, default=0.2)
     return p.parse_args()
+
 
 def get_backbone(backbone_name, weight_path, device):
     from backbone.repnext_utils import load_pretrained_repnext
     model = load_pretrained_repnext(backbone_name, weight_path)
     return model.to(device)
+
+
+def safe_get_iris_radius_tensor(dataset, subj_tensor, B, V, device):
+    """
+    Build [B,V] tensor of iris radius (in cm) from dataset.attr_dict using per-sample subject ids.
+    If missing, fill with zeros and let the loss skip the 2D ellipse term.
+    """
+    subj_list = subj_tensor.view(-1).tolist()  # length B*V
+    vals = []
+    for s in subj_list:
+        attrs = dataset.attr_dict.get(int(s), None)
+        if attrs is None:
+            vals.append(0.0)
+        else:
+            # the key in subject_label.pkl is 'iris_radius' (assumed already in centimeters)
+            r = attrs.get('iris_radius', 0.0)
+            try:
+                vals.append(float(r))
+            except Exception:
+                vals.append(0.0)
+    t = torch.tensor(vals, dtype=torch.float32, device=device).view(B, V)
+    return t
+
 
 # ----------------------------
 # Main
@@ -71,7 +97,7 @@ def main():
         subject_ids=subject_ids,
         samples_per_subject=args.samples_per_subject,
         transform=None,
-        balance_attributes=['ethicity']  # keep as in your codebase
+        balance_attributes=['ethicity']  # keep parity with your codebase
     )
     batch_sampler = MultiViewBatchSampler(dataset, batch_size=args.batch_size,
                                           balance_attributes=['ethicity'], shuffle=True)
@@ -133,7 +159,7 @@ def main():
     if args.plot_live:
         plt.ion()
         fig, ax = plt.subplots(figsize=(12, 7))
-        plt.show(block=False)          # important fix
+        plt.show(block=False)
         loss_hist = defaultdict(list)
 
     # GradNorm bookkeeping
@@ -142,7 +168,7 @@ def main():
 
     # Helper: pick a shared parameter for GradNorm gradients
     def pick_shared_param(net):
-        # Try cross-attention neck first
+        # Prefer a parameter in the cross-attention neck if present
         if hasattr(net, "xattn") and hasattr(net.xattn, "q_proj"):
             return net.xattn.q_proj.weight
         # Fallback: first parameter
@@ -161,35 +187,65 @@ def main():
             step_global += 1
 
             # ---- Prepare batch (multi-view) ----
-            images = batch['img'].to(device)           # [B*V, C, H, W] in your sampler
+            images = batch['img'].to(device)           # [B*V, C, H, W]
             B = images.shape[0] // 9
             V = 9
-            # If your sampler already gives [B*V,...] you may not need these reshapes,
-            # but we'll keep parity with your previous code:
-            images = images.view(B, V, images.shape[1], images.shape[2], images.shape[3])
-            images = images.reshape(B * V, images.shape[2], images.shape[3], images.shape[4]).to(device)
+
+            # reshape back to [B,V,...] then flatten again only if helpful; here we keep [B*V,...] for the model
+            # (your model expects [B*V, C, H, W])
+            # But we still need [B,V,...] for losses / bookkeeping:
+            # subjects for iris radius lookup:
+            subj_ids = batch['subject']  # likely Tensor [B*V]
+            if not torch.is_tensor(subj_ids):
+                subj_ids = torch.tensor(subj_ids, dtype=torch.long)
+            iris_r_cm = safe_get_iris_radius_tensor(dataset, subj_ids.to('cpu'), B, V, device)
+
+            # intrinsics: [B*V,3,3] -> [B,V,3,3]
+            K = batch['intrinsic'].to(device).view(B, V, 3, 3)
+
+            # GTs
+            hp_gt = batch['head_pose']['R'].to(device).view(B, V, 3, 3)
+            gaze_vec_gt = batch['gaze']['gaze_C'].to(device).view(B, V, 3)
+            gt_pupil_3d = batch['mesh']['pupil_center_3D'].to(device).view(B, V, 2, 3)
+            eye_ctr_3d = batch['mesh']['eyeball_center_3D'].to(device).view(B, V, 2, 3)
 
             # Forward
-            out = model(images)  # Stage-1 output for each view, shapes [B*V, ...]
-            # Head pose (6D), pupil center [B*V,2,3], gaze vMF {"mu":[B*V,3], "kappa":[B*V,1]}
-            # --- shapes ---
+            out = model(images)  # Stage-1 output per view [B*V, ...]
+            # Head pose (6D) -> [B,V,6]
             hp_pred = out["head_pose_6d"].view(B, V, 6)
+
+            # Gaze vMF dict -> reshape
+            if "gaze" not in out:
+                raise RuntimeError("Expected Stage-1 to return 'gaze' dict with keys ('mu','kappa').")
             gaze_mu = out["gaze"]["mu"].view(B, V, 3)
             gaze_k = out["gaze"]["kappa"].view(B, V, 1)
 
-            pupil_pred = out["pupil"]  # {"ellipse":[B*V,2,5] or [B, V, 2, 5], "delta_cm":[...,2,3]}
-            gt_pupil_3d = batch['mesh']['pupil_center_3D'].to(device).view(B, V, 2, 3)
-            eye_ctr_3d = batch['mesh']['eyeball_center_3D'].to(device).view(B, V, 2, 3)
-            K = batch['intrinsic'].to(device).view(B, V, 3, 3)
-            iris_r_cm = batch['iris_radius_cm'].to(device).view(B, V)
+            # Pupil head output can be dict or tensor
+            if "pupil" in out:
+                pupil_pred = out["pupil"]  # pass through to loss (dict OR tensor)
+            elif "pupil_center_3d" in out:
+                pupil_pred = out["pupil_center_3d"].view(B, V, 2, 3)  # legacy
+            else:
+                raise RuntimeError("Pupil output not found. Expected keys: 'pupil' or 'pupil_center_3d'")
 
-            # losses
-            hp_losses = multiview_headpose_losses(hp_pred, batch['head_pose']['R'].to(device).view(B, V, 3, 3))
-            gaze_losses = multiview_gaze_vector_vmf_losses({"mu": gaze_mu, "kappa": gaze_k},
-                                                           batch['gaze']['gaze_C'].to(device).view(B, V, 3),
-                                                           w_cons=args.gaze_cons_w)
-            pc_losses = multiview_pupil_center_losses(pupil_pred, gt_pupil_3d, eye_ctr_3d, K, iris_r_cm,
-                                   w_3d=1.0, w_consistency=0.3, w_ellipse2d=0.2)
+            # ---- Per-task base losses (accuracy + consistency) ----
+            hp_losses = multiview_headpose_losses(hp_pred, hp_gt)
+            gaze_losses = multiview_gaze_vector_vmf_losses(
+                {"mu": gaze_mu, "kappa": gaze_k},
+                gaze_vec_gt,
+                w_cons=args.gaze_cons_w
+            )
+            # New SOTA pupil loss: handles dict OR tensor; ellipse term is skipped if iris_r_cm == 0
+            pc_losses = multiview_pupil_center_losses(
+                pred=pupil_pred,
+                gt_center_3d=gt_pupil_3d,
+                eye_center_3d=eye_ctr_3d,
+                K=K,
+                iris_radius_cm=iris_r_cm,
+                w_3d=args.pc_w_3d,
+                w_consistency=args.pc_w_cons,
+                w_ellipse2d=args.pc_w_ellipse2d
+            )
 
             # Combine accuracy + consistency per task
             L_hp   = hp_losses['accuracy']   + hp_losses['consistency']
@@ -226,7 +282,7 @@ def main():
             # Compute GradNorm targets
             loss_ratios = (kendall_losses.detach() / (initial_losses + 1e-8))
             avg_ratio = loss_ratios.mean()
-            target = G.mean().detach() * (loss_ratios / (avg_ratio + 1e-8)) ** args.gradnorm_alpha  # [3]
+            target = G.mean().detach() * (loss_ratios / (avg_ratio + 1e-8)) ** alpha  # [3]
 
             # Phase 2: update task weights
             optimizer_weights.zero_grad()
@@ -258,7 +314,7 @@ def main():
             csv_writer.writerow(log)
             logfile.flush()
 
-            # ---- Live plot (fixed) ----
+            # ---- Live plot (robust) ----
             if args.plot_live:
                 for k in ["hp_acc", "gaze_acc_nll", "pc_acc"]:
                     loss_hist[k].append(log[k])
@@ -270,22 +326,25 @@ def main():
                 ax.set_title(f"Epoch {epoch} Step {step} | Batch {args.batch_size}")
                 ax.set_xlabel("Iterations")
                 ax.set_ylabel("Loss")
-                fig.canvas.draw()          # important
-                fig.canvas.flush_events()  # important
+                fig.canvas.draw()
+                fig.canvas.flush_events()
                 plt.pause(0.01)
-
-                # Also save a PNG periodically (works even if interactive fails)
                 if step_global % args.plot_png_every == 0:
-                    fig.savefig(os.path.join(args.checkpoint_dir, "training_plot.png"))
+                    try:
+                        fig.savefig(os.path.join(args.checkpoint_dir, "training_plot.png"))
+                    except Exception:
+                        pass
 
             if (step + 1) % 10 == 0:
-                print(f"Epoch {epoch} | Step {step+1}/{len(loader)} | "
-                      f"HP: {log['hp_acc']:.4f}/{log['hp_cons']:.4f} | "
-                      f"Gaze NLL: {log['gaze_acc_nll']:.4f} Cons: {log['gaze_cons']:.4f} | "
-                      f"PC: {log['pc_acc']:.4f}/{log['pc_cons']:.4f} | "
-                      f"w: [{log['w_hp']:.2f},{log['w_gaze']:.2f},{log['w_pc']:.2f}] | "
-                      f"s: [{log['s_hp']:.2f},{log['s_gaze']:.2f},{log['s_pc']:.2f}] | "
-                      f"Total: {log['total_loss']:.4f}")
+                print(
+                    f"Epoch {epoch} | Step {step+1}/{len(loader)} | "
+                    f"HP: {log['hp_acc']:.4f}/{log['hp_cons']:.4f} | "
+                    f"Gaze NLL: {log['gaze_acc_nll']:.4f} Cons: {log['gaze_cons']:.4f} | "
+                    f"PC: {log['pc_acc']:.4f}/{log['pc_cons']:.4f} | "
+                    f"w: [{log['w_hp']:.2f},{log['w_gaze']:.2f},{log['w_pc']:.2f}] | "
+                    f"s: [{log['s_hp']:.2f},{log['s_gaze']:.2f},{log['s_pc']:.2f}] | "
+                    f"Total: {log['total_loss']:.4f}"
+                )
 
         # ---- Save checkpoint ----
         if (epoch + 1) % args.checkpoint_freq == 0 or (epoch + 1) == args.epochs:
@@ -306,7 +365,6 @@ def main():
 
     if args.plot_live:
         plt.ioff()
-        # Save final plot snapshot
         try:
             fig.savefig(os.path.join(args.checkpoint_dir, "training_plot_final.png"))
         except Exception:
