@@ -17,7 +17,7 @@ from raynet import RayNetStage1  # <-- new Stage-1 model
 from dataset import GazeGeneDataset, MultiViewBatchSampler
 
 from head_pose.loss import multiview_headpose_losses
-from gaze_vector.loss_vmf import multiview_gaze_vector_vmf_losses  # <-- vMF loss
+from gaze_vector.loss import multiview_gaze_vector_vmf_losses  # <-- vMF loss
 from pupil_center.loss import multiview_pupil_center_losses        # or _uncertainty if you enabled it
 # Stage-1: we don't use gaze point / depth or ray-consistency
 

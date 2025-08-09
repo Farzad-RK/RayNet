@@ -197,32 +197,37 @@ class RayNetStage1(nn.Module):
         return [c1, c2, c3, c4]
 
     def forward(self, x):
-        c1, c2, c3, c4 = self._stages(x)
+        # ----- backbone -----
+        c0 = self.backbone.stem(x)  # don't checkpoint the stem
+        c1 = checkpoint(self.backbone.stages[0], c0, use_reentrant=False)
+        c2 = checkpoint(self.backbone.stages[1], c1, use_reentrant=False)
+        c3 = checkpoint(self.backbone.stages[2], c2, use_reentrant=False)
+        c4 = checkpoint(self.backbone.stages[3], c3, use_reentrant=False)
 
-        # Coordinate Attention gates
+        # coord-attn on each level
         c1, c2, c3, c4 = self.ca1(c1), self.ca2(c2), self.ca3(c3), self.ca4(c4)
 
-        # Cross-scale attention to enrich high-res features
-        feat = self.xattn([c1, c2, c3, c4])  # [B, C, H, W]
+        # cross-scale attention neck -> high-res feat
+        feat = self.xattn([c1, c2, c3, c4])  # [B,C,H,W]
 
-        # Task heads
-        head_pose_6d     = self.head_pose(feat)      # [B, 6]
-        gaze_vector_6d   = self.gaze_vector(feat)    # [B, 6]
-        pupil_center_3d  = self.pupil_center(feat)   # [B, 2, 3]
+        # ----- heads -----
+        head_pose_6d = self.head_pose(feat)  # [B,6]
+        pupil_center_3d = self.pupil_center(feat)  # [B,2,3]
 
-        # Geometry for downstream
-        R = ortho6d_to_rotmat(gaze_vector_6d)        # [B,3,3]
-        direction = R[:, :, 2]
-        direction = direction / (direction.norm(dim=1, keepdim=True) + 1e-8)
-        origin = pupil_center_3d.mean(dim=1)         # [B,3]
+        # vMF gaze head returns dict with 'mu' (unit dir) and 'kappa'
+        gaze_out = self.gaze_vector(feat, head_pose_6d)  # {'mu':[B,3], 'kappa':[B,1]}
+        direction = gaze_out['mu']  # [B,3], already unit
+
+        # Geometry helpful for downstream (origin as mean of eyes)
+        origin = pupil_center_3d.mean(dim=1)  # [B,3]
 
         return {
-            "feat": feat,  # enriched high-res map
             "head_pose_6d": head_pose_6d,
-            "gaze_vector_6d": gaze_vector_6d,
-            "direction": direction,
             "pupil_center_3d": pupil_center_3d,
+            "gaze": gaze_out,  # keep as dict
+            "direction": direction,  # convenience
             "origin": origin,
+            # if you aren't computing ray depth/point in Stage1, don't return them here
         }
 
 
