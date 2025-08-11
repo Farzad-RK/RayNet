@@ -1,113 +1,109 @@
 # pupil_center/model.py
-# Geometry-aware pupil center head: predicts per-eye ellipse in image + along-normal offset.
-# Works with your CoordAtt and RepNeXt backbone features.
+# Geometry-aware pupil head: predicts per-eye ellipse in pixels + along-normal offset (scalar).
 
-import math
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from RayNet.coordatt import CoordAtt
 
+from coordatt import CoordAtt
+
+PUPIL_DEBUG = os.environ.get("PUPIL_DEBUG", "0") not in ("0", "", "false", "False", "no", "No")
+
+# Set a generous upper bound so you can *see* if depths are wrong before clamping.
+MIN_DEPTH_CM = float(os.environ.get("PUPIL_MIN_DEPTH_CM", "0.5"))
+MAX_DEPTH_CM = float(os.environ.get("PUPIL_MAX_DEPTH_CM", "1000.0"))
 
 def _safe_norm(v, dim=-1, eps=1e-8):
     return v / (v.norm(dim=dim, keepdim=True) + eps)
 
+def _ensure_6param(ellipse: torch.Tensor) -> torch.Tensor:
+    if ellipse.size(-1) == 6:
+        return ellipse
+    if ellipse.size(-1) == 5:
+        cx, cy, a, b, th = torch.split(ellipse, [1, 1, 1, 1, 1], dim=-1)
+        return torch.cat([cx, cy, a, b, torch.cos(th), torch.sin(th)], dim=-1)
+    raise ValueError(f"_ensure_6param: expected last dim 5 or 6, got {ellipse.size(-1)}")
+
+def _k_stats_str(K: torch.Tensor) -> str:
+    fx = K[:, 0, 0]; fy = K[:, 1, 1]; cx = K[:, 0, 2]; cy = K[:, 1, 2]
+    return (f"fx min/mean/max: {float(fx.min()):.2f}/{float(fx.mean()):.2f}/{float(fx.max()):.2f} | "
+            f"fy min/mean/max: {float(fy.min()):.2f}/{float(fy.mean()):.2f}/{float(fy.max()):.2f} | "
+            f"cx mean: {float(cx.mean()):.2f} cy mean: {float(cy.mean()):.2f}")
+
+def _validate_intrinsics(K: torch.Tensor):
+    fx = K[:, 0, 0]; fy = K[:, 1, 1]
+    if torch.any(torch.isnan(K)) or torch.any(torch.isinf(K)):
+        raise ValueError("[K] contains NaN/Inf.")
+    if float(fx.mean()) < 10.0 or float(fy.mean()) < 10.0:
+        raise ValueError(f"[K] intrinsics look invalid; {_k_stats_str(K)}")
 
 class PupilCenterRegressionHead(nn.Module):
     """
-    Predicts, for each eye (L,R):
-      - an image-space ellipse E = (cx, cy, a, b, cosθ, sinθ)  [pixels]
-      - a signed offset δ [cm] along the inferred iris-plane normal (toward the camera if negative)
-      - optional aleatoric log-variance for robust training
-
-    Forward can be called in two modes:
-      1) params-only (default): returns ellipse params and offset; 3D lifting is done in the loss.
-         out = {"ellipse": [B,2,6], "delta_cm": [B,2,1]}
-      2) geometry mode: pass K (intrinsics) and iris_radius_cm to also get 3D pupil centers:
-         out additionally contains "pupil_center_3d": [B,2,3] and "iris_normal": [B,2,3]
+    For each eye (L, R):
+      - ellipse (cx, cy, a, b, cosθ, sinθ)    [pixels]
+      - scalar offset δ (cm) along iris-plane normal
+      - optional logvar (aleatoric)
     """
-
-    def __init__(
-        self,
-        in_channels: int = 256,
-        hidden_dim: int = 256,
-        reduction: int = 32,
-        dropout: float = 0.0,
-        predict_logvar: bool = False,
-    ):
+    def __init__(self, in_channels=256, hidden_dim=256, reduction=32, dropout=0.0, predict_logvar=False):
         super().__init__()
         self.predict_logvar = predict_logvar
 
-        # Lightweight attention + global pooling
         self.ca = CoordAtt(in_channels, in_channels, reduction=reduction)
         self.pool = nn.AdaptiveAvgPool2d(1)
 
-        # MLP trunk
         self.fc1 = nn.Linear(in_channels, hidden_dim)
         self.bn1 = nn.BatchNorm1d(hidden_dim)
         self.act = nn.ReLU(inplace=True)
         self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-        # Per-eye output (L and R, concatenated)
-        # ellipse: (cx, cy, log_a, log_b, cosθ, sinθ) -> 6 params
-        # delta: along-normal offset in cm -> 1 param
-        # optional: logvar (for heteroscedastic loss) -> 1 param
-        per_eye = 6 + 1 + (1 if predict_logvar else 0)
+        # Per-eye params: [cx, cy, log_a, log_b, ang_x, ang_y, delta, (logvar)]
+        per_eye = 7 + (1 if predict_logvar else 0)
         self.fc_out = nn.Linear(hidden_dim, 2 * per_eye)
-
-        # Friendly initialization
         nn.init.zeros_(self.fc_out.bias)
 
-    @staticmethod
-    def _pack_ellipse(self, t):
-        """
-        t: [..., D] per-eye vector. We assume:
-           0: cx, 1: cy, 2: ax_raw, 3: ay_raw, 4: theta, 5: dx, 6: dy, 7: dz, (8: logvar optional)
-        Returns:
-           ellipse = [cx, cy, ax, ay, theta]   (ax, ay > 0)
-           delta   = [dx, dy, dz]
-        """
+    def _unpack_eye(self, t):
         cx = t[..., 0:1]
         cy = t[..., 1:2]
-        ax = F.softplus(t[..., 2:3]) + 1e-6
-        ay = F.softplus(t[..., 3:4]) + 1e-6
-        theta = t[..., 4:5]
-        ellipse = torch.cat([cx, cy, ax, ay, theta], dim=-1)  # [..., 5]
-        delta = t[..., 5:8]  # [..., 3]
-        return ellipse, delta
+        a = F.softplus(t[..., 2:3]) + 1e-6
+        b = F.softplus(t[..., 3:4]) + 1e-6
+        ang = _safe_norm(t[..., 4:6], dim=-1)
+        cos_t = ang[..., 0:1]
+        sin_t = ang[..., 1:2]
+        delta = 0.3 * torch.tanh(t[..., 6:7])  # cm
+        ellipse = torch.cat([cx, cy, a, b, cos_t, sin_t], dim=-1)
+        if self.predict_logvar:
+            logvar = t[..., 7:8]
+            return ellipse, delta, logvar
+        return ellipse, delta, None
 
     @staticmethod
     def ellipse_to_normalized_conic(ellipse, K):
         """
-        Convert ellipse params to a 2D conic in normalized camera coords.
-        ellipse: [B,2,6] (cx,cy,a,b,cosθ,sinθ) in pixels
-        K:       [B,3,3] intrinsics for the (cropped) image (per sample)
-        Returns:
-          Cn: [B,2,3,3]  conic matrices in normalized coords (homogeneous 2D)
+        x_n^T Cn x_n = 0 with u = K x_n  =>  Cn = K^T C K  (not K^{-T} C K^{-1})
         """
         B = ellipse.shape[0]
         device = ellipse.device
+        ellipse = _ensure_6param(ellipse)
+        _validate_intrinsics(K)
 
-        cx, cy, a, b, cth, sth = torch.split(ellipse, [1, 1, 1, 1, 1, 1], dim=-1)  # [B,2,1] each
+        cx, cy, a, b, cth, sth = torch.split(ellipse, [1, 1, 1, 1, 1, 1], dim=-1)
         theta = torch.atan2(sth, cth)
-        # 2x2 shape matrix A = R diag(1/a^2, 1/b^2) R^T
-        c2 = (1.0 / (a * a)).squeeze(-1)  # [B,2]
-        d2 = (1.0 / (b * b)).squeeze(-1)  # [B,2]
+        inv_a2 = (1.0 / (a * a)).squeeze(-1)
+        inv_b2 = (1.0 / (b * b)).squeeze(-1)
         ct = torch.cos(theta).squeeze(-1)
         st = torch.sin(theta).squeeze(-1)
-        # A entries
-        A11 = ct * ct * c2 + st * st * d2
-        A22 = st * st * c2 + ct * ct * d2
-        A12 = ct * st * (c2 - d2)
 
-        # Conic in pixel coords: (x-c)^T A (x-c) = 1  -> C = [A  -A c; -c^T A  c^T A c - 1]
+        A11 = ct * ct * inv_a2 + st * st * inv_b2
+        A22 = st * st * inv_a2 + ct * ct * inv_b2
+        A12 = ct * st * (inv_a2 - inv_b2)
+
         C = torch.zeros(B, 2, 3, 3, device=device)
         C[:, :, 0, 0] = A11
         C[:, :, 1, 1] = A22
         C[:, :, 0, 1] = A12
         C[:, :, 1, 0] = A12
 
-        # -A*c
         ax = (A11 * cx.squeeze(-1) + A12 * cy.squeeze(-1))
         ay = (A12 * cx.squeeze(-1) + A22 * cy.squeeze(-1))
         C[:, :, 0, 2] = -ax
@@ -115,151 +111,117 @@ class PupilCenterRegressionHead(nn.Module):
         C[:, :, 1, 2] = -ay
         C[:, :, 2, 1] = -ay
 
-        # c^T A c - 1
-        cAc = (A11 * cx.squeeze(-1) ** 2
-               + 2 * A12 * cx.squeeze(-1) * cy.squeeze(-1)
-               + A22 * cy.squeeze(-1) ** 2)
+        cAc = (A11 * cx.squeeze(-1) ** 2 + 2 * A12 * cx.squeeze(-1) * cy.squeeze(-1) + A22 * cy.squeeze(-1) ** 2)
         C[:, :, 2, 2] = cAc - 1.0
 
-        # Normalize to camera coordinates: x_n = T x, with
-        # T = [[1/fx, 0, -cx/fx], [0, 1/fy, -cy/fy], [0, 0, 1]]
-        # Conic transforms as Cn = T^{-T} C T^{-1}
-        Kinv = torch.inverse(K)  # [B,3,3]
-        # Break Kinv for affine part: x_n = K^{-1} x
-        # For a 2D conic, full 3x3 works; just apply for each eye
-        Cn = torch.zeros_like(C)
-        for eye in range(2):
-            Cn[:, eye] = torch.matmul(Kinv.transpose(1, 2), torch.matmul(C[:, eye], Kinv))
+        Cn = K.transpose(1, 2).unsqueeze(1) @ C @ K.unsqueeze(1)
         return Cn
 
     @staticmethod
     def conic_axes_in_normalized(Cn):
-        """
-        Extract semi-axes (a_n, b_n) and angle theta_n (in the normalized plane z=1)
-        from conic matrix Cn (2D ellipse).
-        Returns: a_n [B,2,1], b_n [B,2,1], theta_n [B,2,1]  (all in normalized units)
-        """
-        B = Cn.shape[0]
-        device = Cn.device
-        # Convert Cn -> implicit ellipse (x-μ)^T A (x-μ)=1 to read axes.
-        # For conic C = [A  u; u^T  w], the center μ solves A μ = -u
-        A = Cn[:, :, :2, :2]      # [B,2,2,2]
-        u = Cn[:, :, :2, 2:3]     # [B,2,2,1]
-        # Solve for center (per batch, per eye)
-        mu = torch.linalg.solve(A, -u)  # [B,2,2,1]
-        # Translate to center -> A stays; axes from eigen-decomposition of A
-        # A = R diag(λ1, λ2) R^T, semi-axes = 1/sqrt(λi)
-        evals, evecs = torch.linalg.eigh(A)  # [B,2,2], [B,2,2,2]
-        lam1 = evals[:, :, 0:1]  # smallest
+        A = Cn[:, :, :2, :2]
+        u = Cn[:, :, :2, 2:3]
+        mu = torch.linalg.solve(A, -u).squeeze(-1)  # [B,2,2]
+
+        evals, evecs = torch.linalg.eigh(A)
+        lam1 = evals[:, :, 0:1]
         lam2 = evals[:, :, 1:2]
-        # Ensure ordering so that a_n >= b_n
-        a_n = (1.0 / torch.sqrt(lam1.clamp_min(1e-12)))  # major
-        b_n = (1.0 / torch.sqrt(lam2.clamp_min(1e-12)))  # minor
-        # Angle from eigenvector of major axis
-        v = evecs[:, :, :, 0]  # [B,2,2], major axis direction in normalized x-y
+        a_n = 1.0 / torch.sqrt(lam1.clamp_min(1e-12))
+        b_n = 1.0 / torch.sqrt(lam2.clamp_min(1e-12))
+
+        v = evecs[:, :, :, 0]
         theta_n = torch.atan2(v[..., 1], v[..., 0]).unsqueeze(-1)
-        return a_n, b_n, theta_n, mu.squeeze(-1)  # mu: [B,2,2]
+        return a_n, b_n, theta_n, mu
+
+    @staticmethod
+    def _direct_normalized_from_pixels(ellipse, K):
+        ellipse = _ensure_6param(ellipse)
+        cx, cy, a, b, _, _ = torch.split(ellipse, [1,1,1,1,1,1], dim=-1)
+        fx = K[:, 0, 0].view(-1, 1, 1)
+        fy = K[:, 1, 1].view(-1, 1, 1)
+        cx0 = K[:, 0, 2].view(-1, 1, 1)
+        cy0 = K[:, 1, 2].view(-1, 1, 1)
+        a_n = a / fx
+        b_n = b / fy
+        mu_n = torch.cat([(cx - cx0) / fx, (cy - cy0) / fy], dim=-1)
+        return a_n, b_n, mu_n
 
     @staticmethod
     def lift_iris_pose_and_center(ellipse, K, iris_radius_cm):
-        """
-        Given ellipse in pixels and intrinsics K, lift to a coarse iris plane pose:
-          - depth z via a_n (major axis in normalized coords): z ≈ R / a_n
-          - plane tilt via axis ratio: cos(tilt) ≈ b_n / a_n (orthographic approx)
-          - plane normal by rotating camera z-axis about the major-axis direction by 'tilt'
-          - 3D iris center at depth z along center ray
-
-        Returns:
-          iris_center_3d: [B,2,3] (cm, camera coords)
-          iris_normal:    [B,2,3] (unit, camera coords)
-          depth_cm:       [B,2,1]
-        """
         B = ellipse.shape[0]
-        device = ellipse.device
+        ellipse = _ensure_6param(ellipse)
+        _validate_intrinsics(K)
 
-        # Conic in normalized coords & axes
-        Cn = PupilCenterRegressionHead.ellipse_to_normalized_conic(ellipse, K)   # [B,2,3,3]
-        a_n, b_n, theta_n, mu_n = PupilCenterRegressionHead.conic_axes_in_normalized(Cn)  # [B,2,1],..., mu_n [B,2,2]
+        Cn = PupilCenterRegressionHead.ellipse_to_normalized_conic(ellipse, K)
+        a_n, b_n, theta_n, mu_n = PupilCenterRegressionHead.conic_axes_in_normalized(Cn)
 
-        # Depth from major axis (normalized plane has focal=1): a_n ≈ R / z  -> z ≈ R / a_n
-        R = iris_radius_cm.view(B, 1, 1)  # [B,1,1]
-        z = (R / a_n.clamp_min(1e-6))     # [B,2,1]
+        if PUPIL_DEBUG:
+            a_dir, b_dir, mu_dir = PupilCenterRegressionHead._direct_normalized_from_pixels(ellipse, K)
+            a_rel = torch.abs((a_n - a_dir) / a_dir.clamp_min(1e-12))
+            b_rel = torch.abs((b_n - b_dir) / b_dir.clamp_min(1e-12))
+            mu_err = torch.norm(mu_n - mu_dir, dim=-1)
+            def _stat(t): return float(t.min()), float(t.mean()), float(t.max())
+            print("[DEBUG] K stats:", _k_stats_str(K))
+            print(f"[DEBUG] iris R cm min/mean/max: {float(iris_radius_cm.min()):.4f} / "
+                  f"{float(iris_radius_cm.mean()):.4f} / {float(iris_radius_cm.max()):.4f}")
+            print(f"[DEBUG] a_n min/mean/max:       {_stat(a_n)[0]:.6f} / {_stat(a_n)[1]:.6f} / {_stat(a_n)[2]:.6f}")
+            print(f"[DEBUG] b_n min/mean/max:       {_stat(b_n)[0]:.6f} / {_stat(b_n)[1]:.6f} / {_stat(b_n)[2]:.6f}")
+            print(f"[DEBUG] sanity a_n~a/fx rel err mean/max: {float(a_rel.mean()):.4e} / {float(a_rel.max()):.4e}")
+            print(f"[DEBUG] sanity b_n~b/fy rel err mean/max: {float(b_rel.mean()):.4e} / {float(b_rel.max()):.4e}")
+            print(f"[DEBUG] center μ_n vs direct (norm) mean/max: {float(mu_err.mean()):.4e} / {float(mu_err.max()):.4e}")
 
-        # Iris center direction ray (normalized)
-        x_n = mu_n[..., 0:1]  # [B,2,1]
+        a_n = a_n.clamp_min(1e-6)
+        R   = iris_radius_cm.view(B, 1, 1)
+        z_raw = R / a_n
+        z     = z_raw.clamp(MIN_DEPTH_CM, MAX_DEPTH_CM)
+
+        x_n = mu_n[..., 0:1]
         y_n = mu_n[..., 1:2]
-        ray = torch.cat([x_n, y_n, torch.ones_like(x_n)], dim=-1)  # [B,2,3]
-        ray = _safe_norm(ray, dim=-1)
+        ray = _safe_norm(torch.cat([x_n, y_n, torch.ones_like(x_n)], dim=-1), dim=-1)
+        iris_center_3d = ray * z
 
-        iris_center_3d = ray * z  # [B,2,3] in "focal=1, units=cm" because z is cm
-
-        # Plane tilt & normal: cos(tilt) ≈ b_n / a_n
         cos_tilt = (b_n / a_n).clamp(0.0, 1.0)
-        tilt = torch.acos(cos_tilt)  # [B,2,1]
+        tilt = torch.acos(cos_tilt)
 
-        # Major-axis direction in normalized x-y plane
-        maj_dir = torch.cat([torch.cos(theta_n), torch.sin(theta_n)], dim=-1)  # [B,2,2]
-        # Build rotation axis (major-axis direction in 3D)
-        axis = F.pad(maj_dir, (0, 1), value=0.0)  # [B,2,3], z=0
+        maj_dir = torch.cat([torch.cos(theta_n), torch.sin(theta_n)], dim=-1)
+        axis = F.pad(maj_dir, (0, 1), value=0.0)
+        z_axis = iris_center_3d.new_zeros(B, 2, 3); z_axis[..., 2] = 1.0
 
-        # Rotate z-axis [0,0,1] by 'tilt' around 'axis' (Rodrigues)
-        z_axis = torch.zeros(B, 2, 3, device=device); z_axis[..., 2] = 1.0
         k = _safe_norm(axis, dim=-1)
-        ct = torch.cos(tilt)
-        st = torch.sin(tilt)
-        # Rodrigues: v_rot = v*ct + (k x v)*st + k*(k·v)*(1-ct)
+        ct = torch.cos(tilt); st = torch.sin(tilt)
         kv = torch.cross(k, z_axis, dim=-1)
         kdotv = (k * z_axis).sum(dim=-1, keepdim=True)
-        normal = z_axis * ct + kv * st + k * (kdotv * (1.0 - ct))
-        normal = _safe_norm(normal, dim=-1)  # [B,2,3]
+        normal = _safe_norm(z_axis * ct + kv * st + k * (kdotv * (1.0 - ct)), dim=-1)
 
-        depth_cm = z
-        return iris_center_3d, normal, depth_cm
+        if PUPIL_DEBUG:
+            print(f"[DEBUG] z_raw cm min/mean/max:  {float(z_raw.min()):.2f} / {float(z_raw.mean()):.2f} / {float(z_raw.max()):.2f}")
+            print(f"[DEBUG] z_clamp cm mn/mean/mx:  {float(z.min()):.2f} / {float(z.mean()):.2f} / {float(z.max()):.2f}")
 
-    def forward(self, x, K: torch.Tensor = None, iris_radius_cm: torch.Tensor = None):
-        """
-        x: features [B,C,H,W]
-        K: intrinsics [B,3,3] (optional)
-        iris_radius_cm: [B,] or [B,1] (optional)
-        """
+        return iris_center_3d, normal, z
+
+    def forward(self, x, K=None, iris_radius_cm=None):
         B = x.size(0)
         x = self.ca(x)
-        x = self.pool(x).flatten(1)               # [B,C]
-        h = self.drop(self.act(self.bn1(self.fc1(x))))  # [B,H]
-
-        raw = self.fc_out(h)                      # [B, 2 * per_eye]
-        per_eye = raw.shape[-1] // 2
+        x = self.pool(x).flatten(1)
+        h = self.drop(self.act(self.bn1(self.fc1(x))))
+        raw = self.fc_out(h)
+        per_eye = raw.size(-1) // 2
         left, right = raw[:, :per_eye], raw[:, per_eye:]
 
-        # Unpack eyes (ellipse, delta, optional logvar)
-        def unpack_eye(t):
-            ellipse, delta = self._pack_ellipse(t)
-            if self.predict_logvar:
-                logvar = t[..., 8:9]  # not 7:8
-                return ellipse, delta, logvar
-            return ellipse, delta, None
+        eL, dL, sL = self._unpack_eye(left)
+        eR, dR, sR = self._unpack_eye(right)
 
-        eL, dL, sL = unpack_eye(left)
-        eR, dR, sR = unpack_eye(right)
+        ellipse = torch.stack([eL, eR], dim=1)
+        delta_cm = torch.stack([dL, dR], dim=1)
 
-        ellipse = torch.stack([eL, eR], dim=1)     # [B,2,6]
-        delta_cm = torch.stack([dL, dR], dim=1)    # [B,2,1]
-
-        out = {
-            "ellipse": ellipse,
-            "delta_cm": delta_cm,
-        }
+        out = {"ellipse": ellipse, "delta_cm": delta_cm}
         if self.predict_logvar:
-            logvar = torch.stack([sL, sR], dim=1)  # [B,2,1]
-            out["logvar"] = logvar
+            out["logvar"] = torch.stack([sL, sR], dim=1)
 
-        # Optional geometry pass
         if K is not None and iris_radius_cm is not None:
             iris_center, iris_normal, depth_cm = self.lift_iris_pose_and_center(ellipse, K, iris_radius_cm)
-            pupil_center = iris_center + delta_cm * iris_normal  # shift along normal
             out["iris_center_3d"] = iris_center
             out["iris_normal"] = iris_normal
-            out["pupil_center_3d"] = pupil_center
+            out["pupil_center_3d"] = iris_center + delta_cm * iris_normal
             out["iris_depth_cm"] = depth_cm
-
         return out
