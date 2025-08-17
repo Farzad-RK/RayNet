@@ -7,13 +7,25 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import numpy as np
 
+# Import the eye-focused RayNet and losses
+import sys
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 from raynet import RayNet  # Eye-focused version
 from dataset import GazeGeneDataset, MultiViewBatchSampler
 from eye_losses import CombinedRayNetLoss
 
+import matplotlib
+
+# Set backend before importing pyplot
+matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 from collections import defaultdict
 import torch.nn as nn
+import warnings
+
+warnings.filterwarnings('ignore', category=UserWarning)
 
 
 def parse_args():
@@ -252,6 +264,27 @@ def main():
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
+    # Check for existing checkpoints to resume training
+    start_epoch = 0
+    checkpoint_files = []
+    if os.path.exists(args.checkpoint_dir):
+        checkpoint_files = sorted([f for f in os.listdir(args.checkpoint_dir)
+                                   if f.endswith('.pth') and 'raynet_eye_epoch' in f])
+
+    if checkpoint_files:
+        last_ckpt = os.path.join(args.checkpoint_dir, checkpoint_files[-1])
+        print(f"Resuming from checkpoint: {last_ckpt}")
+        try:
+            checkpoint = torch.load(last_ckpt, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            print(f"Resumed from epoch {start_epoch}")
+        except Exception as e:
+            print(f"Failed to load checkpoint: {e}")
+            print("Starting from scratch...")
+
     # Logging setup
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     logfile = open(args.log_csv, "w", newline="")
@@ -289,8 +322,31 @@ def main():
             # Forward pass
             outputs = model(images)
 
+            # Prepare ground truth data for loss computation
+            # Move all data to device and reshape for multi-view
+            gt_data = {
+                'mesh': {
+                    'eyeball_center_3D': batch['mesh']['eyeball_center_3D'].to(device),
+                    'iris_mesh_3D': batch['mesh']['iris_mesh_3D'].to(device),
+                    'pupil_center_3D': batch['mesh']['pupil_center_3D'].to(device)
+                },
+                'gaze': {
+                    'gaze_C': batch['gaze']['gaze_C'].to(device),
+                    'optic_axis_L': batch['gaze']['optic_axis_L'].to(device),
+                    'optic_axis_R': batch['gaze']['optic_axis_R'].to(device),
+                    'visual_axis_L': batch['gaze']['visual_axis_L'].to(device),
+                    'visual_axis_R': batch['gaze']['visual_axis_R'].to(device),
+                    'gaze_depth': batch['gaze']['gaze_depth'].to(device)
+                },
+                'gaze_point': batch['gaze_point'].to(device),
+                'head_pose': {
+                    'R': batch['head_pose']['R'].to(device),
+                    't': batch['head_pose']['t'].to(device)
+                }
+            }
+
             # Compute loss
-            losses = criterion(outputs, batch, is_multiview=True)
+            losses = criterion(outputs, gt_data, is_multiview=True)
             total_loss = losses['total']
 
             # Backward pass
