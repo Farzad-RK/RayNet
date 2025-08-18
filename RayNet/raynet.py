@@ -1,363 +1,348 @@
+# raynet.py
+import math
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from backbone.repnext_utils import load_pretrained_repnext
 from torch.utils.checkpoint import checkpoint
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# backbone helper (only used in the sanity block)
+from backbone.repnext_utils import load_pretrained_repnext
+
+# use your stable 6D -> SO(3)
+from utils import compute_rotation_matrix_from_ortho6d
 
 
-# ----------------------------
-# Utility: 6D -> SO(3)
-# ----------------------------
-def sixd_to_R(x: torch.Tensor) -> torch.Tensor:
+# ========= Geometry helpers (kept here; move to utils.py later if you like) =========
+
+def _skew3(v: torch.Tensor) -> torch.Tensor:
+    """v: [...,3] -> skew-symmetric [...,3,3]"""
+    O = torch.zeros_like(v[..., 0])
+    vx, vy, vz = v[..., 0], v[..., 1], v[..., 2]
+    return torch.stack(
+        [
+            torch.stack([O, -vz, vy], dim=-1),
+            torch.stack([vz, O, -vx], dim=-1),
+            torch.stack([-vy, vx, O], dim=-1),
+        ],
+        dim=-2,
+    )
+
+
+def so3_exp(rotvec: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
     """
-    x: [..., 6]
-    returns rotation matrices [..., 3, 3]
+    Axis-angle exponential map.
+    rotvec: [...,3]  (radians)  ->  R: [...,3,3]
     """
-    a1 = F.normalize(x[..., 0:3], dim=-1)
-    a2 = x[..., 3:6]
-    b2 = F.normalize(a2 - (a1 * a2).sum(-1, keepdim=True) * a1, dim=-1)
-    b3 = torch.cross(a1, b2, dim=-1)
-    R = torch.stack([a1, b2, b3], dim=-2)
-    return R
+    theta = torch.linalg.norm(rotvec, dim=-1, keepdim=True)          # [...,1]
+    k = torch.where(theta > eps, rotvec / theta, torch.zeros_like(rotvec))
+    K = _skew3(k)                                                     # [...,3,3]
+    I = torch.eye(3, device=rotvec.device, dtype=rotvec.dtype).expand(K.shape)
+    st = torch.sin(theta)[..., None]                                  # [...,1,1]
+    ct = torch.cos(theta)[..., None]
+    R = I + st * K + (1.0 - ct) * (K @ K)
+    return torch.where((theta[..., None] < eps), I, R)
 
 
-# ----------------------------
-# Lightweight FPN neck
-# ----------------------------
-class Conv1x1(nn.Module):
-    def __init__(self, c_in, c_out):
-        super().__init__()
-        self.conv = nn.Conv2d(c_in, c_out, 1, 1, 0)
-        self.bn = nn.BatchNorm2d(c_out)
-        self.act = nn.ReLU(inplace=True)
+# ========= Parameter bounds (all cm except angles) =========
 
-    def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
-
-
-class Conv3x3(nn.Module):
-    def __init__(self, c_in, c_out):
-        super().__init__()
-        self.conv = nn.Conv2d(c_in, c_out, 3, 1, 1)
-        self.bn = nn.BatchNorm2d(c_out)
-        self.act = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
-
-
-class TinyFPN(nn.Module):
-    """
-    Creates P2..P5 from C1..C4 with lateral 1x1 + top-down, then 3x3 smooth.
-    """
-    def __init__(self, in_channels_list, out_channels=256):
-        super().__init__()
-        assert len(in_channels_list) == 4
-        C1, C2, C3, C4 = in_channels_list
-
-        self.lats = nn.ModuleList([
-            Conv1x1(C1, out_channels),
-            Conv1x1(C2, out_channels),
-            Conv1x1(C3, out_channels),
-            Conv1x1(C4, out_channels),
-        ])
-        self.smooth = nn.ModuleList([
-            Conv3x3(out_channels, out_channels),
-            Conv3x3(out_channels, out_channels),
-            Conv3x3(out_channels, out_channels),
-            Conv3x3(out_channels, out_channels),
-        ])
-
-    def forward(self, feats):
-        # feats = [C1, C2, C3, C4]
-        c1, c2, c3, c4 = feats
-        p4 = self.lats[3](c4)                     # top
-        p3 = self.lats[2](c3) + F.interpolate(p4, size=c3.shape[-2:], mode="nearest")
-        p2 = self.lats[1](c2) + F.interpolate(p3, size=c2.shape[-2:], mode="nearest")
-        p1 = self.lats[0](c1) + F.interpolate(p2, size=c1.shape[-2:], mode="nearest")
-
-        p1 = self.smooth[0](p1)
-        p2 = self.smooth[1](p2)
-        p3 = self.smooth[2](p3)
-        p4 = self.smooth[3](p4)
-        return [p1, p2, p3, p4]
-
-
-class GlobalEmbed(nn.Module):
-    """
-    Global feature from pyramid by GAP + concat.
-    """
-    def __init__(self, num_levels=4, level_dim=256, out_dim=1024):
-        super().__init__()
-        in_dim = num_levels * level_dim
-        self.proj = nn.Sequential(
-            nn.Linear(in_dim, out_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(out_dim, out_dim),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, ps):  # list of [N,C,H,W]
-        pools = [F.adaptive_avg_pool2d(p, 1).flatten(1) for p in ps]  # each [N,C]
-        x = torch.cat(pools, dim=1)                                   # [N, L*C]
-        return self.proj(x)                                           # [N, out_dim]
-
-
-# ----------------------------
-# Constrained parameter projector
-# ----------------------------
+@dataclass
 class GeomBounds:
-    """
-    Default anatomical-ish bounds (adjust to your dataset units).
-    Values are in the same unit as your labels (often mm).
-    """
-    def __init__(self,
-                 r_eye_min=10.0, r_eye_max=15.0,
-                 r_iris_min=4.0, r_iris_max=7.5,
-                 r_cornea_min=6.5, r_cornea_max=9.0,
-                 d_cornea_min=0.0, d_cornea_max=5.0,
-                 kappa_max_deg=12.0):
-        self.r_eye_min = r_eye_min
-        self.r_eye_max = r_eye_max
-        self.r_iris_min = r_iris_min
-        self.r_iris_max = r_iris_max
-        self.r_cornea_min = r_cornea_min
-        self.r_cornea_max = r_cornea_max
-        self.d_cornea_min = d_cornea_min
-        self.d_cornea_max = d_cornea_max
-        self.kappa_max = torch.tensor(kappa_max_deg * 3.14159265 / 180.0, dtype=torch.float32)
+    eyeball_min_cm: float = 0.9
+    eyeball_max_cm: float = 1.6
+    iris_min_cm: float = 0.30
+    iris_max_cm: float = 0.80
+    cornea_min_cm: float = 0.55
+    cornea_max_cm: float = 0.90
+    cornea2center_min_cm: float = 0.20
+    cornea2center_max_cm: float = 0.45
+
+    center_abs_max_cm: float = 4.0         # tanh box for c_eye in HCS
+    kappa_max_rad: float = 0.15            # ~8.6 deg
+
+    iris_plane_min_cm: float = 0.0
+    iris_plane_max_cm: float = 0.60
+    iris_aniso_abs_max: float = 0.30       # ±30%
+    phi_abs_max_rad: float = math.pi
+
+    pupil_u_min: float = 0.20
+    pupil_u_max: float = 0.95
 
 
-def _bounded_sigmoid(z, lo, hi):
-    return lo + (hi - lo) * torch.sigmoid(z)
+# ========= Tiny MLP factory =========
 
-
-class EyeParamProjector(nn.Module):
-    """
-    Maps raw unconstrained outputs to physically valid parameters.
-    - Rotations: 6D -> SO(3)
-    - Radii/lengths: bounded to [min,max]
-    - Pupil radius: (0, r_iris)
-    - Kappa: bounded to (-kappa_max, +kappa_max)
-    """
-    def __init__(self, bounds: GeomBounds):
-        super().__init__()
-        self.register_buffer("kappa_max", bounds.kappa_max)
-        self.r_eye_min, self.r_eye_max = bounds.r_eye_min, bounds.r_eye_max
-        self.r_iris_min, self.r_iris_max = bounds.r_iris_min, bounds.r_iris_max
-        self.r_cornea_min, self.r_cornea_max = bounds.r_cornea_min, bounds.r_cornea_max
-        self.d_cornea_min, self.d_cornea_max = bounds.d_cornea_min, bounds.d_cornea_max
-
-    def forward(self, raw: dict) -> dict:
-        out = {}
-
-        # Per-view head pose
-        # raw['head_rot6d']: [B,V,6], raw['head_t']: [B,V,3]
-        B, V, _ = raw["head_rot6d"].shape
-        R_head = sixd_to_R(raw["head_rot6d"].view(B * V, 6)).view(B, V, 3, 3)
-        out["R_head"] = R_head
-        out["t_head"] = raw["head_t"]  # [B,V,3]
-
-        # Frame-level (shared across views)
-        # eye rotations
-        # raw['eye_rot6d']: [B,2,6]
-        R_eye_L = sixd_to_R(raw["eye_rot6d"][:, 0])  # [B,3,3]
-        R_eye_R = sixd_to_R(raw["eye_rot6d"][:, 1])  # [B,3,3]
-        out["R_eye"] = torch.stack([R_eye_L, R_eye_R], dim=1)  # [B,2,3,3]
-
-        # centers in HCS (can be predicted, or you can feed GT β directly during training)
-        out["c_eye"] = raw["c_eye"]  # [B,2,3]
-
-        # radii/lengths (shared L/R by default)
-        r_eye    = _bounded_sigmoid(raw["z_r_eye"],    self.r_eye_min,    self.r_eye_max)    # [B,1]
-        r_iris   = _bounded_sigmoid(raw["z_r_iris"],   self.r_iris_min,   self.r_iris_max)   # [B,1]
-        r_cornea = _bounded_sigmoid(raw["z_r_cornea"], self.r_cornea_min, self.r_cornea_max) # [B,1]
-        d_cornea = _bounded_sigmoid(raw["z_d_cornea"], self.d_cornea_min, self.d_cornea_max) # [B,1]
-        out["r_eye"]    = r_eye
-        out["r_iris"]   = r_iris
-        out["r_cornea"] = r_cornea
-        out["d_cornea"] = d_cornea
-
-        # pupil radius per eye: (0, r_iris)
-        # raw['z_pupil']: [B,2,1]
-        r_pupil = torch.sigmoid(raw["z_pupil"]).clamp_min(1e-6) * r_iris.unsqueeze(1)  # [B,2,1]
-        out["r_pupil"] = r_pupil
-
-        # kappa per eye, bounded
-        # raw['z_kappa']: [B,2,3]
-        out["kappa"] = self.kappa_max * torch.tanh(raw["z_kappa"])  # [B,2,3]
-
-        return out
-
-
-# ----------------------------
-# MLP heads
-# ----------------------------
-def mlp(in_dim, hidden, out_dim, dropout=0.0):
+def mlp(in_ch: int, out_ch: int, hidden: int = 256, num_layers: int = 2) -> nn.Sequential:
     layers = []
-    d = in_dim
-    for h in hidden:
-        layers += [nn.Linear(d, h), nn.ReLU(inplace=True)]
-        if dropout > 0:
-            layers += [nn.Dropout(dropout)]
-        d = h
-    layers += [nn.Linear(d, out_dim)]
+    c = in_ch
+    for _ in range(num_layers - 1):
+        layers += [nn.Linear(c, hidden), nn.ReLU(inplace=True)]
+        c = hidden
+    layers += [nn.Linear(c, out_ch)]
     return nn.Sequential(*layers)
 
 
+# ========= RayNet (fully geometric) =========
+
 class RayNet(nn.Module):
     """
-    FLAME-inspired eye parameter regressor with geometric constraints.
     Inputs:
-      - Single view:  [B,3,H,W]
-      - Multi-view:   [B,V,3,H,W]  (V=9)
-    Outputs (dict):
-      {
-        'per_view': {'R_head':[B,V,3,3], 't_head':[B,V,3]},
-        'frame':    {
-            'R_eye':[B,2,3,3], 'c_eye':[B,2,3],
-            'r_eye':[B,1], 'r_iris':[B,1], 'r_cornea':[B,1], 'd_cornea':[B,1],
-            'r_pupil':[B,2,1], 'kappa':[B,2,3]
-        },
-        'raw': {...}  # optional, for losses/debug
-      }
-    """
-    def __init__(self, backbone, in_channels_list, panet_out_channels=256,
-                 embed_dim=1024, bounds: GeomBounds = GeomBounds()):
-        super().__init__()
-
-        # Backbone (RepNeXt)
-        self.backbone = backbone
-
-        # Neck: Tiny FPN + Global embedding per view
-        self.fpn = TinyFPN(in_channels_list, out_channels=panet_out_channels)
-        self.embed = GlobalEmbed(num_levels=4, level_dim=panet_out_channels, out_dim=embed_dim)
-
-        # View-level head pose head (per view)
-        self.view_head_pose = nn.ModuleDict({
-            "rot": mlp(embed_dim, [512, 256], 6),   # 6D rotation
-            "t":   mlp(embed_dim, [512, 256], 3),   # translation in CCS
-        })
-
-        # Frame-level shared heads (from fused multi-view feature)
-        self.eye_rot_head = mlp(embed_dim, [512, 256], 12)   # 2 eyes × 6D
-        self.center_head  = mlp(embed_dim, [512, 256], 6)    # c_L (3) + c_R (3) in HCS
-        self.radii_head   = mlp(embed_dim, [512, 256], 4)    # z_r_eye, z_r_iris, z_r_cornea, z_d_cornea
-        self.kappa_head   = mlp(embed_dim, [512, 256], 6)    # 2×3
-        self.pupil_head   = mlp(embed_dim, [512, 256], 2)    # 2×1 (z)
-
-        # Projector for constraints
-        self.projector = EyeParamProjector(bounds)
-
-    def _forward_backbone_feats(self, x: torch.Tensor):
-        """
-        x: [N,3,H,W]
-        returns list [C1,C2,C3,C4]
-        """
-        # These calls follow your template with checkpoint
-        c0 = checkpoint(self.backbone.stem, x)                 # stride=4
-        c1 = checkpoint(self.backbone.stages[0], c0)           # stride=4
-        c2 = checkpoint(self.backbone.stages[1], c1)           # stride=8
-        c3 = checkpoint(self.backbone.stages[2], c2)           # stride=16
-        c4 = checkpoint(self.backbone.stages[3], c3)           # stride=32
-        return [c1, c2, c3, c4]
-
-    def _per_view_embedding(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [N,3,H,W]
-        return: [N, D]
-        """
-        feats = self._forward_backbone_feats(x)
-        pyr = self.fpn(feats)
-        emb = self.embed(pyr)
-        return emb
-
-    def forward(self, x: torch.Tensor) -> dict:
-        """
-        x: [B,3,H,W] or [B,V,3,H,W]
-        """
-        single_view = (x.dim() == 4)
-        if single_view:
-            B, C, H, W = x.shape
-            V = 1
-            x_flat = x
-        else:
-            B, V, C, H, W = x.shape
-            x_flat = x.view(B * V, C, H, W)
-
-        # Per-view embeddings
-        emb_v = self._per_view_embedding(x_flat)           # [B*V, D]
-        emb_v = emb_v.view(B, V, -1)                       # [B, V, D]
-
-        # View-level head pose
-        head_rot6d = self.view_head_pose["rot"](emb_v.reshape(B*V, -1)).view(B, V, 6)
-        head_t     = self.view_head_pose["t"](emb_v.reshape(B*V, -1)).view(B, V, 3)
-
-        # Frame-level fused feature (mean across views)
-        emb_f = emb_v.mean(dim=1)                          # [B, D]
-
-        # Eye rotations (shared across views)
-        eye_rot6d = self.eye_rot_head(emb_f).view(B, 2, 6) # [B,2,6]
-
-        # Eye centers in HCS (shared across views)
-        c_eye = self.center_head(emb_f).view(B, 2, 3)      # [B,2,3]
-
-        # Radii & cornea depth (shared across views)
-        z_r = self.radii_head(emb_f)                       # [B,4]
-        z_r_eye, z_r_iris, z_r_cornea, z_d_cornea = torch.split(z_r, 1, dim=-1)
-
-        # Kappa per eye
-        z_kappa = self.kappa_head(emb_f).view(B, 2, 3)     # [B,2,3]
-
-        # Pupil per eye
-        z_pupil = self.pupil_head(emb_f).view(B, 2, 1)     # [B,2,1]
-
-        raw = {
-            "head_rot6d": head_rot6d,  # [B,V,6]
-            "head_t":     head_t,      # [B,V,3]
-            "eye_rot6d":  eye_rot6d,   # [B,2,6]
-            "c_eye":      c_eye,       # [B,2,3] (HCS)
-            "z_r_eye":    z_r_eye,     # [B,1]
-            "z_r_iris":   z_r_iris,    # [B,1]
-            "z_r_cornea": z_r_cornea,  # [B,1]
-            "z_d_cornea": z_d_cornea,  # [B,1]
-            "z_kappa":    z_kappa,     # [B,2,3]
-            "z_pupil":    z_pupil,     # [B,2,1]
+        x: [B, V, 3, H, W]   (V = number of views, e.g., 9)
+    Outputs:
+        {
+          "per_view": {
+            "R_head": [B,V,3,3],
+            "t_head": [B,V,3],                 # cm
+          },
+          "frame": {
+            "c_eye": [B,2,3],                  # HCS, cm (L,R)
+            "R_eye": [B,2,3,3],
+            "kappa": [B,2,3],                  # axis-angle, rad
+            "r_eye": [B,1], "r_iris": [B,1], "r_cornea": [B,1], "d_cornea": [B,1],  # cm
+            "iris_pts_local": [B,2,N,3],       # eye-local ring, cm
+            "iris_pts_h": [B,2,N,3],           # ring in HCS, cm (NEW: 3D eye mesh you asked for)
+            "pupil_radius": [B,2,1],           # cm
+            "iris_params": { "aniso": [B,2,2], "phi":[B,2,1], "z_plane":[B,2,1], "pupil_u":[B,2,1] }
+          }
         }
+    """
 
-        proj = self.projector(raw)
+    def __init__(self, backbone, in_channels_list=None, panet_out_channels: int = 256,
+                 bounds: GeomBounds = None, num_iris_pts: int = 100):
+        super().__init__()
+        self.backbone = backbone
+        self.bounds = bounds if bounds is not None else GeomBounds()
+        self.num_iris_pts = num_iris_pts
 
+        # Decide per-view feature dimensionality
+        self.has_stages = hasattr(self.backbone, "stem") and hasattr(self.backbone, "stages")
+        if self.has_stages and in_channels_list is not None:
+            # multi-scale concat of GAP(c1..c4)
+            self.per_view_dim = int(sum(in_channels_list))
+        else:
+            # fallback: last feature map only
+            self.per_view_dim = int(getattr(self.backbone, "num_features", 512))
+
+        # ---------------- Per-view head pose ----------------
+        self.head_rot_fc = nn.Linear(self.per_view_dim, 6)   # 6D rep
+        self.head_trans_fc = nn.Linear(self.per_view_dim, 3) # cm
+
+        # ---------------- Frame-shared anatomy & joints -----
+        fused_dim = self.per_view_dim                        # we fuse views by mean
+
+        self.eye_center_fc = mlp(fused_dim, 6)               # two eyes × 3D
+        self.eye_rot6d_fc = mlp(fused_dim, 12)               # two eyes × 6D
+        self.kappa_fc     = mlp(fused_dim, 6)                # two eyes × 3
+
+        self.radii_fc     = mlp(fused_dim, 4)                # r_eye, r_iris, r_cornea, d_cornea (cm)
+
+        self.iris_aniso_fc = mlp(fused_dim, 4)               # (ax,ay) per eye
+        self.iris_phi_fc   = mlp(fused_dim, 2)               # in-plane angle per eye
+        self.iris_z_fc     = mlp(fused_dim, 2)               # plane z offset per eye (cm)
+        self.pupil_u_fc    = mlp(fused_dim, 2)               # dilation fraction per eye
+
+        # Precompute unit circle
+        theta = torch.linspace(0, 2 * math.pi, self.num_iris_pts)
+        self.register_buffer("unit_circle_xy", torch.stack([torch.cos(theta), torch.sin(theta)], dim=-1))
+
+        # zero-initialize small heads (stable start)
+        for m in [
+            self.head_rot_fc, self.head_trans_fc,
+            self.eye_center_fc, self.eye_rot6d_fc, self.kappa_fc, self.radii_fc,
+            self.iris_aniso_fc, self.iris_phi_fc, self.iris_z_fc, self.pupil_u_fc
+        ]:
+            if isinstance(m, nn.Linear):
+                nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Sequential):
+                for mm in m.modules():
+                    if isinstance(mm, nn.Linear):
+                        nn.init.zeros_(mm.weight); nn.init.zeros_(mm.bias)
+
+    # ---- Feature extractor (multi-scale if available) ----
+    def _per_view_token(self, x_flat: torch.Tensor) -> torch.Tensor:
+        """
+        x_flat: [B*V, 3, H, W] -> per-view tokens [B,V,C]
+        If stages available: concat GAP(c1..c4); else: GAP(last).
+        """
+        BxV = x_flat.shape[0]
+        if self.has_stages:
+            c0 = checkpoint(self.backbone.stem, x_flat)       # stride 4
+            c1 = checkpoint(self.backbone.stages[0], c0)      # stride 4
+            c2 = checkpoint(self.backbone.stages[1], c1)      # stride 8
+            c3 = checkpoint(self.backbone.stages[2], c2)      # stride 16
+            c4 = checkpoint(self.backbone.stages[3], c3)      # stride 32
+            pools = [
+                torch.flatten(F.adaptive_avg_pool2d(fm, 1), 1)
+                for fm in (c1, c2, c3, c4)
+            ]
+            vec = torch.cat(pools, dim=1)                     # [B*V, sum(Ci)]
+        else:
+            # Many RepNeXt wrappers expose forward_features()
+            feats = (self.backbone.forward_features(x_flat)
+                     if hasattr(self.backbone, "forward_features")
+                     else x_flat)  # let it crash loudly if backbone is incompatible
+            vec = torch.flatten(F.adaptive_avg_pool2d(feats, 1), 1)
+        return vec
+
+    # ---- Bounding helpers ----
+    def _bound_scalar(self, raw: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
+        return torch.sigmoid(raw) * (hi - lo) + lo
+
+    def _bound_tanh(self, raw: torch.Tensor, scale: float) -> torch.Tensor:
+        return torch.tanh(raw) * scale
+
+    # ---- Iris generator (eye-local) ----
+    def _build_iris_points_local(
+        self,
+        r_iris_per_eye: torch.Tensor,     # [B,2,1] cm
+        anisotropy_per_eye: torch.Tensor, # [B,2,2]
+        phi_per_eye: torch.Tensor,        # [B,2,1] rad
+        z_per_eye: torch.Tensor           # [B,2,1] cm
+    ) -> torch.Tensor:
+        B = r_iris_per_eye.shape[0]
+        base = self.unit_circle_xy.view(1, 1, self.num_iris_pts, 2).to(r_iris_per_eye.dtype)    # [1,1,N,2]
+        xy = base * r_iris_per_eye.unsqueeze(2)                                                 # [B,2,N,2]
+        xy = xy * (1.0 + anisotropy_per_eye).unsqueeze(2)                                       # ellipse
+        c = torch.cos(phi_per_eye).unsqueeze(2); s = torch.sin(phi_per_eye).unsqueeze(2)        # [B,2,1,1]
+        x, y = xy[..., 0:1], xy[..., 1:2]
+        xr = c * x - s * y; yr = s * x + c * y
+        z = z_per_eye.unsqueeze(2).expand(-1, -1, self.num_iris_pts, -1)                        # [B,2,N,1]
+        return torch.cat([xr, yr, z], dim=-1)                                                   # [B,2,N,3]
+
+    # ---- Public helpers for transforms/projection (optional use in train.py) ----
+    @staticmethod
+    def hcs_to_ccs_points(pts_h: torch.Tensor, R_head: torch.Tensor, t_head: torch.Tensor) -> torch.Tensor:
+        """
+        pts_h:   [B,2,N,3]
+        R_head:  [B,V,3,3]
+        t_head:  [B,V,3]
+        -> [B,V,2,N,3]
+        """
+        B, V = R_head.shape[0], R_head.shape[1]
+        pts_h_v = pts_h.unsqueeze(1).expand(-1, V, -1, -1, -1)                 # [B,V,2,N,3]
+        pts_c   = torch.matmul(R_head.unsqueeze(2).unsqueeze(2),               # [B,V,1,1,3,3]
+                               pts_h_v.unsqueeze(-1)).squeeze(-1)              # [B,V,2,N,3]
+        return pts_c + t_head.unsqueeze(2).unsqueeze(2)
+
+    @staticmethod
+    def project_points(pts_c: torch.Tensor, K: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """
+        pts_c: [B,V,2,N,3], K: [B,V,3,3] -> uv [B,V,2,N,2]
+        """
+        B, V, E, N, _ = pts_c.shape
+        X = pts_c.view(B, V, E * N, 3)
+        x = torch.matmul(K, X.transpose(-1, -2)).transpose(-1, -2)            # [B,V,E*N,3]
+        uv = x[..., :2] / x[..., 2:].clamp_min(eps)
+        return uv.view(B, V, E, N, 2)
+
+    @staticmethod
+    def compose_axes(R_head: torch.Tensor, R_eye: torch.Tensor, kappa: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+        """
+        Returns optic and visual axes in CCS for each view.
+        R_head: [B,V,3,3], R_eye: [B,2,3,3], kappa: [B,2,3]
+        -> (a_optic, a_visual): [B,V,2,3] each
+        """
+        B, V = R_head.shape[:2]
+        ez = torch.tensor([0.0, 0.0, 1.0], device=R_head.device, dtype=R_head.dtype).view(1, 1, 1, 3, 1)
+        a_eye_local = torch.matmul(R_eye.unsqueeze(2), ez).squeeze(-1).squeeze(-1)        # [B,2,3]
+        R_kappa = so3_exp(kappa.view(B * 2, 3)).view(B, 2, 3, 3)
+        a_visual_local = torch.matmul(R_kappa, a_eye_local.unsqueeze(-1)).squeeze(-1)     # [B,2,3]
+        a_eye_v   = a_eye_local.unsqueeze(1).expand(-1, V, -1, -1)                        # [B,V,2,3]
+        a_vis_v   = a_visual_local.unsqueeze(1).expand(-1, V, -1, -1)                     # [B,V,2,3]
+        a_optic   = torch.matmul(R_head.unsqueeze(2), a_eye_v.unsqueeze(-1)).squeeze(-1)  # [B,V,2,3]
+        a_visual  = torch.matmul(R_head.unsqueeze(2), a_vis_v.unsqueeze(-1)).squeeze(-1)  # [B,V,2,3]
+        return a_optic, a_visual
+
+    # ---- Forward ----
+    def forward(self, x: torch.Tensor):
+        """
+        x: [B, V, 3, H, W]
+        """
+        assert x.dim() == 5, "Expected input [B,V,3,H,W]"
+        B, V = x.shape[0], x.shape[1]
+
+        # Per-view tokens (multi-scale concat if possible)
+        x_flat = x.view(B * V, x.shape[2], x.shape[3], x.shape[4])
+        per_view_flat = self._per_view_token(x_flat)                          # [B*V, per_view_dim]
+        per_view_vec  = per_view_flat.view(B, V, -1)                          # [B,V,C]
+
+        # Frame-level fused token (mean over views)
+        frame_vec = per_view_vec.mean(dim=1)                                  # [B,C]
+
+        # ----- Per-view head pose -----
+        rot6d = self.head_rot_fc(per_view_vec).view(B * V, 6)                 # [B*V,6]
+        R_head = compute_rotation_matrix_from_ortho6d(rot6d).view(B, V, 3, 3) # [B,V,3,3]
+        t_head = self.head_trans_fc(per_view_vec).view(B, V, 3)               # [B,V,3]  (cm)
+
+        # ----- Frame-shared anatomy & joints -----
+        # Eye centers in HCS (cm), bounded via tanh box
+        c_eye_raw = self.eye_center_fc(frame_vec).view(B, 2, 3)
+        c_eye     = self._bound_tanh(c_eye_raw, self.bounds.center_abs_max_cm)           # [B,2,3]
+
+        # Eye rotations (6D -> SO(3))
+        eye_rot6d = self.eye_rot6d_fc(frame_vec).view(B, 2, 6)
+        R_eye     = compute_rotation_matrix_from_ortho6d(eye_rot6d.view(B * 2, 6)).view(B, 2, 3, 3)
+
+        # Kappa (axis-angle, radians)
+        kappa_raw = self.kappa_fc(frame_vec).view(B, 2, 3)
+        kappa     = self._bound_tanh(kappa_raw, self.bounds.kappa_max_rad)               # [B,2,3]
+
+        # Radii / cornea distances (cm)
+        radii_raw = self.radii_fc(frame_vec)                                             # [B,4]
+        r_eye     = self._bound_scalar(radii_raw[:, 0:1], self.bounds.eyeball_min_cm,  self.bounds.eyeball_max_cm)
+        r_iris    = self._bound_scalar(radii_raw[:, 1:2], self.bounds.iris_min_cm,     self.bounds.iris_max_cm)
+        r_cornea  = self._bound_scalar(radii_raw[:, 2:3], self.bounds.cornea_min_cm,   self.bounds.cornea_max_cm)
+        d_cornea  = self._bound_scalar(radii_raw[:, 3:4], self.bounds.cornea2center_min_cm, self.bounds.cornea2center_max_cm)
+
+        # Iris ellipse parameters
+        aniso_raw = self.iris_aniso_fc(frame_vec).view(B, 2, 2)
+        aniso     = self._bound_tanh(aniso_raw, self.bounds.iris_aniso_abs_max)
+        phi_raw   = self.iris_phi_fc(frame_vec).view(B, 2, 1)
+        phi       = self._bound_tanh(phi_raw, self.bounds.phi_abs_max_rad)
+        z_raw     = self.iris_z_fc(frame_vec).view(B, 2, 1)
+        z_plane   = self._bound_scalar(z_raw, self.bounds.iris_plane_min_cm, self.bounds.iris_plane_max_cm)
+
+        # Pupil radius from dilation fraction
+        pupil_u_raw  = self.pupil_u_fc(frame_vec).view(B, 2, 1)
+        pupil_u      = self._bound_scalar(pupil_u_raw, self.bounds.pupil_u_min, self.bounds.pupil_u_max)
+        pupil_radius = pupil_u * r_iris.unsqueeze(1)                                     # [B,2,1] cm
+
+        # Build iris ring in eye-local (cm) -> in HCS (cm)  *** 3D eye mesh ***
+        r_iris_per_eye = r_iris.unsqueeze(1).expand(-1, 2, -1)                           # [B,2,1]
+        iris_pts_local = self._build_iris_points_local(r_iris_per_eye, aniso, phi, z_plane)  # [B,2,N,3]
+        iris_pts_h     = torch.matmul(R_eye.unsqueeze(2), iris_pts_local.unsqueeze(-1)).squeeze(-1) + c_eye.unsqueeze(2)  # [B,2,N,3]
+
+        # Pack outputs
         out = {
             "per_view": {
-                "R_head": proj["R_head"],  # [B,V,3,3]
-                "t_head": proj["t_head"],  # [B,V,3]
+                "R_head": R_head,                  # [B,V,3,3]
+                "t_head": t_head,                  # [B,V,3] cm
             },
             "frame": {
-                "R_eye":    proj["R_eye"],    # [B,2,3,3]
-                "c_eye":    proj["c_eye"],    # [B,2,3] (HCS)
-                "r_eye":    proj["r_eye"],    # [B,1]
-                "r_iris":   proj["r_iris"],   # [B,1]
-                "r_cornea": proj["r_cornea"], # [B,1]
-                "d_cornea": proj["d_cornea"], # [B,1]
-                "r_pupil":  proj["r_pupil"],  # [B,2,1]
-                "kappa":    proj["kappa"],    # [B,2,3]
+                "c_eye": c_eye,                    # [B,2,3] HCS, cm
+                "R_eye": R_eye,                    # [B,2,3,3]
+                "kappa": kappa,                    # [B,2,3] axis-angle, rad
+                "r_eye": r_eye, "r_iris": r_iris, "r_cornea": r_cornea, "d_cornea": d_cornea,  # [B,1] each
+                "iris_pts_local": iris_pts_local,  # [B,2,N,3] cm
+                "iris_pts_h": iris_pts_h,          # [B,2,N,3] cm  (3D iris mesh in head coords)
+                "pupil_radius": pupil_radius,      # [B,2,1] cm
+                "iris_params": {
+                    "aniso": aniso, "phi": phi, "z_plane": z_plane, "pupil_u": pupil_u
+                },
             },
-            "raw": raw,  # keep for loss/debug if you want
         }
         return out
 
 
+# ========= Sanity check =========
+
 if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     backbone_name = "repnext_m3"
     weight_path = "./repnext_m3_pretrained.pt"
-    repnext_model = load_pretrained_repnext(backbone_name, weight_path)
-    repnext_model = repnext_model.to(device)
 
-    # Channels from each RepNeXt variant
-    backbone_channels_dict = {
+    repnext = load_pretrained_repnext(backbone_name, weight_path).to(device)
+    in_channels_dict = {
         'repnext_m0': [40, 80, 160, 320],
         'repnext_m1': [48, 96, 192, 384],
         'repnext_m2': [56, 112, 224, 448],
@@ -365,16 +350,13 @@ if __name__ == "__main__":
         'repnext_m4': [64, 128, 256, 512],
         'repnext_m5': [80, 160, 320, 640],
     }
+    model = RayNet(repnext, in_channels_list=in_channels_dict[backbone_name], bounds=GeomBounds()).to(device)
 
-    in_channels_list = backbone_channels_dict[backbone_name]
-    raynet_model = RayNet(repnext_model, in_channels_list, panet_out_channels=256).to(device)
-
-    # sanity: single-view input
-    x = torch.randn(2, 3, 256, 256).to(device)
-    out = raynet_model(x)
-    print("single-view R_head:", out["per_view"]["R_head"].shape)
-
-    # sanity: multi-view input (V=9)
-    x_mv = torch.randn(1, 9, 3, 256, 256).to(device)
-    out_mv = raynet_model(x_mv)
-    print("multi-view R_head:", out_mv["per_view"]["R_head"].shape)
+    B, V, H, W = 2, 9, 256, 256
+    x = torch.randn(B, V, 3, H, W, device=device)
+    with torch.no_grad():
+        y = model(x)
+    print("R_head", y["per_view"]["R_head"].shape,
+          "t_head", y["per_view"]["t_head"].shape,
+          "c_eye",  y["frame"]["c_eye"].shape,
+          "iris_h", y["frame"]["iris_pts_h"].shape)
