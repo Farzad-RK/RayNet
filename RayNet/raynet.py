@@ -1,292 +1,273 @@
+# raynet.py
 import math
-from typing import Dict
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
-from coordatt import CoordAtt
-from depth_from_iris import depth_from_iris_cm       # analytic depth from iris (MediaPipe-style)
+from coordatt import CoordAtt  # your existing module
 
+# --- minimal 6D -> rotation utils (Zhou et al.) ---
+def _normalize(v, eps=1e-8):
+    return v / (v.norm(dim=-1, keepdim=True) + eps)
 
-# -----------------------------
-# Utils
-# -----------------------------
-def ortho6d_to_rotmat(x: torch.Tensor) -> torch.Tensor:
-    """Zhou et al., CVPR'19: 6D -> 3x3 rotation matrix."""
-    a1 = F.normalize(x[:, 0:3], dim=1)
-    a2 = x[:, 3:6]
-    a2 = F.normalize(a2 - (a1 * a2).sum(1, keepdim=True) * a1, dim=1)
-    a3 = torch.cross(a1, a2, dim=1)
-    return torch.stack([a1, a2, a3], dim=2)
-
-
-def make_unit_ring(n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    t = torch.linspace(0.0, 2.0 * math.pi, steps=n, device=device, dtype=dtype)
-    x = torch.cos(t); y = torch.sin(t); z = torch.zeros_like(t)
-    return torch.stack([x, y, z], dim=1)  # [N,3]
-
-
-# -----------------------------
-# Minimal Neck: 1x1 + BN/ReLU + CoordAtt on c4
-# -----------------------------
-class CoordNeck(nn.Module):
+def ortho6d_to_rotmat(x):
     """
-    Lightweight adapter (kept as 'fusion' so GradNorm continues to work).
+    x: (..., 6) -> (..., 3, 3)
     """
-    def __init__(self, in_ch: int, out_ch: int = 256, reduction: int = 32):
+    a1 = x[..., 0:3]
+    a2 = x[..., 3:6]
+    b1 = _normalize(a1)
+    b2 = _normalize(a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1)
+    b3 = torch.cross(b1, b2, dim=-1)
+    return torch.stack([b1, b2, b3], dim=-1)  # (...,3,3)
+
+def small_angle_rpy_to_rot(yaw_pitch_rad):
+    """
+    yaw about +Y (nasal-temporal), pitch about +X (up-down)
+    yaw_pitch_rad: (..., 2) -> (..., 3, 3)
+    """
+    yaw, pitch = yaw_pitch_rad[..., 0], yaw_pitch_rad[..., 1]
+    cy, sy = torch.cos(yaw), torch.sin(yaw)
+    cx, sx = torch.cos(pitch), torch.sin(pitch)
+    # R = R_x(pitch) @ R_y(yaw)
+    Rx = torch.stack([
+        torch.ones_like(cx), torch.zeros_like(cx), torch.zeros_like(cx),
+        torch.zeros_like(cx), cx, -sx,
+        torch.zeros_like(cx), sx,  cx
+    ], dim=-1).reshape(*cx.shape, 3, 3)
+    Ry = torch.stack([
+        cy, torch.zeros_like(cy), sy,
+        torch.zeros_like(cy), torch.ones_like(cy), torch.zeros_like(cy),
+        -sy, torch.zeros_like(cy), cy
+    ], dim=-1).reshape(*cy.shape, 3, 3)
+    return torch.einsum('...ij,...jk->...ik', Rx, Ry)
+
+def build_orthonormal_basis(z):
+    """
+    z: (B,3) unit vector -> (B,3), (B,3) two orthonormal vectors u,v s.t. [u,v,z] is right-handed
+    """
+    B = z.shape[0]
+    # choose a helper not parallel to z
+    helper = torch.where(torch.abs(z[:, 2:3]) < 0.9,
+                         torch.tensor([0., 0., 1.], device=z.device).expand(B, 3),
+                         torch.tensor([0., 1., 0.], device=z.device).expand(B, 3))
+    u = _normalize(torch.cross(helper, z, dim=-1))
+    v = torch.cross(z, u, dim=-1)
+    return u, v
+
+
+class MLPHead(nn.Module):
+    def __init__(self, in_ch, out_dim, hidden=512, act=True):
         super().__init__()
-        self.proj = nn.Conv2d(in_ch, out_ch, 1, bias=False)
-        self.bn   = nn.BatchNorm2d(out_ch)
-        self.act  = nn.ReLU(inplace=True)
-        self.ca   = CoordAtt(out_ch, out_ch, reduction=reduction)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.act(self.bn(self.proj(x)))
-        return self.ca(x)
-
-
-# -----------------------------
-# Heads
-# -----------------------------
-class GlobalRegHead(nn.Module):
-    def __init__(self, in_channels: int, out_dim: int, hidden: int = 128, use_coord_att: bool = False, reduction=32):
-        super().__init__()
-        self.use_ca = use_coord_att
-        if use_ca := use_coord_att:
-            self.ca = CoordAtt(in_channels, in_channels, reduction=reduction)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc1 = nn.Linear(in_channels, hidden)
-        self.act = nn.ReLU(inplace=True)
-        self.fc2 = nn.Linear(hidden, out_dim)
+        self.net = nn.Sequential(
+            nn.Linear(in_ch, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, out_dim)
+        )
+        if not act:
+            # for completeness if you want no nonlinearity, but here we ReLU inside
+            pass
 
     def forward(self, x):
-        if hasattr(self, "ca"):
-            x = self.ca(x)
-        x = self.pool(x).flatten(1)
-        x = self.act(self.fc1(x))
-        return self.fc2(x)
+        return self.net(x)
 
 
-class EyeParamHead(nn.Module):
-    """
-    Identity-aware eye parameters (sizes come from identity, not learned):
-      rot6d        [B,6]    eye rotation
-      globe_center [B,3]    CCS position (cm)
-      iris_offset  [B,1]    along optical axis (0..radius]
-      kappa_deg    [B,2]    yaw,pitch for visual axis (±8°)
-    """
-    def __init__(self, in_channels: int, hidden: int = 128):
-        super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.mlp = nn.Sequential(
-            nn.Linear(in_channels, hidden), nn.ReLU(True),
-            nn.Linear(hidden, hidden), nn.ReLU(True),
-            nn.Linear(hidden, 6 + 3 + 1 + 2)
-        )
-
-    def forward(self, x):
-        x = self.pool(x).flatten(1)
-        y = self.mlp(x)
-        rot6d = y[:, 0:6]
-        cx = 10.0 * torch.tanh(y[:, 6:7])                 # [-10,10] cm
-        cy = 10.0 * torch.tanh(y[:, 7:8])
-        cz = 50.0 * torch.tanh(y[:, 8:9]) + 70.0          # [20,120] cm
-        globe_center = torch.cat([cx, cy, cz], dim=1)
-        iris_offset  = torch.sigmoid(y[:, 9:10])          # (0,1) → multiply by radius later
-        kappa_deg    = 8.0 * torch.tanh(y[:, 10:12])      # [-8,+8]°
-        return rot6d, globe_center, iris_offset, kappa_deg
-
-
-class Iris2DHead(nn.Module):
-    """
-    Predicts per-eye 2D iris ring (100 points) in normalized image coords [-1,1],
-    scaled to pixels using input H,W.
-    """
-    def __init__(self, in_ch: int, n_pts: int = 100, hidden: int = 128):
-        super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(in_ch, hidden), nn.ReLU(True),
-            nn.Linear(hidden, hidden), nn.ReLU(True),
-            nn.Linear(hidden, 2 * n_pts * 2)  # (L/R) * points * (x,y)
-        )
-        self.n_pts = n_pts
-
-    def forward(self, x, H: int, W: int):
-        b = x.size(0)
-        y = self.pool(x).flatten(1)
-        y = self.fc(y).view(b, 2, self.n_pts, 2)
-        y = torch.tanh(y)
-        u = (y[..., 0] + 1.0) * 0.5 * (W - 1)
-        v = (y[..., 1] + 1.0) * 0.5 * (H - 1)
-        return torch.stack([u, v], dim=-1)  # [B,2,N,2] in pixels
-
-
-# -----------------------------
-# RayNet (CoordAtt-only + MediaPipe depth)
-# -----------------------------
 class RayNet(nn.Module):
-    def __init__(self, backbone, in_channels_list, n_iris_points: int = 100, reduction: int = 32):
+    """
+    FLAME-compliant eye module:
+      - Uses only CoordAtt after backbone (no PANet/FPN/fusion)
+      - Predicts head pose (6D), per-eye local pose (6D), per-eye head-local centers,
+        per-eye iris-plane offset alpha in [0,1], small kappa angles (visual vs optical),
+        and a 2D iris landmark head (for MediaPipe-style depth and 2D supervision).
+      - Builds 3D iris rings analytically from identity (iris diameter, eyeball radius).
+    """
+    def __init__(
+        self,
+        backbone,
+        in_channels_list,
+        n_iris_landmarks=100,
+        eyeball_radius_cm=1.2,         # ~12 mm
+        iris_diameter_cm=1.17,         # ~11.7 mm
+        kappa_max_deg=8.0,
+    ):
         super().__init__()
         self.backbone = backbone
-        self.n_iris_points = n_iris_points
+        self.C4 = in_channels_list[-1]
+        self.coordatt = CoordAtt(self.C4, self.C4)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        flat_dim = self.C4
 
-        # Minimal neck on c4 (keep attr name 'fusion' for GradNorm)
-        c4_ch = in_channels_list[-1]
-        self.fusion = CoordNeck(c4_ch, out_ch=256, reduction=reduction)
+        self.nL = n_iris_landmarks
+        self.eyeball_radius_cm = float(eyeball_radius_cm)
+        self.iris_diameter_cm = float(iris_diameter_cm)
+        self.kappa_max = math.radians(kappa_max_deg)
 
-        # Heads
-        self.head_pose_regression   = GlobalRegHead(256, 6, use_coord_att=True, reduction=reduction)
-        self.gaze_vector_regression = GlobalRegHead(256, 6)
-        self.eye_left  = EyeParamHead(256)
-        self.eye_right = EyeParamHead(256)
-        self.iris2d_head = Iris2DHead(256, n_pts=n_iris_points)
+        # --- heads ---
+        self.head_pose_6d = MLPHead(flat_dim, 6)            # head rotation
+        self.eye_rot6d_L  = MLPHead(flat_dim, 6)
+        self.eye_rot6d_R  = MLPHead(flat_dim, 6)
 
-        # Geometry buffers
-        self.register_buffer("unit_ring",
-            make_unit_ring(n_iris_points, device=torch.device("cpu"), dtype=torch.float32),
-            persistent=False)
+        self.eye_center_H_L = MLPHead(flat_dim, 3)          # centers in head-local (cm)
+        self.eye_center_H_R = MLPHead(flat_dim, 3)
 
-    # backbone: only c4
-    def _forward_backbone(self, x: torch.Tensor):
-        c0 = checkpoint(self.backbone.stem, x)
-        c1 = checkpoint(self.backbone.stages[0], c0)
-        c2 = checkpoint(self.backbone.stages[1], c1)
-        c3 = checkpoint(self.backbone.stages[2], c2)
-        c4 = checkpoint(self.backbone.stages[3], c3)
-        return c4
+        self.alpha_L = MLPHead(flat_dim, 1)                 # iris-plane offset factor [0,1]
+        self.alpha_R = MLPHead(flat_dim, 1)
 
-    def _eye_geometry(self, rot6d, globe_center, iris_offset_alpha, kappa_deg, iris_radius_cm, device):
+        self.kappa_L = MLPHead(flat_dim, 2)                 # yaw, pitch (deg->rad by tanh * kappa_max)
+        self.kappa_R = MLPHead(flat_dim, 2)
+
+        # 2D iris landmark head (per-eye; normalized to [-1,1], later scaled to pixels)
+        self.iris2d_L = MLPHead(flat_dim, self.nL * 2)
+        self.iris2d_R = MLPHead(flat_dim, self.nL * 2)
+
+        # Gaze direction head (6D -> rot; use z-axis as direction)
+        self.gaze6d = MLPHead(flat_dim, 6)
+
+        # Small learned pupil axial offsets (cm) for entrance pupil mismatch
+        self.pupil_offset = nn.Parameter(torch.zeros(2))  # [δ_L, δ_R], will be squashed
+
+    @torch.no_grad()
+    def _canonical_ring(self, device):
         """
-        Build per-eye geometry in CCS (cm), using identity iris radius (cm).
+        Unit circle points in XY plane (N, 3)
         """
-        B = rot6d.shape[0]
-        R = ortho6d_to_rotmat(rot6d)                               # [B,3,3]
-        z_axis = torch.tensor([0,0,1.0], device=device).view(1,3,1).repeat(B,1,1)
-        optic = F.normalize(torch.bmm(R, z_axis).squeeze(-1), dim=1)  # [B,3]
+        t = torch.linspace(0, 2 * math.pi, self.nL, device=device, dtype=torch.float32)
+        ring = torch.stack([torch.cos(t), torch.sin(t), torch.zeros_like(t)], dim=-1)
+        return ring  # (N,3)
 
-        # If eyeball radius available, limit offset to [0, radius]
-        # iris_offset_alpha \in (0,1) from head; multiply by radius proxy
-        # Use iris radius as a proxy scale if eyeball radius not passed here
-        offset_cm = iris_offset_alpha  # later multiplied externally if eyeball radius available
+    def _forward_backbone(self, x):
+        # RepNeXt style
+        x = self.backbone.stem(x)
+        x = self.backbone.stages[0](x)
+        x = self.backbone.stages[1](x)
+        x = self.backbone.stages[2](x)
+        x = self.backbone.stages[3](x)  # C4 stride 32
+        return x
 
-        # Visual axis = small yaw/pitch from optic
-        yaw  = torch.deg2rad(kappa_deg[:, 0]);  pitch = torch.deg2rad(kappa_deg[:, 1])
-        cy, sy = torch.cos(yaw), torch.sin(yaw)
-        cp, sp = torch.cos(pitch), torch.sin(pitch)
-        Rk = torch.stack([
-            torch.stack([ cy, 0*cy,  sy], dim=1),
-            torch.stack([ 0*cy,  cp, -sp], dim=1),
-            torch.stack([-sy,  sp,  cy], dim=1),
-        ], dim=1)
-        visual = F.normalize(torch.einsum('bij,bj->bi', Rk, optic), dim=1)
-
-        # Ring in eye-local (XY plane), radius = iris_radius_cm
-        ring_local = self.unit_ring.to(device).unsqueeze(0).repeat(B,1,1)
-        ring_local[:, :, :2] *= iris_radius_cm.view(B,1,1)
-
-        return {
-            "R": R,
-            "optic": optic,
-            "visual": visual,
-            "globe_center": globe_center,
-            "offset_alpha": offset_cm,   # (0,1), multiply outside
-            "ring_local": ring_local,    # [B,N,3] in eye-local
-        }
-
-    def forward(self, x: torch.Tensor, K: Dict = None, identity: Dict = None) -> Dict[str, torch.Tensor]:
+    def forward(self, x, K=None, head_pose_gt=None, image_size=None, global_step=0, warmup_steps=1000):
         """
-        Args:
-            x: [B,3,H,W]
-            K: {'fx': [B] or [B,2]}  focal length(s) in pixels
-            identity:
-              - 'iris_diam_cm': [B] or [B,2]
-              - 'eyeball_radius_cm': [B,2] (optional, used for rendering/offset)
+        x: (B,3,H,W)
+        K: optional intrinsics (B,3,3) for projected previews (not required to compute outputs)
+        head_pose_gt: optional {'R': (B,3,3), 't': (B,3)} if you want to compose eyes with GT translation
+        image_size: optional (H,W) to scale 2D landmarks to pixels
         """
-        assert K is not None and identity is not None, "Please pass K (fx px) and identity (iris_diam_cm, ...)."
         B, _, H, W = x.shape
+        feat = self._forward_backbone(x)
+        feat = self.coordatt(feat)
+        g = self.pool(feat).flatten(1)   # (B,C)
 
-        # features
-        c4 = self._forward_backbone(x)
-        feats = self.fusion(c4)
+        # raw predictions
+        R_H     = ortho6d_to_rotmat(self.head_pose_6d(g))       # (B,3,3)
+        R_EL    = ortho6d_to_rotmat(self.eye_rot6d_L(g))         # (B,3,3)
+        R_ER    = ortho6d_to_rotmat(self.eye_rot6d_R(g))         # (B,3,3)
+        cEL_H   = self.eye_center_H_L(g)                         # (B,3)
+        cER_H   = self.eye_center_H_R(g)                         # (B,3)
 
-        # iris 2D for analytic depth
-        iris2d_px = self.iris2d_head(feats, H, W)  # [B,2,N,2]
+        aL      = torch.sigmoid(self.alpha_L(g)).squeeze(-1)     # (B,)
+        aR      = torch.sigmoid(self.alpha_R(g)).squeeze(-1)     # (B,)
 
-        # gaze direction from 6D
-        gaze_vec6d = self.gaze_vector_regression(feats)
-        Rg = ortho6d_to_rotmat(gaze_vec6d)
-        direction = F.normalize(Rg[:, :, 2], dim=1)  # [B,3]
+        # clamp kappa within +/- kappa_max
+        kL      = torch.tanh(self.kappa_L(g)) * self.kappa_max   # (B,2)
+        kR      = torch.tanh(self.kappa_R(g)) * self.kappa_max   # (B,2)
 
-        # per-eye params (pose/center/offset/kappa)
-        Lp = self.eye_left(feats)
-        Rp = self.eye_right(feats)
+        gaze6d  = self.gaze6d(g)
+        Rg      = ortho6d_to_rotmat(gaze6d)                      # (B,3,3)
+        gaze_dir= _normalize(Rg[..., 2])                         # (B,3)
 
-        # identity sizes
-        iris_diam_cm = identity["iris_diam_cm"]  # [B] or [B,2]
-        if iris_diam_cm.ndim == 1:
-            iris_radius_L = iris_radius_R = iris_diam_cm * 0.5
+        # centers in camera space (use predicted head R; for t, prefer GT if given)
+        if head_pose_gt is not None and 't' in head_pose_gt:
+            t_H = head_pose_gt['t']                              # (B,3)
         else:
-            iris_radius_L = iris_diam_cm[:, 0] * 0.5
-            iris_radius_R = iris_diam_cm[:, 1] * 0.5
+            t_H = torch.zeros_like(cEL_H)
 
-        eyeball_radius_cm = identity.get("eyeball_radius_cm", None)  # [B,2] if provided
+        cEL_C = torch.einsum('bij,bj->bi', R_H, cEL_H) + t_H     # (B,3)
+        cER_C = torch.einsum('bij,bj->bi', R_H, cER_H) + t_H     # (B,3)
+        REL_C = torch.einsum('bij,bjk->bik', R_H, R_EL)          # (B,3,3)
+        RER_C = torch.einsum('bij,bjk->bik', R_H, R_ER)          # (B,3,3)
 
-        # left/right geometry (eye-local)
-        geoL = self._eye_geometry(Lp[0], Lp[1], Lp[2], Lp[3], iris_radius_L, x.device)
-        geoR = self._eye_geometry(Rp[0], Rp[1], Rp[2], Rp[3], iris_radius_R, x.device)
+        # optical axes (z-axis of eye frames)
+        z = torch.tensor([0., 0., 1.], device=x.device).expand(B, 3)
+        oL = torch.einsum('bij,bj->bi', REL_C, z)                # (B,3)
+        oR = torch.einsum('bij,bj->bi', RER_C, z)                # (B,3)
+        oL = _normalize(oL); oR = _normalize(oR)
 
-        # Compute absolute centers for iris plane (pupil centers) using offsets
-        if eyeball_radius_cm is not None:
-            offL = geoL["offset_alpha"].squeeze(-1) * eyeball_radius_cm[:, 0]
-            offR = geoR["offset_alpha"].squeeze(-1) * eyeball_radius_cm[:, 1]
+        # visual axes apply kappa rotations
+        RLk = small_angle_rpy_to_rot(kL)                         # (B,3,3)
+        RRk = small_angle_rpy_to_rot(kR)
+        vL = torch.einsum('bij,bj->bi', RLk, oL)                 # (B,3)
+        vR = torch.einsum('bij,bj->bi', RRk, oR)                 # (B,3)
+        vL = _normalize(vL); vR = _normalize(vR)
+
+        # iris centers along optical axis; add small learnable axial pupil offsets (entrance pupil mismatch)
+        rE = torch.tensor(self.eyeball_radius_cm, device=x.device)
+        delta = torch.tanh(self.pupil_offset) * 0.2              # clamp +/- 0.2 cm
+        pL = cEL_C + oL * (aL.unsqueeze(-1) * rE + delta[0])
+        pR = cER_C + oR * (aR.unsqueeze(-1) * rE + delta[1])
+
+        # analytic 3D iris ring for each eye
+        ring = self._canonical_ring(x.device)                    # (N,3) in canonical XY plane
+        D = torch.tensor(self.iris_diameter_cm, device=x.device)
+        radius = 0.5 * D
+
+        # Build ortho bases for each eye
+        uL, vLbasis = build_orthonormal_basis(oL)
+        uR, vRbasis = build_orthonormal_basis(oR)
+        # (B,N,3)
+        ringL = pL[:, None, :] + radius * (uL[:, None, :] * ring[None, :, 0:1] +
+                                           vLbasis[:, None, :] * ring[None, :, 1:2])
+        ringR = pR[:, None, :] + radius * (uR[:, None, :] * ring[None, :, 0:1] +
+                                           vRbasis[:, None, :] * ring[None, :, 1:2])
+
+        # separate 2D iris head (normalized to [-1,1] then scaled to pixels if size supplied)
+        L2d = self.iris2d_L(g).reshape(B, self.nL, 2)
+        R2d = self.iris2d_R(g).reshape(B, self.nL, 2)
+        L2d = torch.tanh(L2d)  # [-1,1]
+        R2d = torch.tanh(R2d)
+        if image_size is None:
+            Hn, Wn = H, W
         else:
-            # fallback: scale by iris radius (keeps magnitude reasonable)
-            offL = geoL["offset_alpha"].squeeze(-1) * iris_radius_L
-            offR = geoR["offset_alpha"].squeeze(-1) * iris_radius_R
+            Hn, Wn = image_size
+        # map to pixel coords
+        L2d_px = torch.stack([(L2d[..., 0] + 1) * 0.5 * Wn, (L2d[..., 1] + 1) * 0.5 * Hn], dim=-1)
+        R2d_px = torch.stack([(R2d[..., 0] + 1) * 0.5 * Wn, (R2d[..., 1] + 1) * 0.5 * Hn], dim=-1)
 
-        iris_center_L = geoL["globe_center"] + geoL["optic"] * offL.unsqueeze(-1)  # [B,3]
-        iris_center_R = geoR["globe_center"] + geoR["optic"] * offR.unsqueeze(-1)  # [B,3]
+        # ray origin (between pupils) and direction
+        origin = 0.5 * (pL + pR)                                 # (B,3)
+        direction = gaze_dir                                     # (B,3)
 
-        # Rotate iris rings to CCS
-        ringL = torch.einsum('bij,bnj->bni', geoL["R"], geoL["ring_local"]) + iris_center_L.unsqueeze(1)
-        ringR = torch.einsum('bij,bnj->bni', geoR["R"], geoR["ring_local"]) + iris_center_R.unsqueeze(1)
+        out = {
+            # raw heads
+            "head_pose_6d": self.head_pose_6d(g),
+            "eye_rot6d_L":  self.eye_rot6d_L(g),
+            "eye_rot6d_R":  self.eye_rot6d_R(g),
+            "eye_center_H_L": cEL_H,
+            "eye_center_H_R": cER_H,
+            "alpha_L": aL, "alpha_R": aR,
+            "kappa_L": kL, "kappa_R": kR,
+            "gaze_vector_6d": gaze6d,
 
-        pupil_centers = torch.stack([iris_center_L, iris_center_R], dim=1)    # [B,2,3]
-        origin = pupil_centers.mean(dim=1)                                    # [B,3]
+            # composed camera-space geometry
+            "R_H": R_H, "t_H": t_H,
+            "R_EL_C": REL_C, "R_ER_C": RER_C,
+            "cEL_C": cEL_C, "cER_C": cER_C,
+            "optic_L": oL, "optic_R": oR,
+            "visual_L": vL, "visual_R": vR,
+            "pupil_L": pL, "pupil_R": pR,
 
-        # --- analytic depth from iris (MediaPipe) ---
-        depth_cm = depth_from_iris_cm(iris2d_px, K["fx"], identity["iris_diam_cm"])  # [B]
+            # 3D iris rings (camera space, cm)
+            "iris3d_L": ringL,  # (B,N,3)
+            "iris3d_R": ringR,
 
-        # gaze point (hard)
-        gaze_point = origin + depth_cm.unsqueeze(-1) * direction
+            # 2D iris landmarks (pixels)
+            "iris2d_L_px": L2d_px,  # (B,N,2)
+            "iris2d_R_px": R2d_px,
 
-        # optional head pose (if supervised)
-        head_pose_6d = self.head_pose_regression(feats)
+            # gaze ray
+            "ray_origin": origin,
+            "ray_dir": direction,
 
-        # if eyeball radius provided, expose it; else put a proxy (NaN-safe)
-        if eyeball_radius_cm is None:
-            eyeball_radius_out = torch.stack([iris_radius_L, iris_radius_R], dim=1) * 2.2  # loose proxy
-        else:
-            eyeball_radius_out = eyeball_radius_cm
-
-        return {
-            "head_pose_6d": head_pose_6d,
-            "gaze_vector_6d": gaze_vec6d,
-            "gaze_vector_normalized": direction,
-            "origin": origin,
-            "direction": direction,
-            "gaze_depth": depth_cm,                                # cm
-            "gaze_point_3d": gaze_point,
-            "gaze_point_from_ray": gaze_point,
-            "pupil_center_3d": pupil_centers,                      # [B,2,3] cm
-            "iris2d_px": iris2d_px,                                # [B,2,N,2] px
-            "iris_mesh_3d": torch.stack([ringL, ringR], dim=1),    # [B,2,N,3] cm
-            "eyeball_center_3d": torch.stack([geoL["globe_center"], geoR["globe_center"]], dim=1),
-            "eyeball_radius_cm": eyeball_radius_out,               # [B,2] cm
-            "optic_axis_eyes": torch.stack([geoL["optic"], geoR["optic"]], dim=1),     # [B,2,3]
-            "visual_axis_eyes": torch.stack([geoL["visual"], geoR["visual"]], dim=1),  # [B,2,3]
-            "fused": feats,
+            # identity (for completeness)
+            "eyeball_radius_cm": rE,
+            "iris_diameter_cm": D,
         }
+        return out
