@@ -1,494 +1,366 @@
+# train.py
 import argparse
 import os
 import csv
-import torch
-import torch.optim as optim
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-import numpy as np
-
-# Import the eye-focused RayNet and losses
-import sys
-
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from raynet import RayNet  # Eye-focused version
-from dataset import GazeGeneDataset, MultiViewBatchSampler
-from eye_losses import CombinedRayNetLoss
-
-import matplotlib
-
-# Set backend before importing pyplot
-matplotlib.use('Agg')  # Use non-interactive backend
-import matplotlib.pyplot as plt
 from collections import defaultdict
+
+import numpy as np
+import torch
 import torch.nn as nn
-import warnings
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
 
-warnings.filterwarnings('ignore', category=UserWarning)
+from raynet import RayNet
+from dataset import GazeGeneDataset, MultiViewBatchSampler
+
+# multiview losses you already use
+from head_pose.loss import multiview_headpose_losses
+from gaze_vector.loss import multiview_gaze_vector_geodesic_losses
+from gaze_point.loss import multiview_gaze_point_losses
+from gaze_depth.loss import multiview_gaze_depth_losses
+from pupil_center.loss import multiview_pupil_center_losses
+from ray_consistency_loss import multiview_ray_consistency_loss
+
+import matplotlib.pyplot as plt
 
 
+# -----------------------------
+# helpers
+# -----------------------------
 def parse_args():
-    parser = argparse.ArgumentParser(description="Eye-Focused RayNet Training")
-    parser.add_argument('--base_dir', type=str, required=True, help="Root of GazeGene dataset")
-    parser.add_argument('--backbone_name', type=str, default="repnext_m3")
-    parser.add_argument('--weight_path', type=str, default="./repnext_m3_pretrained.pt")
-    parser.add_argument('--batch_size', type=int, default=2)
-    parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--samples_per_subject', type=int, default=None)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--checkpoint_dir', type=str, default="checkpoints_eye")
-    parser.add_argument('--log_csv', type=str, default="train_eye_log.csv")
-    parser.add_argument('--checkpoint_freq', type=int, default=5)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--split', type=str, default="train", choices=["train", "test"])
-    parser.add_argument('--plot_live', action="store_true")
-    parser.add_argument('--visualize_freq', type=int, default=100, help="Frequency of 3D visualization")
-    return parser.parse_args()
+    ap = argparse.ArgumentParser("RayNet + MediaPipe-iris depth")
+    ap.add_argument("--base_dir", type=str, required=True)
+    ap.add_argument("--backbone_name", type=str, default="repnext_m3")
+    ap.add_argument("--weight_path", type=str, default="./repnext_m3_pretrained.pt")
+    ap.add_argument("--batch_size", type=int, default=2)
+    ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--checkpoint_dir", type=str, default="checkpoints")
+    ap.add_argument("--log_csv", type=str, default="train_log.csv")
+    ap.add_argument("--checkpoint_freq", type=int, default=5)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--split", type=str, default="train", choices=["train", "test"])
+    ap.add_argument("--samples_per_subject", type=int, default=None)
+    ap.add_argument("--plot_live", action="store_true")
+    ap.add_argument("--gradnorm_alpha", type=float, default=1.5)
+
+    # Optional fallbacks if dataset does not provide intrinsics/identity
+    ap.add_argument("--fx_pixels_fallback", type=float, default=1200.0,
+                    help="Fallback focal length in pixels if K not in dataset")
+    ap.add_argument("--iris_diam_cm_fallback", type=float, default=1.17,
+                    help="Fallback iris diameter (cm) if identity missing")
+    ap.add_argument("--eyeball_radius_cm_fallback", type=float, default=1.2,
+                    help="Fallback eyeball radius (cm) if identity missing")
+    return ap.parse_args()
 
 
 def get_backbone(backbone_name, weight_path, device):
     from backbone.repnext_utils import load_pretrained_repnext
-    model = load_pretrained_repnext(backbone_name, weight_path)
-    return model.to(device)
+    return load_pretrained_repnext(backbone_name, weight_path).to(device)
 
 
-def visualize_eye_reconstruction(model_output, gt_data, save_path=None):
+class RunningNormalizer:
+    def __init__(self):
+        self.min = float("inf"); self.max = float("-inf")
+    def update(self, v):
+        v = float(v); self.min = min(self.min, v); self.max = max(self.max, v)
+    def __call__(self, v):
+        if self.max <= self.min + 1e-8: return 0.0
+        return (float(v) - self.min) / (self.max - self.min)
+
+
+def ray_to_point_l1(origins, directions, points, eps=1e-6):
     """
-    Visualize 3D eye reconstruction including eyeball, iris, and gaze rays
+    Perpendicular L1 distance from points to rays (in cm).
+    origins    : [B,V,3]
+    directions : [B,V,3] (unit)
+    points     : [B,V,3]
     """
-    import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D
-
-    fig = plt.figure(figsize=(20, 5))
-
-    # Take first sample from batch
-    def to_numpy(x):
-        if isinstance(x, torch.Tensor):
-            return x[0].detach().cpu().numpy()
-        return x
-
-    # Plot 1: Left eye reconstruction
-    ax1 = fig.add_subplot(141, projection='3d')
-
-    # Eyeball mesh (simplified visualization)
-    if 'eyeball_left' in model_output:
-        eyeball = model_output['eyeball_left']
-        center = to_numpy(eyeball['center'])
-        radius = to_numpy(eyeball['radius'])
-
-        # Draw sphere for eyeball
-        u = np.linspace(0, 2 * np.pi, 20)
-        v = np.linspace(0, np.pi, 20)
-        x = radius * np.outer(np.cos(u), np.sin(v)) + center[0]
-        y = radius * np.outer(np.sin(u), np.sin(v)) + center[1]
-        z = radius * np.outer(np.ones(np.size(u)), np.cos(v)) + center[2]
-        ax1.plot_surface(x, y, z, alpha=0.3, color='pink')
-
-    # Iris landmarks
-    if 'iris_landmarks' in model_output:
-        iris_left = to_numpy(model_output['iris_landmarks']['left'])
-        ax1.scatter(iris_left[:, 0], iris_left[:, 1], iris_left[:, 2],
-                    c='blue', s=10, label='Predicted Iris')
-
-    # Ground truth iris
-    if 'mesh' in gt_data:
-        gt_iris = to_numpy(gt_data['mesh']['iris_mesh_3D'])
-        if len(gt_iris.shape) > 2:
-            gt_iris_left = gt_iris[0] if gt_iris.shape[0] == 2 else gt_iris[:, 0]
-            ax1.scatter(gt_iris_left[:, 0], gt_iris_left[:, 1], gt_iris_left[:, 2],
-                        c='green', s=5, alpha=0.5, label='GT Iris')
-
-    # Pupil center
-    if 'pupil_centers' in model_output:
-        pupil = to_numpy(model_output['pupil_centers']['left'])
-        ax1.scatter(pupil[0], pupil[1], pupil[2], c='red', s=50, marker='*', label='Pupil')
-
-    # Gaze ray
-    if 'eyeball_center_left' in model_output and 'visual_axis_left' in model_output:
-        origin = to_numpy(model_output['eyeball_center_left'])
-        direction = to_numpy(model_output['visual_axis_left'])
-        ax1.quiver(origin[0], origin[1], origin[2],
-                   direction[0] * 20, direction[1] * 20, direction[2] * 20,
-                   color='red', arrow_length_ratio=0.1, linewidth=2, label='Visual Axis')
-
-    ax1.set_title('Left Eye')
-    ax1.set_xlabel('X (mm)')
-    ax1.set_ylabel('Y (mm)')
-    ax1.set_zlabel('Z (mm)')
-    ax1.legend()
-    ax1.set_box_aspect([1, 1, 1])
-
-    # Plot 2: Right eye reconstruction
-    ax2 = fig.add_subplot(142, projection='3d')
-
-    # Similar visualization for right eye
-    if 'eyeball_right' in model_output:
-        eyeball = model_output['eyeball_right']
-        center = to_numpy(eyeball['center'])
-        radius = to_numpy(eyeball['radius'])
-
-        u = np.linspace(0, 2 * np.pi, 20)
-        v = np.linspace(0, np.pi, 20)
-        x = radius * np.outer(np.cos(u), np.sin(v)) + center[0]
-        y = radius * np.outer(np.sin(u), np.sin(v)) + center[1]
-        z = radius * np.outer(np.ones(np.size(u)), np.cos(v)) + center[2]
-        ax2.plot_surface(x, y, z, alpha=0.3, color='pink')
-
-    if 'iris_landmarks' in model_output:
-        iris_right = to_numpy(model_output['iris_landmarks']['right'])
-        ax2.scatter(iris_right[:, 0], iris_right[:, 1], iris_right[:, 2],
-                    c='blue', s=10, label='Predicted Iris')
-
-    ax2.set_title('Right Eye')
-    ax2.set_xlabel('X (mm)')
-    ax2.set_ylabel('Y (mm)')
-    ax2.set_zlabel('Z (mm)')
-    ax2.set_box_aspect([1, 1, 1])
-
-    # Plot 3: Combined gaze visualization
-    ax3 = fig.add_subplot(143, projection='3d')
-
-    # Both eyes and combined gaze
-    if 'ray_origin' in model_output and 'ray_direction' in model_output:
-        origin = to_numpy(model_output['ray_origin'])
-        direction = to_numpy(model_output['ray_direction'])
-
-        # Draw ray
-        t = np.linspace(0, 500, 100)
-        ray_points = origin[:, np.newaxis] + direction[:, np.newaxis] * t
-        ax3.plot(ray_points[0], ray_points[1], ray_points[2], 'r-', linewidth=2, label='Gaze Ray')
-
-        # Mark origin
-        ax3.scatter(origin[0], origin[1], origin[2], c='red', s=100, marker='o')
-
-        # Gaze point
-        if 'gaze_point_3d' in model_output:
-            gaze_pt = to_numpy(model_output['gaze_point_3d'])
-            ax3.scatter(gaze_pt[0], gaze_pt[1], gaze_pt[2], c='green', s=100, marker='*', label='Gaze Point')
-
-    ax3.set_title('Combined Gaze Ray')
-    ax3.set_xlabel('X (mm)')
-    ax3.set_ylabel('Y (mm)')
-    ax3.set_zlabel('Z (mm)')
-    ax3.legend()
-
-    # Plot 4: Angular error visualization
-    ax4 = fig.add_subplot(144)
-
-    # Show angular errors if available
-    if hasattr(ax4, 'text_data'):
-        text_data = ax4.text_data
-    else:
-        text_data = []
-
-    ax4.axis('off')
-    y_pos = 0.9
-    for line in text_data:
-        ax4.text(0.1, y_pos, line, fontsize=10, transform=ax4.transAxes)
-        y_pos -= 0.05
-
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    else:
-        plt.show()
-
-    plt.close()
+    v = points - origins
+    cross = torch.linalg.vector_norm(torch.cross(v, directions, dim=-1), dim=-1)  # [B,V]
+    return cross.mean()
 
 
+# -----------------------------
+# main
+# -----------------------------
 def main():
     args = parse_args()
-
-    # Set up device and seed
     torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
 
-    # Dataset split
+    # dataset / loader
     if args.split == "train":
         subject_ids = [f"subject{i}" for i in range(1, 46)]
     else:
         subject_ids = [f"subject{i}" for i in range(46, 56)]
 
-    # Create dataset and dataloader
     dataset = GazeGeneDataset(
         args.base_dir,
         subject_ids=subject_ids,
         samples_per_subject=args.samples_per_subject,
         transform=None,
-        balance_attributes=['ethicity']
+        balance_attributes=["ethicity"],
     )
+    batch_sampler = MultiViewBatchSampler(dataset, batch_size=args.batch_size,
+                                          balance_attributes=["ethicity"], shuffle=True)
+    loader = DataLoader(dataset, batch_sampler=batch_sampler,
+                        num_workers=args.num_workers, pin_memory=True)
 
-    batch_sampler = MultiViewBatchSampler(
-        dataset,
-        batch_size=args.batch_size,
-        balance_attributes=['ethicity'],
-        shuffle=True
-    )
-
-    loader = DataLoader(
-        dataset,
-        batch_sampler=batch_sampler,
-        num_workers=args.num_workers,
-        pin_memory=True
-    )
-
-    # Model setup
-    backbone_channels_dict = {
-        'repnext_m0': [40, 80, 160, 320],
-        'repnext_m1': [48, 96, 192, 384],
-        'repnext_m2': [56, 112, 224, 448],
-        'repnext_m3': [64, 128, 256, 512],
-        'repnext_m4': [64, 128, 256, 512],
-        'repnext_m5': [80, 160, 320, 640],
+    # model
+    backbone_channels = {
+        "repnext_m0": [40, 80, 160, 320],
+        "repnext_m1": [48, 96, 192, 384],
+        "repnext_m2": [56, 112, 224, 448],
+        "repnext_m3": [64, 128, 256, 512],
+        "repnext_m4": [64, 128, 256, 512],
+        "repnext_m5": [80, 160, 320, 640],
     }
-
-    in_channels_list = backbone_channels_dict[args.backbone_name]
     backbone = get_backbone(args.backbone_name, args.weight_path, device)
+    model = RayNet(backbone=backbone, in_channels_list=backbone_channels[args.backbone_name],
+                   n_iris_points=100).to(device)
 
-    model = RayNet(
-        backbone=backbone,
-        in_channels_list=in_channels_list,
-        n_iris_landmarks=100,
-        panet_out_channels=256
-    ).to(device)
+    # optimizers / GradNorm
+    NUM_TASKS = 5  # HP, GV, GP, GD, PC
+    task_weights = nn.Parameter(torch.ones(NUM_TASKS, device=device))
+    optimizer_model = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer_weights = optim.Adam([task_weights], lr=args.lr)
 
-    # Loss and optimizer
-    criterion = CombinedRayNetLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-
-    # Check for existing checkpoints to resume training
-    start_epoch = 0
-    checkpoint_files = []
-    if os.path.exists(args.checkpoint_dir):
-        checkpoint_files = sorted([f for f in os.listdir(args.checkpoint_dir)
-                                   if f.endswith('.pth') and 'raynet_eye_epoch' in f])
-
-    if checkpoint_files:
-        last_ckpt = os.path.join(args.checkpoint_dir, checkpoint_files[-1])
-        print(f"Resuming from checkpoint: {last_ckpt}")
-        try:
-            checkpoint = torch.load(last_ckpt, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            start_epoch = checkpoint['epoch'] + 1
-            print(f"Resumed from epoch {start_epoch}")
-        except Exception as e:
-            print(f"Failed to load checkpoint: {e}")
-            print("Starting from scratch...")
-
-    # Logging setup
+    # logging
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    logfile = open(args.log_csv, "w", newline="")
-    csv_writer = csv.DictWriter(logfile, fieldnames=[
-        "epoch", "step", "batch_size",
-        "eyeball_loss", "iris_loss", "gaze_loss",
-        "rotation_loss", "multiview_loss", "total_loss",
-        "gaze_angular_error", "lr"
-    ])
+    logf = open(args.log_csv, "w", newline="")
+    csv_writer = csv.DictWriter(
+        logf,
+        fieldnames=[
+            "epoch","step","batch",
+            "hp_acc","hp_cons",
+            "gv_acc","gv_cons",
+            "gp_acc","gp_cons",
+            "gd_acc","gd_cons",
+            "pc_acc","pc_cons",
+            "ray_cons","rayp_cons",
+            "w_hp","w_gv","w_gp","w_gd","w_pc",
+        ],
+    )
     csv_writer.writeheader()
 
-    # Live plotting setup
+    # live plot (optional)
     if args.plot_live:
         plt.ion()
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        loss_history = defaultdict(list)
+        fig, ax = plt.subplots(figsize=(12, 6))
+        curves = defaultdict(list)
 
-    # Training loop
-    print(f"Starting training for {args.epochs} epochs...")
-    global_step = 0
+    # GradNorm control
+    init_losses = None
+    alpha = args.gradnorm_alpha
+    normalizer = {k: RunningNormalizer() for k in ["hp","gv","gp","gd","pc"]}
 
-    for epoch in range(args.epochs):
+    # resume
+    start_epoch = 0
+    ckpts = sorted([f for f in os.listdir(args.checkpoint_dir) if f.endswith(".pth")])
+    if ckpts:
+        last = os.path.join(args.checkpoint_dir, ckpts[-1])
+        print(f"Resuming from {last}")
+        state = torch.load(last, map_location=device)
+        model.load_state_dict(state["model"])
+        optimizer_model.load_state_dict(state["optimizer_model"])
+        optimizer_weights.load_state_dict(state["optimizer_weights"])
+        start_epoch = int(state["epoch"]) + 1
+
+    # training
+    V = 9  # multi-view cameras per sample
+    CM2M = 0.01
+
+    for epoch in range(start_epoch, args.epochs):
         model.train()
-        epoch_losses = defaultdict(float)
-        n_batches = 0
-
         for step, batch in enumerate(loader):
-            global_step += 1
+            imgs = batch["img"].to(device)              # [B*V, 3, H, W]
+            B = imgs.shape[0] // V
+            _, _, H, W = imgs.shape
 
-            # Prepare batch
-            images = batch['img'].to(device)
-            B = images.shape[0] // 9  # Multi-view batch
-            images = images.view(B * 9, images.shape[1], images.shape[2], images.shape[3])
+            # intrinsics / identity
+            if "K" in batch:
+                # batch["K"]: likely [B*V,3,3] or [B,V,3,3] depending on your dataset.py
+                K = batch["K"]
+                if K.dim() == 4:   # [B,V,3,3] -> [B*V,3,3]
+                    K = K.to(device).view(B*V, 3, 3)
+                else:
+                    K = K.to(device)
+                fx = K[:, 0, 0]  # [B*V]
+            else:
+                fx = torch.full((B*V,), args.fx_pixels_fallback, device=device)
 
-            # Forward pass
-            outputs = model(images)
+            identity = batch.get("identity", {})
+            if "iris_diameter_cm" in identity:
+                iris_diam = identity["iris_diameter_cm"]
+                if iris_diam.dim() == 3:  # [B,V,2] -> average per view to [B*V] or keep per-eye if needed
+                    iris_diam = iris_diam.mean(dim=2)  # [B,V]
+                if iris_diam.dim() == 2:  # [B,V] -> [B*V]
+                    iris_diam = iris_diam.to(device).reshape(B*V)
+                else:
+                    iris_diam = iris_diam.to(device).reshape(B*V)
+            else:
+                iris_diam = torch.full((B*V,), args.iris_diam_cm_fallback, device=device)
 
-            # Prepare ground truth data for loss computation
-            # Move all data to device and reshape for multi-view
-            gt_data = {
-                'mesh': {
-                    'eyeball_center_3D': batch['mesh']['eyeball_center_3D'].to(device),
-                    'iris_mesh_3D': batch['mesh']['iris_mesh_3D'].to(device),
-                    'pupil_center_3D': batch['mesh']['pupil_center_3D'].to(device)
-                },
-                'gaze': {
-                    'gaze_C': batch['gaze']['gaze_C'].to(device),
-                    'optic_axis_L': batch['gaze']['optic_axis_L'].to(device),
-                    'optic_axis_R': batch['gaze']['optic_axis_R'].to(device),
-                    'visual_axis_L': batch['gaze']['visual_axis_L'].to(device),
-                    'visual_axis_R': batch['gaze']['visual_axis_R'].to(device),
-                    'gaze_depth': batch['gaze']['gaze_depth'].to(device)
-                },
-                'gaze_point': batch['gaze_point'].to(device),
-                'head_pose': {
-                    'R': batch['head_pose']['R'].to(device),
-                    't': batch['head_pose']['t'].to(device)
-                }
+            # optional per-eye eyeball radius
+            if "eyeball_radius_cm" in identity:
+                er = identity["eyeball_radius_cm"].to(device)
+                if er.dim() == 3:  # [B,V,2] -> [B*V,2]
+                    er = er.view(B*V, 2)
+            else:
+                er = torch.full((B*V, 2), args.eyeball_radius_cm_fallback, device=device)
+
+            Kdict = {"fx": fx}  # [B*V]
+            identity_dict = {
+                "iris_diam_cm": iris_diam,              # [B*V]
+                "eyeball_radius_cm": er,                # [B*V,2]
             }
 
-            # Compute loss
-            losses = criterion(outputs, gt_data, is_multiview=True)
-            total_loss = losses['total']
+            # forward
+            out = model(imgs, K=Kdict, identity=identity_dict)
 
-            # Backward pass
-            optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            # reshape predictions to [B, V, ...]
+            hp_pred   = out["head_pose_6d"].view(B, V, 6)
+            gv_pred   = out["gaze_vector_6d"].view(B, V, 6)
+            gp_pred   = out["gaze_point_3d"].view(B, V, 3)   # cm
+            gd_pred   = out["gaze_depth"].view(B, V)         # cm
+            pc_pred   = out["pupil_center_3d"].view(B, V, 2, 3)
+            origins    = out["origin"].view(B, V, 3)
+            directions = out["direction"].view(B, V, 3)
 
-            # Update epoch losses
-            for k, v in losses.items():
-                if isinstance(v, torch.Tensor):
-                    epoch_losses[k] += v.item()
-            n_batches += 1
+            # ground truth
+            hp_gt = batch["head_pose"]["R"].to(device).view(B, V, 3, 3)
+            gv_gt = batch["gaze"]["gaze_C"].to(device).view(B, V, 3)
+            gp_gt = batch["gaze_point"].to(device).view(B, V, 3)      # cm
+            gd_gt = batch["gaze"]["gaze_depth"].to(device).view(B, V) # cm
+            pc_gt = batch["mesh"]["pupil_center_3D"].to(device).view(B, V, 2, 3)
 
-            # Logging
-            log_dict = {
-                "epoch": epoch,
-                "step": step,
-                "batch_size": args.batch_size,
-                "eyeball_loss": losses.get('eyeball_total', 0),
-                "iris_loss": losses.get('iris_total', 0),
-                "gaze_loss": losses.get('gaze_total', 0),
-                "rotation_loss": losses.get('rotation_total', 0),
-                "multiview_loss": losses.get('multiview_total', 0),
-                "total_loss": total_loss.item(),
-                "gaze_angular_error": losses.get('gaze_mean_angular_error', 0),
-                "lr": optimizer.param_groups[0]['lr']
+            # convert GP/GD to meters for numerically stable regression
+            gp_pred_m = gp_pred * CM2M
+            gp_gt_m   = gp_gt   * CM2M
+            gd_pred_m = gd_pred * CM2M
+            gd_gt_m   = gd_gt   * CM2M
+
+            # task losses
+            hp_loss = multiview_headpose_losses(hp_pred, hp_gt)
+            gv_loss = multiview_gaze_vector_geodesic_losses(gv_pred, gv_gt)
+            gp_loss = multiview_gaze_point_losses(gp_pred_m, gp_gt_m)
+            gd_loss = multiview_gaze_depth_losses(gd_pred_m, gd_gt_m)   # analytic depth supervised
+            pc_loss = multiview_pupil_center_losses(pc_pred, pc_gt)
+            ray_loss = multiview_ray_consistency_loss(
+                origins=origins, directions=directions, gaze_depths=gd_pred, gaze_points_pred=gp_pred
+            )["total"]
+            rayp_loss = ray_to_point_l1(origins, directions, gp_gt)     # cm
+
+            # running normalizers
+            for k, L in [
+                ("hp", hp_loss["accuracy"] + hp_loss["consistency"]),
+                ("gv", gv_loss["accuracy"] + gv_loss["consistency"]),
+                ("gp", gp_loss["accuracy"] + gp_loss["consistency"]),
+                ("gd", gd_loss["accuracy"] + gd_loss["consistency"]),
+                ("pc", pc_loss["accuracy"] + pc_loss["consistency"]),
+            ]:
+                normalizer[k].update(L.item())
+
+            n_hp = normalizer["hp"](hp_loss["accuracy"] + hp_loss["consistency"])
+            n_gv = normalizer["gv"](gv_loss["accuracy"] + gv_loss["consistency"])
+            n_gp = normalizer["gp"](gp_loss["accuracy"] + gp_loss["consistency"])
+            n_gd = normalizer["gd"](gd_loss["accuracy"] + gd_loss["consistency"])
+            n_pc = normalizer["pc"](pc_loss["accuracy"] + pc_loss["consistency"])
+
+            per_task_losses = torch.stack([
+                (hp_loss["accuracy"] + hp_loss["consistency"]) * n_hp,
+                (gv_loss["accuracy"] + gv_loss["consistency"]) * n_gv,
+                (gp_loss["accuracy"] + gp_loss["consistency"]) * n_gp,
+                (gd_loss["accuracy"] + gd_loss["consistency"]) * n_gd,
+                (pc_loss["accuracy"] + pc_loss["consistency"]) * n_pc,
+            ])
+
+            # GradNorm base norms w.r.t a shared param (CoordNeck)
+            shared_param = list(model.fusion.parameters())[0]
+            base_norms = []
+            for i in range(NUM_TASKS):
+                g = torch.autograd.grad(per_task_losses[i], shared_param, retain_graph=True)[0]
+                base_norms.append(g.norm().detach())
+            base_norms = torch.stack(base_norms)
+
+            # phase 1: update model
+            optimizer_model.zero_grad()
+            model_loss = (task_weights.detach() * per_task_losses).sum() + 0.1 * ray_loss + 0.1 * rayp_loss
+            model_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            optimizer_model.step()
+
+            # GradNorm initialization
+            if init_losses is None:
+                init_losses = per_task_losses.detach().clone()
+
+            # phase 2: update task weights
+            loss_ratios = per_task_losses.detach() / (init_losses + 1e-8)
+            avg_ratio = loss_ratios.mean()
+            G = task_weights * base_norms
+            target_G = G.mean().detach() * (loss_ratios / (avg_ratio + 1e-8)) ** args.gradnorm_alpha
+
+            optimizer_weights.zero_grad()
+            gradnorm_loss = F.l1_loss(G, target_G)
+            gradnorm_loss.backward()
+            optimizer_weights.step()
+
+            with torch.no_grad():
+                task_weights.mul_(NUM_TASKS / (task_weights.sum() + 1e-8))
+
+            # logging
+            row = {
+                "epoch": int(epoch), "step": int(step), "batch": int(args.batch_size),
+                "hp_acc": float(hp_loss["accuracy"]), "hp_cons": float(hp_loss["consistency"]),
+                "gv_acc": float(gv_loss["accuracy"]), "gv_cons": float(gv_loss["consistency"]),
+                "gp_acc": float(gp_loss["accuracy"]), "gp_cons": float(gp_loss["consistency"]),
+                "gd_acc": float(gd_loss["accuracy"]), "gd_cons": float(gd_loss["consistency"]),
+                "pc_acc": float(pc_loss["accuracy"]), "pc_cons": float(pc_loss["consistency"]),
+                "ray_cons": float(ray_loss), "rayp_cons": float(rayp_loss),
+                "w_hp": float(task_weights[0].item()),
+                "w_gv": float(task_weights[1].item()),
+                "w_gp": float(task_weights[2].item()),
+                "w_gd": float(task_weights[3].item()),
+                "w_pc": float(task_weights[4].item()),
             }
-            csv_writer.writerow(log_dict)
-            logfile.flush()
+            csv_writer.writerow(row); logf.flush()
 
-            # Live plotting
-            if args.plot_live and step % 10 == 0:
-                for key in ['eyeball_loss', 'iris_loss', 'gaze_loss', 'total_loss']:
-                    if key in log_dict:
-                        loss_history[key].append(log_dict[key])
+            if args.plot_live:
+                for k in ["hp_acc","gv_acc","gp_acc","gd_acc","pc_acc","ray_cons","rayp_cons"]:
+                    curves[k].append(row[k])
+                ax.clear()
+                for k, v in curves.items():
+                    ax.plot(np.asarray(v, dtype=float), label=k)
+                ax.legend(); ax.set_title(f"Epoch {epoch} Step {step}"); plt.pause(0.01)
 
-                # Update plots
-                for idx, (ax, key) in enumerate(zip(axes.flat, loss_history.keys())):
-                    ax.clear()
-                    ax.plot(loss_history[key])
-                    ax.set_title(key)
-                    ax.set_xlabel('Step')
-                    ax.set_ylabel('Loss')
-                    ax.grid(True, alpha=0.3)
+            if (step + 1) % 10 == 0:
+                print(
+                    f"Epoch {epoch} | Step {step+1}/{len(loader)} | "
+                    f"HP {row['hp_acc']:.3f} | GV {row['gv_acc']:.3f} | "
+                    f"GP {row['gp_acc']:.3f} | GD {row['gd_acc']:.3f} | "
+                    f"PC {row['pc_acc']:.3f} | Ray {row['ray_cons']:.3f} | RayP {row['rayp_cons']:.3f}"
+                )
 
-                plt.suptitle(f'Epoch {epoch}, Step {step}')
-                plt.tight_layout()
-                plt.pause(0.01)
-
-            # 3D Visualization
-            if args.visualize_freq > 0 and global_step % args.visualize_freq == 0:
-                with torch.no_grad():
-                    vis_path = os.path.join(args.checkpoint_dir, f'vis_epoch{epoch}_step{step}.png')
-                    visualize_eye_reconstruction(outputs, batch, save_path=vis_path)
-                    print(f"Saved visualization to {vis_path}")
-
-            # Print progress
-            if step % 10 == 0:
-                gaze_error = losses.get('gaze_mean_angular_error', 0)
-                if isinstance(gaze_error, torch.Tensor):
-                    gaze_error = gaze_error.item()
-
-                print(f"Epoch [{epoch}/{args.epochs}] Step [{step}/{len(loader)}] "
-                      f"Loss: {total_loss.item():.4f} "
-                      f"Gaze Error: {gaze_error:.2f}° "
-                      f"LR: {optimizer.param_groups[0]['lr']:.6f}")
-
-        # Epoch summary
-        avg_losses = {k: v / n_batches for k, v in epoch_losses.items()}
-        print(f"\nEpoch {epoch} Summary:")
-        print(f"  Average Total Loss: {avg_losses.get('total', 0):.4f}")
-        print(f"  Average Gaze Angular Error: {avg_losses.get('gaze_mean_angular_error', 0):.2f}°")
-
-        # Step scheduler
-        scheduler.step()
-
-        # Save checkpoint
+        # checkpoint
         if (epoch + 1) % args.checkpoint_freq == 0 or (epoch + 1) == args.epochs:
-            ckpt_path = os.path.join(args.checkpoint_dir, f"raynet_eye_epoch{epoch + 1}.pth")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'losses': avg_losses,
-                'args': vars(args)
-            }, ckpt_path)
-            print(f"Checkpoint saved to {ckpt_path}")
+            ckpt = os.path.join(args.checkpoint_dir, f"raynet_epoch{epoch+1}.pth")
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "optimizer_model": optimizer_model.state_dict(),
+                    "optimizer_weights": optimizer_weights.state_dict(),
+                    "epoch": epoch,
+                    "args": vars(args),
+                }, ckpt
+            )
+            print(f"Saved checkpoint: {ckpt}")
 
-    # Cleanup
-    logfile.close()
+    logf.close()
     if args.plot_live:
-        plt.ioff()
-        plt.show()
-
-    print("Training complete!")
-
-
-def evaluate_model(model, dataloader, device):
-    """
-    Evaluate model performance
-    """
-    model.eval()
-    criterion = CombinedRayNetLoss()
-
-    total_losses = defaultdict(float)
-    angular_errors = []
-    n_batches = 0
-
-    with torch.no_grad():
-        for batch in dataloader:
-            images = batch['img'].to(device)
-            B = images.shape[0] // 9
-            images = images.view(B * 9, images.shape[1], images.shape[2], images.shape[3])
-
-            outputs = model(images)
-            losses = criterion(outputs, batch, is_multiview=True)
-
-            for k, v in losses.items():
-                if isinstance(v, torch.Tensor):
-                    total_losses[k] += v.item()
-
-            # Collect angular errors
-            if 'gaze_mean_angular_error' in losses:
-                angular_errors.append(losses['gaze_mean_angular_error'].item())
-
-            n_batches += 1
-
-    # Compute averages
-    avg_losses = {k: v / n_batches for k, v in total_losses.items()}
-    mean_angular_error = np.mean(angular_errors) if angular_errors else 0
-    std_angular_error = np.std(angular_errors) if angular_errors else 0
-
-    print("\nEvaluation Results:")
-    print(f"  Average Total Loss: {avg_losses.get('total', 0):.4f}")
-    print(f"  Mean Gaze Angular Error: {mean_angular_error:.2f}° ± {std_angular_error:.2f}°")
-    print(f"  Eyeball Loss: {avg_losses.get('eyeball_total', 0):.4f}")
-    print(f"  Iris Loss: {avg_losses.get('iris_total', 0):.4f}")
-    print(f"  Gaze Loss: {avg_losses.get('gaze_total', 0):.4f}")
-
-    return avg_losses, mean_angular_error
+        plt.ioff(); plt.show()
 
 
 if __name__ == "__main__":

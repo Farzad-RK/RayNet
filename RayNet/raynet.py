@@ -1,597 +1,292 @@
+import math
+from typing import Dict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from typing import Dict, Tuple, Optional
-import math
+from torch.utils.checkpoint import checkpoint
+
+from coordatt import CoordAtt
+from depth_from_iris import depth_from_iris_cm       # analytic depth from iris (MediaPipe-style)
 
 
-class EyeballModel(nn.Module):
+# -----------------------------
+# Utils
+# -----------------------------
+def ortho6d_to_rotmat(x: torch.Tensor) -> torch.Tensor:
+    """Zhou et al., CVPR'19: 6D -> 3x3 rotation matrix."""
+    a1 = F.normalize(x[:, 0:3], dim=1)
+    a2 = x[:, 3:6]
+    a2 = F.normalize(a2 - (a1 * a2).sum(1, keepdim=True) * a1, dim=1)
+    a3 = torch.cross(a1, a2, dim=1)
+    return torch.stack([a1, a2, a3], dim=2)
+
+
+def make_unit_ring(n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    t = torch.linspace(0.0, 2.0 * math.pi, steps=n, device=device, dtype=dtype)
+    x = torch.cos(t); y = torch.sin(t); z = torch.zeros_like(t)
+    return torch.stack([x, y, z], dim=1)  # [N,3]
+
+
+# -----------------------------
+# Minimal Neck: 1x1 + BN/ReLU + CoordAtt on c4
+# -----------------------------
+class CoordNeck(nn.Module):
     """
-    Parametric eyeball model for 3D eye reconstruction
-    Learns to predict eyeball shape and position from features
+    Lightweight adapter (kept as 'fusion' so GradNorm continues to work).
     """
-
-    def __init__(self,
-                 input_dim: int = 256,
-                 n_shape_params: int = 10,
-                 n_vertices: int = 642):  # Icosphere subdivision level 3
+    def __init__(self, in_ch: int, out_ch: int = 256, reduction: int = 32):
         super().__init__()
+        self.proj = nn.Conv2d(in_ch, out_ch, 1, bias=False)
+        self.bn   = nn.BatchNorm2d(out_ch)
+        self.act  = nn.ReLU(inplace=True)
+        self.ca   = CoordAtt(out_ch, out_ch, reduction=reduction)
 
-        self.n_shape_params = n_shape_params
-        self.n_vertices = n_vertices
-
-        # Initialize base eyeball mesh (unit sphere)
-        self.register_buffer('base_vertices', self._create_icosphere(n_vertices))
-        self.register_buffer('faces', self._create_icosphere_faces(n_vertices))
-
-        # Shape basis for eyeball deformation (learned)
-        self.shape_basis = nn.Parameter(torch.randn(n_shape_params, n_vertices, 3) * 0.01)
-
-        # Networks for eyeball parameters
-        self.eyeball_encoder = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
-            nn.Linear(128, 64)
-        )
-
-        # Predict shape coefficients
-        self.shape_predictor = nn.Linear(64, n_shape_params)
-
-        # Predict eyeball center position
-        self.center_predictor = nn.Linear(64, 3)
-
-        # Predict eyeball radius (typically ~12mm)
-        self.radius_predictor = nn.Sequential(
-            nn.Linear(64, 1),
-            nn.Sigmoid()  # Constrain between 0-1, scale later
-        )
-
-        # Predict rotation for eyeball orientation
-        self.rotation_predictor = nn.Linear(64, 6)  # 6D rotation representation
-
-    def _create_icosphere(self, n_vertices):
-        """Create base icosphere vertices"""
-        # Create a proper sphere with exactly n_vertices points
-        # Using a more controlled generation to ensure exact vertex count
-        n_points = n_vertices
-
-        # Generate points using golden angle spiral for better distribution
-        indices = torch.arange(0, n_points, dtype=torch.float32)
-
-        # Golden angle in radians
-        golden_angle = np.pi * (3. - np.sqrt(5.))
-
-        # Generate points on sphere
-        y = 1 - (indices / float(n_points - 1)) * 2  # y goes from 1 to -1
-        radius = torch.sqrt(1 - y * y)
-
-        theta = golden_angle * indices
-
-        x = torch.cos(theta) * radius
-        z = torch.sin(theta) * radius
-
-        vertices = torch.stack([x, y, z], dim=1)
-
-        # Ensure we have exactly n_vertices
-        assert vertices.shape[0] == n_vertices, f"Vertex count mismatch: {vertices.shape[0]} != {n_vertices}"
-
-        return vertices
-
-    def _create_icosphere_faces(self, n_vertices):
-        """Create icosphere face indices using Delaunay triangulation approximation"""
-        # For a sphere, we can use a simple triangulation scheme
-        # This is a placeholder - for production, use proper icosphere topology
-
-        # Approximate number of faces for a sphere (Euler's formula: V - E + F = 2)
-        # For a triangulated sphere: F ≈ 2V - 4
-        n_faces = max(2 * n_vertices - 4, 100)
-
-        # Generate pseudo-random but valid face indices
-        # In practice, you'd want proper sphere triangulation
-        faces = []
-        torch.manual_seed(42)  # For reproducibility
-
-        for i in range(n_faces):
-            # Create valid triangles
-            v1 = i % n_vertices
-            v2 = (i + 1) % n_vertices
-            v3 = (i + n_vertices // 2) % n_vertices
-
-            # Ensure no degenerate triangles
-            if v1 != v2 and v2 != v3 and v1 != v3:
-                faces.append([v1, v2, v3])
-
-        faces = torch.tensor(faces[:n_faces], dtype=torch.long)
-        return faces
-
-    def forward(self, features):
-        """
-        Generate eyeball mesh from features
-        Args:
-            features: (B, C) encoded features
-        Returns:
-            dict with eyeball mesh and parameters
-        """
-        batch_size = features.shape[0]
-
-        # Encode features
-        encoded = self.eyeball_encoder(features)
-
-        # Predict eyeball parameters
-        shape_coeffs = self.shape_predictor(encoded)  # (B, n_shape_params)
-        center = self.center_predictor(encoded)  # (B, 3)
-        radius = 10.0 + 4.0 * self.radius_predictor(encoded)  # (B, 1) - scale to 10-14mm
-        rotation_6d = self.rotation_predictor(encoded)  # (B, 6)
-
-        # Convert 6D to rotation matrix
-        rotation_matrix = self.ortho6d_to_rotmat(rotation_6d)  # (B, 3, 3)
-
-        # Apply shape deformation
-        vertices = self.base_vertices.unsqueeze(0).expand(batch_size, -1, -1)  # (B, V, 3)
-
-        # Add shape basis deformations
-        shape_deltas = torch.einsum('bs,svd->bvd', shape_coeffs, self.shape_basis)
-        vertices = vertices + shape_deltas
-
-        # Apply rotation
-        vertices = torch.einsum('bvd,bkd->bvk', vertices, rotation_matrix)
-
-        # Scale by radius
-        vertices = vertices * radius.unsqueeze(1)
-
-        # Translate to center position
-        vertices = vertices + center.unsqueeze(1)
-
-        return {
-            'vertices': vertices,
-            'faces': self.faces,
-            'center': center,
-            'radius': radius.squeeze(-1),
-            'rotation': rotation_matrix,
-            'shape_coeffs': shape_coeffs
-        }
-
-    def ortho6d_to_rotmat(self, ortho6d):
-        """Convert 6D orthogonal representation to rotation matrix"""
-        x_raw = ortho6d[:, :3]
-        y_raw = ortho6d[:, 3:6]
-
-        x = F.normalize(x_raw, dim=1)
-        z = F.normalize(torch.cross(x, y_raw, dim=1), dim=1)
-        y = F.normalize(torch.cross(z, x, dim=1), dim=1)
-
-        return torch.stack([x, y, z], dim=2)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.act(self.bn(self.proj(x)))
+        return self.ca(x)
 
 
-class IrisMeshDecoder(nn.Module):
-    """
-    Decoder for 3D iris mesh (100 landmarks from GazeGene)
-    Also handles pupil center prediction
-    """
-
-    def __init__(self,
-                 input_dim: int = 256,
-                 n_landmarks: int = 100,
-                 hidden_dim: int = 256):
+# -----------------------------
+# Heads
+# -----------------------------
+class GlobalRegHead(nn.Module):
+    def __init__(self, in_channels: int, out_dim: int, hidden: int = 128, use_coord_att: bool = False, reduction=32):
         super().__init__()
-        self.n_landmarks = n_landmarks
+        self.use_ca = use_coord_att
+        if use_ca := use_coord_att:
+            self.ca = CoordAtt(in_channels, in_channels, reduction=reduction)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Linear(in_channels, hidden)
+        self.act = nn.ReLU(inplace=True)
+        self.fc2 = nn.Linear(hidden, out_dim)
 
-        # Shared encoder for both eyes
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True)
-        )
-
-        # Separate decoders for left and right iris
-        self.left_iris_decoder = nn.Sequential(
-            nn.Linear(hidden_dim, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, n_landmarks * 3)
-        )
-
-        self.right_iris_decoder = nn.Sequential(
-            nn.Linear(hidden_dim, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, n_landmarks * 3)
-        )
-
-        # Pupil center predictors (3D position within iris)
-        self.left_pupil_predictor = nn.Linear(hidden_dim, 3)
-        self.right_pupil_predictor = nn.Linear(hidden_dim, 3)
-
-        # Iris shape parameters (for regularization and control)
-        self.iris_shape_predictor = nn.Linear(hidden_dim, 10)  # 10 shape parameters
-
-    def forward(self, features, eyeball_info=None):
-        """
-        Decode iris landmarks and pupil centers
-        Args:
-            features: (B, C) encoded features
-            eyeball_info: dict with eyeball centers and radii (optional, for constraint)
-        Returns:
-            dict with iris landmarks and pupil centers
-        """
-        batch_size = features.shape[0]
-
-        # Encode features
-        encoded = self.encoder(features)
-
-        # Decode iris landmarks
-        left_iris = self.left_iris_decoder(encoded).view(batch_size, self.n_landmarks, 3)
-        right_iris = self.right_iris_decoder(encoded).view(batch_size, self.n_landmarks, 3)
-
-        # Predict pupil centers
-        left_pupil = self.left_pupil_predictor(encoded)
-        right_pupil = self.right_pupil_predictor(encoded)
-
-        # Predict iris shape parameters (for regularization)
-        iris_shape = self.iris_shape_predictor(encoded)
-
-        # Apply geometric constraints if eyeball info is provided
-        if eyeball_info is not None:
-            left_iris = self._constrain_to_eyeball(
-                left_iris,
-                eyeball_info['center'][:, 0] if eyeball_info['center'].dim() > 1 else eyeball_info['center'],
-                eyeball_info['radius']
-            )
-            right_iris = self._constrain_to_eyeball(
-                right_iris,
-                eyeball_info['center'][:, 1] if eyeball_info['center'].dim() > 1 else eyeball_info['center'],
-                eyeball_info['radius']
-            )
-
-        return {
-            'iris_landmarks': {
-                'left': left_iris,
-                'right': right_iris
-            },
-            'pupil_centers': {
-                'left': left_pupil,
-                'right': right_pupil
-            },
-            'iris_shape_params': iris_shape
-        }
-
-    def _constrain_to_eyeball(self, iris_points, eyeball_center, eyeball_radius):
-        """
-        Project iris points onto eyeball surface
-        Args:
-            iris_points: (B, N, 3) iris landmark positions
-            eyeball_center: (B, 3) eyeball center
-            eyeball_radius: (B,) or (B, 1) eyeball radius
-        """
-        # Vector from eyeball center to each iris point
-        vectors = iris_points - eyeball_center.unsqueeze(1)
-
-        # Normalize and scale to eyeball surface
-        distances = torch.norm(vectors, dim=2, keepdim=True)
-        normalized = vectors / (distances + 1e-8)
-
-        # Project onto sphere surface
-        if eyeball_radius.dim() == 1:
-            eyeball_radius = eyeball_radius.unsqueeze(1)
-
-        constrained = eyeball_center.unsqueeze(1) + normalized * eyeball_radius.unsqueeze(1)
-
-        return constrained
+    def forward(self, x):
+        if hasattr(self, "ca"):
+            x = self.ca(x)
+        x = self.pool(x).flatten(1)
+        x = self.act(self.fc1(x))
+        return self.fc2(x)
 
 
-class GazeRayEstimator(nn.Module):
+class EyeParamHead(nn.Module):
     """
-    Estimate gaze rays from eyeball and iris geometry
-    Computes optical axis, visual axis, and combined gaze vector
+    Identity-aware eye parameters (sizes come from identity, not learned):
+      rot6d        [B,6]    eye rotation
+      globe_center [B,3]    CCS position (cm)
+      iris_offset  [B,1]    along optical axis (0..radius]
+      kappa_deg    [B,2]    yaw,pitch for visual axis (±8°)
     """
-
-    def __init__(self, hidden_dim: int = 128):
+    def __init__(self, in_channels: int, hidden: int = 128):
         super().__init__()
-
-        # Network for optical axis from iris geometry
-        self.optical_axis_net = nn.Sequential(
-            nn.Linear(100 * 3 + 3 + 3, hidden_dim),  # iris + pupil + eyeball center
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 3)
-        )
-
-        # Network for visual axis (includes foveal offset)
-        self.visual_axis_net = nn.Sequential(
-            nn.Linear(3 + 3, 32),  # optical axis + eye-specific features
-            nn.ReLU(inplace=True),
-            nn.Linear(32, 3)
-        )
-
-        # Combined gaze from both eyes
-        self.gaze_combiner = nn.Sequential(
-            nn.Linear(6 + 6, 64),  # both visual axes + both eyeball centers
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 32),
-            nn.ReLU(inplace=True),
-            nn.Linear(32, 3)
-        )
-
-        # Gaze depth estimator
-        self.depth_estimator = nn.Sequential(
-            nn.Linear(3 + 3 + 6, 64),  # gaze vector + mean eye center + eye centers
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, iris_data, eyeball_data):
-        """
-        Compute gaze rays from eye geometry
-        Args:
-            iris_data: dict with iris_landmarks and pupil_centers
-            eyeball_data: dict with eyeball centers
-        Returns:
-            dict with all gaze-related outputs
-        """
-        batch_size = iris_data['iris_landmarks']['left'].shape[0]
-        results = {}
-
-        # Process each eye
-        for eye in ['left', 'right']:
-            # Flatten iris landmarks
-            iris_flat = iris_data['iris_landmarks'][eye].reshape(batch_size, -1)
-            pupil = iris_data['pupil_centers'][eye]
-
-            # Get eyeball center for this eye
-            if eyeball_data['center'].dim() > 1 and eyeball_data['center'].shape[1] == 2:
-                eyeball_center = eyeball_data['center'][:, 0 if eye == 'left' else 1]
-            else:
-                eyeball_center = eyeball_data['center']
-
-            # Compute optical axis
-            optical_input = torch.cat([iris_flat, pupil, eyeball_center], dim=1)
-            optical_axis = F.normalize(self.optical_axis_net(optical_input), dim=1)
-
-            # Compute visual axis (with foveal offset)
-            visual_input = torch.cat([optical_axis, pupil - eyeball_center], dim=1)
-            visual_offset = self.visual_axis_net(visual_input)
-            visual_axis = F.normalize(optical_axis + 0.1 * visual_offset, dim=1)
-
-            results[f'optical_axis_{eye}'] = optical_axis
-            results[f'visual_axis_{eye}'] = visual_axis
-            results[f'eyeball_center_{eye}'] = eyeball_center
-
-        # Combine both eyes for final gaze
-        combined_input = torch.cat([
-            results['visual_axis_left'],
-            results['visual_axis_right'],
-            results['eyeball_center_left'],
-            results['eyeball_center_right']
-        ], dim=1)
-
-        gaze_vector = F.normalize(self.gaze_combiner(combined_input), dim=1)
-        results['gaze_vector'] = gaze_vector
-
-        # Ray origin (mean of eyeball centers)
-        ray_origin = (results['eyeball_center_left'] + results['eyeball_center_right']) / 2
-        results['ray_origin'] = ray_origin
-        results['ray_direction'] = gaze_vector
-
-        # Estimate gaze depth
-        depth_input = torch.cat([
-            gaze_vector,
-            ray_origin,
-            results['eyeball_center_left'],
-            results['eyeball_center_right']
-        ], dim=1)
-        gaze_depth = self.depth_estimator(depth_input).squeeze(-1)
-        results['gaze_depth'] = gaze_depth
-
-        # Compute 3D gaze point
-        results['gaze_point_3d'] = ray_origin + gaze_depth.unsqueeze(-1) * gaze_vector
-
-        return results
-
-
-class RayNet(nn.Module):
-    """
-    Eye-focused RayNet for 3D eyeball/iris reconstruction and gaze estimation
-    """
-
-    def __init__(self,
-                 backbone,
-                 in_channels_list,
-                 n_iris_landmarks: int = 100,
-                 panet_out_channels: int = 256):
-        super().__init__()
-
-        # Visual backbone
-        self.backbone = backbone
-
-        # Feature pyramid network
-        from panet import PANet
-        from fusion import MultiScaleFusion
-        self.panet = PANet(channels_list=in_channels_list, out_channels=panet_out_channels)
-        self.fusion = MultiScaleFusion(in_channels=panet_out_channels, n_scales=4, out_channels=256)
-
-        # Global feature encoder
-        self.global_encoder = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(256, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(512, 256)
-        )
-
-        # Eyeball reconstruction (both eyes)
-        self.left_eyeball = EyeballModel(input_dim=256)
-        self.right_eyeball = EyeballModel(input_dim=256)
-
-        # Iris mesh decoder
-        self.iris_decoder = IrisMeshDecoder(input_dim=256, n_landmarks=n_iris_landmarks)
-
-        # Gaze ray estimator
-        self.gaze_estimator = GazeRayEstimator(hidden_dim=128)
-
-        # Head pose regressor (for completeness)
-        self.head_pose_regressor = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, 6)  # 6D rotation representation
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels, hidden), nn.ReLU(True),
+            nn.Linear(hidden, hidden), nn.ReLU(True),
+            nn.Linear(hidden, 6 + 3 + 1 + 2)
         )
 
     def forward(self, x):
-        """
-        Forward pass
-        Args:
-            x: (B, 3, H, W) input images
-        Returns:
-            dict with all outputs
-        """
-        # Extract visual features
-        from torch.utils.checkpoint import checkpoint
+        x = self.pool(x).flatten(1)
+        y = self.mlp(x)
+        rot6d = y[:, 0:6]
+        cx = 10.0 * torch.tanh(y[:, 6:7])                 # [-10,10] cm
+        cy = 10.0 * torch.tanh(y[:, 7:8])
+        cz = 50.0 * torch.tanh(y[:, 8:9]) + 70.0          # [20,120] cm
+        globe_center = torch.cat([cx, cy, cz], dim=1)
+        iris_offset  = torch.sigmoid(y[:, 9:10])          # (0,1) → multiply by radius later
+        kappa_deg    = 8.0 * torch.tanh(y[:, 10:12])      # [-8,+8]°
+        return rot6d, globe_center, iris_offset, kappa_deg
+
+
+class Iris2DHead(nn.Module):
+    """
+    Predicts per-eye 2D iris ring (100 points) in normalized image coords [-1,1],
+    scaled to pixels using input H,W.
+    """
+    def __init__(self, in_ch: int, n_pts: int = 100, hidden: int = 128):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_ch, hidden), nn.ReLU(True),
+            nn.Linear(hidden, hidden), nn.ReLU(True),
+            nn.Linear(hidden, 2 * n_pts * 2)  # (L/R) * points * (x,y)
+        )
+        self.n_pts = n_pts
+
+    def forward(self, x, H: int, W: int):
+        b = x.size(0)
+        y = self.pool(x).flatten(1)
+        y = self.fc(y).view(b, 2, self.n_pts, 2)
+        y = torch.tanh(y)
+        u = (y[..., 0] + 1.0) * 0.5 * (W - 1)
+        v = (y[..., 1] + 1.0) * 0.5 * (H - 1)
+        return torch.stack([u, v], dim=-1)  # [B,2,N,2] in pixels
+
+
+# -----------------------------
+# RayNet (CoordAtt-only + MediaPipe depth)
+# -----------------------------
+class RayNet(nn.Module):
+    def __init__(self, backbone, in_channels_list, n_iris_points: int = 100, reduction: int = 32):
+        super().__init__()
+        self.backbone = backbone
+        self.n_iris_points = n_iris_points
+
+        # Minimal neck on c4 (keep attr name 'fusion' for GradNorm)
+        c4_ch = in_channels_list[-1]
+        self.fusion = CoordNeck(c4_ch, out_ch=256, reduction=reduction)
+
+        # Heads
+        self.head_pose_regression   = GlobalRegHead(256, 6, use_coord_att=True, reduction=reduction)
+        self.gaze_vector_regression = GlobalRegHead(256, 6)
+        self.eye_left  = EyeParamHead(256)
+        self.eye_right = EyeParamHead(256)
+        self.iris2d_head = Iris2DHead(256, n_pts=n_iris_points)
+
+        # Geometry buffers
+        self.register_buffer("unit_ring",
+            make_unit_ring(n_iris_points, device=torch.device("cpu"), dtype=torch.float32),
+            persistent=False)
+
+    # backbone: only c4
+    def _forward_backbone(self, x: torch.Tensor):
         c0 = checkpoint(self.backbone.stem, x)
         c1 = checkpoint(self.backbone.stages[0], c0)
         c2 = checkpoint(self.backbone.stages[1], c1)
         c3 = checkpoint(self.backbone.stages[2], c2)
         c4 = checkpoint(self.backbone.stages[3], c3)
+        return c4
 
-        features = [c1, c2, c3, c4]
-        panet_features = self.panet(features)
-        fused = self.fusion(panet_features)
+    def _eye_geometry(self, rot6d, globe_center, iris_offset_alpha, kappa_deg, iris_radius_cm, device):
+        """
+        Build per-eye geometry in CCS (cm), using identity iris radius (cm).
+        """
+        B = rot6d.shape[0]
+        R = ortho6d_to_rotmat(rot6d)                               # [B,3,3]
+        z_axis = torch.tensor([0,0,1.0], device=device).view(1,3,1).repeat(B,1,1)
+        optic = F.normalize(torch.bmm(R, z_axis).squeeze(-1), dim=1)  # [B,3]
 
-        # Global encoding
-        global_features = self.global_encoder(fused)
+        # If eyeball radius available, limit offset to [0, radius]
+        # iris_offset_alpha \in (0,1) from head; multiply by radius proxy
+        # Use iris radius as a proxy scale if eyeball radius not passed here
+        offset_cm = iris_offset_alpha  # later multiplied externally if eyeball radius available
 
-        # Reconstruct eyeballs
-        left_eyeball = self.left_eyeball(global_features)
-        right_eyeball = self.right_eyeball(global_features)
+        # Visual axis = small yaw/pitch from optic
+        yaw  = torch.deg2rad(kappa_deg[:, 0]);  pitch = torch.deg2rad(kappa_deg[:, 1])
+        cy, sy = torch.cos(yaw), torch.sin(yaw)
+        cp, sp = torch.cos(pitch), torch.sin(pitch)
+        Rk = torch.stack([
+            torch.stack([ cy, 0*cy,  sy], dim=1),
+            torch.stack([ 0*cy,  cp, -sp], dim=1),
+            torch.stack([-sy,  sp,  cy], dim=1),
+        ], dim=1)
+        visual = F.normalize(torch.einsum('bij,bj->bi', Rk, optic), dim=1)
 
-        # Combine eyeball information
-        eyeball_info = {
-            'center': torch.stack([left_eyeball['center'], right_eyeball['center']], dim=1),
-            'radius': (left_eyeball['radius'] + right_eyeball['radius']) / 2,
-            'left': left_eyeball,
-            'right': right_eyeball
+        # Ring in eye-local (XY plane), radius = iris_radius_cm
+        ring_local = self.unit_ring.to(device).unsqueeze(0).repeat(B,1,1)
+        ring_local[:, :, :2] *= iris_radius_cm.view(B,1,1)
+
+        return {
+            "R": R,
+            "optic": optic,
+            "visual": visual,
+            "globe_center": globe_center,
+            "offset_alpha": offset_cm,   # (0,1), multiply outside
+            "ring_local": ring_local,    # [B,N,3] in eye-local
         }
 
-        # Decode iris mesh and pupil centers
-        iris_output = self.iris_decoder(global_features, eyeball_info)
+    def forward(self, x: torch.Tensor, K: Dict = None, identity: Dict = None) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            x: [B,3,H,W]
+            K: {'fx': [B] or [B,2]}  focal length(s) in pixels
+            identity:
+              - 'iris_diam_cm': [B] or [B,2]
+              - 'eyeball_radius_cm': [B,2] (optional, used for rendering/offset)
+        """
+        assert K is not None and identity is not None, "Please pass K (fx px) and identity (iris_diam_cm, ...)."
+        B, _, H, W = x.shape
 
-        # Estimate gaze rays
-        gaze_output = self.gaze_estimator(iris_output, eyeball_info)
+        # features
+        c4 = self._forward_backbone(x)
+        feats = self.fusion(c4)
 
-        # Head pose
-        head_pose_6d = self.head_pose_regressor(global_features)
+        # iris 2D for analytic depth
+        iris2d_px = self.iris2d_head(feats, H, W)  # [B,2,N,2]
 
-        # Compile outputs
-        outputs = {
-            # Eyeball reconstruction
-            'eyeball_left': left_eyeball,
-            'eyeball_right': right_eyeball,
-            'eyeball_centers': torch.stack([left_eyeball['center'], right_eyeball['center']], dim=1),
+        # gaze direction from 6D
+        gaze_vec6d = self.gaze_vector_regression(feats)
+        Rg = ortho6d_to_rotmat(gaze_vec6d)
+        direction = F.normalize(Rg[:, :, 2], dim=1)  # [B,3]
 
-            # Iris and pupil
-            'iris_landmarks': iris_output['iris_landmarks'],
-            'pupil_centers': iris_output['pupil_centers'],
-            'iris_shape_params': iris_output['iris_shape_params'],
+        # per-eye params (pose/center/offset/kappa)
+        Lp = self.eye_left(feats)
+        Rp = self.eye_right(feats)
 
-            # Gaze outputs
-            **gaze_output,
+        # identity sizes
+        iris_diam_cm = identity["iris_diam_cm"]  # [B] or [B,2]
+        if iris_diam_cm.ndim == 1:
+            iris_radius_L = iris_radius_R = iris_diam_cm * 0.5
+        else:
+            iris_radius_L = iris_diam_cm[:, 0] * 0.5
+            iris_radius_R = iris_diam_cm[:, 1] * 0.5
 
-            # Head pose
-            'head_pose_6d': head_pose_6d,
+        eyeball_radius_cm = identity.get("eyeball_radius_cm", None)  # [B,2] if provided
 
-            # For compatibility with existing training code
-            'pupil_center_3d': torch.stack([
-                iris_output['pupil_centers']['left'],
-                iris_output['pupil_centers']['right']
-            ], dim=1),
-            'origin': gaze_output['ray_origin'],
-            'direction': gaze_output['ray_direction'],
-            'gaze_vector_normalized': gaze_output['gaze_vector'],
-            'gaze_point_from_ray': gaze_output['gaze_point_3d']
+        # left/right geometry (eye-local)
+        geoL = self._eye_geometry(Lp[0], Lp[1], Lp[2], Lp[3], iris_radius_L, x.device)
+        geoR = self._eye_geometry(Rp[0], Rp[1], Rp[2], Rp[3], iris_radius_R, x.device)
+
+        # Compute absolute centers for iris plane (pupil centers) using offsets
+        if eyeball_radius_cm is not None:
+            offL = geoL["offset_alpha"].squeeze(-1) * eyeball_radius_cm[:, 0]
+            offR = geoR["offset_alpha"].squeeze(-1) * eyeball_radius_cm[:, 1]
+        else:
+            # fallback: scale by iris radius (keeps magnitude reasonable)
+            offL = geoL["offset_alpha"].squeeze(-1) * iris_radius_L
+            offR = geoR["offset_alpha"].squeeze(-1) * iris_radius_R
+
+        iris_center_L = geoL["globe_center"] + geoL["optic"] * offL.unsqueeze(-1)  # [B,3]
+        iris_center_R = geoR["globe_center"] + geoR["optic"] * offR.unsqueeze(-1)  # [B,3]
+
+        # Rotate iris rings to CCS
+        ringL = torch.einsum('bij,bnj->bni', geoL["R"], geoL["ring_local"]) + iris_center_L.unsqueeze(1)
+        ringR = torch.einsum('bij,bnj->bni', geoR["R"], geoR["ring_local"]) + iris_center_R.unsqueeze(1)
+
+        pupil_centers = torch.stack([iris_center_L, iris_center_R], dim=1)    # [B,2,3]
+        origin = pupil_centers.mean(dim=1)                                    # [B,3]
+
+        # --- analytic depth from iris (MediaPipe) ---
+        depth_cm = depth_from_iris_cm(iris2d_px, K["fx"], identity["iris_diam_cm"])  # [B]
+
+        # gaze point (hard)
+        gaze_point = origin + depth_cm.unsqueeze(-1) * direction
+
+        # optional head pose (if supervised)
+        head_pose_6d = self.head_pose_regression(feats)
+
+        # if eyeball radius provided, expose it; else put a proxy (NaN-safe)
+        if eyeball_radius_cm is None:
+            eyeball_radius_out = torch.stack([iris_radius_L, iris_radius_R], dim=1) * 2.2  # loose proxy
+        else:
+            eyeball_radius_out = eyeball_radius_cm
+
+        return {
+            "head_pose_6d": head_pose_6d,
+            "gaze_vector_6d": gaze_vec6d,
+            "gaze_vector_normalized": direction,
+            "origin": origin,
+            "direction": direction,
+            "gaze_depth": depth_cm,                                # cm
+            "gaze_point_3d": gaze_point,
+            "gaze_point_from_ray": gaze_point,
+            "pupil_center_3d": pupil_centers,                      # [B,2,3] cm
+            "iris2d_px": iris2d_px,                                # [B,2,N,2] px
+            "iris_mesh_3d": torch.stack([ringL, ringR], dim=1),    # [B,2,N,3] cm
+            "eyeball_center_3d": torch.stack([geoL["globe_center"], geoR["globe_center"]], dim=1),
+            "eyeball_radius_cm": eyeball_radius_out,               # [B,2] cm
+            "optic_axis_eyes": torch.stack([geoL["optic"], geoR["optic"]], dim=1),     # [B,2,3]
+            "visual_axis_eyes": torch.stack([geoL["visual"], geoR["visual"]], dim=1),  # [B,2,3]
+            "fused": feats,
         }
-
-        return outputs
-
-    def cast_ray_to_plane(self, ray_origin, ray_direction, plane_point, plane_normal):
-        """
-        Cast ray to intersect with a plane (e.g., screen)
-        """
-        if plane_point.dim() == 1:
-            plane_point = plane_point.unsqueeze(0).expand_as(ray_origin)
-        if plane_normal.dim() == 1:
-            plane_normal = plane_normal.unsqueeze(0).expand_as(ray_origin)
-
-        numerator = torch.sum(plane_normal * (plane_point - ray_origin), dim=1)
-        denominator = torch.sum(plane_normal * ray_direction, dim=1)
-
-        t = numerator / (denominator + 1e-8)
-        t = torch.clamp(t, min=0)
-
-        intersection_points = ray_origin + t.unsqueeze(-1) * ray_direction
-
-        return intersection_points, t
-
-
-# Example usage
-if __name__ == '__main__':
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-    # Mock backbone for testing
-    class MockBackbone:
-        class Stage(nn.Module):
-            def __init__(self, in_c, out_c):
-                super().__init__()
-                self.conv = nn.Conv2d(in_c, out_c, 3, 2, 1)
-
-            def forward(self, x):
-                return self.conv(x)
-
-        def __init__(self):
-            self.stem = MockBackbone.Stage(3, 64)
-            self.stages = nn.ModuleList([
-                MockBackbone.Stage(64, 64),
-                MockBackbone.Stage(64, 128),
-                MockBackbone.Stage(128, 256),
-                MockBackbone.Stage(256, 512)
-            ])
-
-
-    backbone = MockBackbone().to(device)
-    in_channels_list = [64, 128, 256, 512]
-
-    model = RayNet(
-        backbone=backbone,
-        in_channels_list=in_channels_list,
-        n_iris_landmarks=100,
-        panet_out_channels=256
-    ).to(device)
-
-    # Test forward pass
-    x = torch.randn(2, 3, 448, 448).to(device)
-    outputs = model(x)
-
-    print("RayNet outputs:")
-    for key, val in outputs.items():
-        if isinstance(val, torch.Tensor):
-            print(f"  {key}: {val.shape}")
-        elif isinstance(val, dict):
-            print(f"  {key}:")
-            for k, v in val.items():
-                if isinstance(v, torch.Tensor):
-                    print(f"    {k}: {v.shape}")
-
-    # Test ray casting
-    screen_point = torch.tensor([0, 0, 500], dtype=torch.float32).to(device)
-    screen_normal = torch.tensor([0, 0, 1], dtype=torch.float32).to(device)
-
-    intersection, depth = model.cast_ray_to_plane(
-        outputs['ray_origin'],
-        outputs['ray_direction'],
-        screen_point,
-        screen_normal
-    )
-    print(f"\nScreen intersection: {intersection.shape}")
-    print(f"Depth to screen: {depth}")
