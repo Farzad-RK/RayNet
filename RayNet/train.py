@@ -4,18 +4,25 @@ import csv
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
-
 import numpy as np
 
-# Import our enhanced components
-from raynet import create_raynet_model, RayNetLoss, compute_metrics
+try:
+    from raynet import create_raynet_model, RayNetLoss, compute_enhanced_metrics
+    ENHANCED_MODEL = True
+except ImportError:
+    print("Warning: Enhanced RayNet integration not found, using basic training")
+    from raynet import RayNet
+    from backbone.repnext_utils import load_pretrained_repnext
+    ENHANCED_MODEL = False
+
 from dataset import GazeGeneDataset, EnhancedMultiViewBatchSampler
+from head_pose.loss import multiview_headpose_losses
 
 from collections import defaultdict
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="RayNet Training with Iris Mesh Regression")
+    parser = argparse.ArgumentParser(description="Enhanced RayNet Training with Iris Mesh Regression")
     parser.add_argument('--base_dir', type=str, required=True, help="Root of GazeGene dataset")
     parser.add_argument('--backbone_name', type=str, default="repnext_m3")
     parser.add_argument('--weight_path', type=str, default="./repnext_m3_pretrained.pt")
@@ -145,14 +152,17 @@ class RunningNormalizer:
 
 
 def create_datasets_and_loaders(args):
-    """Create datasets and loaders."""
+    """Create enhanced datasets and loaders."""
     if args.split == "train":
-        train_subjects = list(range(1, 47))  # Subjects 1-46
-        val_subjects = list(range(47, 57))  # Subjects 47-56
+        # Use string format like original dataset expects
+        train_subjects = [f"subject{i}" for i in range(1, 47)]  # Subjects 1-46
+        val_subjects = [f"subject{i}" for i in range(47, 57)]  # Subjects 47-56
     else:
         # For testing, use the official test split
-        train_subjects = list(range(47, 57))
+        train_subjects = [f"subject{i}" for i in range(47, 57)]
         val_subjects = None
+
+    print(f"Loading training subjects: {train_subjects[:5]}...{train_subjects[-5:]}")
 
     # Training dataset
     train_dataset = GazeGeneDataset(
@@ -182,6 +192,7 @@ def create_datasets_and_loaders(args):
     # Validation dataset (if available)
     val_loader = None
     if val_subjects is not None:
+        print(f"Loading validation subjects: {val_subjects[:3]}...{val_subjects[-3:]}")
         val_dataset = GazeGeneDataset(
             base_dir=args.base_dir,
             subject_ids=val_subjects,
@@ -204,6 +215,26 @@ def create_datasets_and_loaders(args):
             num_workers=args.num_workers,
             pin_memory=True
         )
+
+    print(f"Dataset statistics:")
+    print(f"  Training samples: {len(train_dataset)}")
+    if val_loader:
+        print(f"  Validation samples: {len(val_loader.dataset)}")
+
+    # Debug: Print some dataset info
+    if len(train_dataset) > 0:
+        sample = train_dataset[0]
+        print(f"  Sample keys: {list(sample.keys())}")
+        print(f"  Image shape: {sample['img'].shape}")
+        if 'mesh' in sample:
+            print(f"  3D mesh keys: {list(sample['mesh'].keys())}")
+            print(f"  Iris mesh 3D shape: {sample['mesh']['iris_mesh_3D'].shape}")
+    else:
+        print("  WARNING: No training samples found!")
+        print(f"  Base directory exists: {os.path.exists(args.base_dir)}")
+        if os.path.exists(args.base_dir):
+            subdirs = [d for d in os.listdir(args.base_dir) if os.path.isdir(os.path.join(args.base_dir, d))]
+            print(f"  Subdirectories found: {subdirs[:10]}")
 
     return train_loader, val_loader
 
@@ -233,7 +264,6 @@ def train_step(model, batch, loss_fn, optimizer, args, device):
 
     # Extract data from batch
     images = batch['img'].to(device)  # [B*9, 3, H, W]
-    intrinsics = batch['intrinsic'].to(device)  # [B*9, 3, 3]
 
     # Get batch size (accounting for 9 views per sample)
     total_batch_size = images.shape[0]
@@ -241,35 +271,50 @@ def train_step(model, batch, loss_fn, optimizer, args, device):
 
     # Reshape for multi-view processing
     images = images.view(B * 9, *images.shape[1:])
-    intrinsics = intrinsics.view(B * 9, *intrinsics.shape[1:])
 
-    # Forward pass
-    predictions = model(
-        images,
-        intrinsic_matrix=intrinsics,
-        image_size=tuple(args.image_size)
-    )
+    # Forward pass - handle both enhanced and basic models
+    if ENHANCED_MODEL and hasattr(model, 'iris_mesh_regression'):
+        # Enhanced model with iris mesh regression
+        intrinsics = batch['intrinsic'].to(device)  # [B*9, 3, 3]
+        intrinsics = intrinsics.view(B * 9, *intrinsics.shape[1:])
 
-    # Reshape predictions for multi-view loss computation
-    for key in predictions:
-        if torch.is_tensor(predictions[key]):
-            if key == "head_pose_6d":
-                predictions[key] = predictions[key].view(B, 9, -1)
-            elif "iris_mesh" in key:
-                predictions[key] = predictions[key].view(B, 9, *predictions[key].shape[1:])
-            elif key == "pupil_centers_3d":
-                predictions[key] = predictions[key].view(B, 9, *predictions[key].shape[1:])
+        predictions = model(
+            images,
+            intrinsic_matrix=intrinsics,
+            image_size=tuple(args.image_size)
+        )
 
-    # Prepare targets (ensure consistent shapes)
-    targets = batch.copy()
-    for key in ['mesh', 'head_pose']:
-        if key in targets:
-            for subkey in targets[key]:
-                if torch.is_tensor(targets[key][subkey]):
-                    targets[key][subkey] = targets[key][subkey].view(B, 9, *targets[key][subkey].shape[1:])
+        # Reshape predictions for multi-view loss computation
+        for key in predictions:
+            if torch.is_tensor(predictions[key]):
+                if key == "head_pose_6d":
+                    predictions[key] = predictions[key].view(B, 9, -1)
+                elif "iris_mesh" in key:
+                    predictions[key] = predictions[key].view(B, 9, *predictions[key].shape[1:])
+                elif key == "pupil_centers_3d":
+                    predictions[key] = predictions[key].view(B, 9, *predictions[key].shape[1:])
 
-    # Add image size to targets for 2D normalization
-    targets['image_size'] = tuple(args.image_size)
+        # Prepare targets (ensure consistent shapes)
+        targets = batch.copy()
+        for key in ['mesh', 'head_pose']:
+            if key in targets:
+                for subkey in targets[key]:
+                    if torch.is_tensor(targets[key][subkey]):
+                        targets[key][subkey] = targets[key][subkey].view(B, 9, *targets[key][subkey].shape[1:])
+
+        # Add image size to targets for 2D normalization
+        targets['image_size'] = tuple(args.image_size)
+
+    else:
+        # Basic model - original RayNet
+        predictions = model(images)
+
+        # Prepare targets for basic loss
+        targets = {
+            'head_pose': {
+                'R': batch['head_pose']['R'].to(device)
+            }
+        }
 
     # Compute loss
     total_loss, individual_losses = loss_fn(predictions, targets)
@@ -284,7 +329,21 @@ def train_step(model, batch, loss_fn, optimizer, args, device):
 
     # Compute metrics
     with torch.no_grad():
-        metrics = compute_metrics(predictions, targets)
+        if ENHANCED_MODEL:
+            metrics = compute_enhanced_metrics(predictions, targets)
+        else:
+            # Basic metrics - just head pose error
+            metrics = {}
+            if "head_pose_6d" in predictions:
+                from utils import ortho6d_to_rotmat
+                pred_rotmat = ortho6d_to_rotmat(predictions["head_pose_6d"].view(-1, 6))
+                gt_rotmat = targets["head_pose"]["R"].view(-1, 3, 3)
+
+                trace = torch.sum(pred_rotmat * gt_rotmat, dim=(1, 2))
+                cos_angle = (trace - 1) / 2
+                cos_angle = torch.clamp(cos_angle, -1, 1)
+                angle_error = torch.acos(cos_angle) * 180 / 3.14159
+                metrics['head_pose_error_deg'] = torch.mean(angle_error)
 
     return {
         'total_loss': total_loss.item(),
@@ -339,7 +398,7 @@ def validate_step(model, val_loader, loss_fn, args, device):
 
             # Compute loss and metrics
             total_loss, individual_losses = loss_fn(predictions, targets)
-            metrics = compute_metrics(predictions, targets)
+            metrics = compute_enhanced_metrics(predictions, targets)
 
             # Accumulate results
             val_losses['total'].append(total_loss.item())
@@ -371,7 +430,22 @@ def main():
 
     # Create model
     print("Creating model...")
-    model = create_raynet_model(args.backbone_name, args.weight_path)
+    if ENHANCED_MODEL:
+        model = create_raynet_model(args.backbone_name, args.weight_path)
+    else:
+        print("Using fallback basic RayNet model")
+        # Fallback to basic model creation
+        backbone_channels_dict = {
+            'repnext_m0': [40, 80, 160, 320],
+            'repnext_m1': [48, 96, 192, 384],
+            'repnext_m2': [56, 112, 224, 448],
+            'repnext_m3': [64, 128, 256, 512],
+            'repnext_m4': [64, 128, 256, 512],
+            'repnext_m5': [80, 160, 320, 640],
+        }
+        backbone = load_pretrained_repnext(args.backbone_name, args.weight_path)
+        in_channels_list = backbone_channels_dict[args.backbone_name]
+        model = RayNet(backbone, in_channels_list, panet_out_channels=256).to(device)
 
     # Progressive training scheduler
     progressive_scheduler = None
@@ -380,12 +454,32 @@ def main():
         print("Using progressive training strategy")
 
     # Create loss function
-    iris_loss_config = get_loss_config(args, epoch=0, progressive_scheduler=progressive_scheduler)
-    loss_fn = RayNetLoss(
-        head_pose_weight=args.head_pose_weight,
-        iris_mesh_weight=args.iris_mesh_weight,
-        iris_loss_config=iris_loss_config
-    )
+    if ENHANCED_MODEL:
+        iris_loss_config = get_loss_config(args, epoch=0, progressive_scheduler=progressive_scheduler)
+        loss_fn = RayNetLoss(
+            head_pose_weight=args.head_pose_weight,
+            iris_mesh_weight=args.iris_mesh_weight,
+            iris_loss_config=iris_loss_config
+        )
+    else:
+        # Fallback: use only head pose loss
+        def basic_loss_fn(predictions, targets):
+            # Simple head pose loss only
+            if "head_pose_6d" in predictions and "head_pose" in targets:
+                pred_6d = predictions["head_pose_6d"]
+                gt_rotmat = targets["head_pose"]["R"]
+
+                B = pred_6d.shape[0] // 9
+                pred_6d = pred_6d.view(B, 9, 6)
+                gt_rotmat = gt_rotmat.view(B, 9, 3, 3)
+
+                head_pose_losses = multiview_headpose_losses(pred_6d, gt_rotmat)
+                total_loss = head_pose_losses['accuracy'] + 0.1 * head_pose_losses['consistency']
+                return total_loss, {'total': total_loss, **head_pose_losses}
+            else:
+                return torch.tensor(0.0, device=device), {'total': torch.tensor(0.0)}
+
+        loss_fn = basic_loss_fn
 
     # Optimizer
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
@@ -418,44 +512,71 @@ def main():
 
     # Training loop
     print("Starting training...")
+    print(f"Total epochs: {args.epochs}")
+    print(f"Steps per epoch: {len(train_loader)}")
+
+    if len(train_loader) == 0:
+        print("ERROR: No training data available! Check your dataset path and subject IDs.")
+        return
+
     for epoch in range(start_epoch, args.epochs):
         # Update loss weights for progressive training
         if progressive_scheduler:
             iris_loss_config = get_loss_config(args, epoch, progressive_scheduler)
             loss_fn.iris_loss_config = iris_loss_config
             phase = min(3, epoch // (args.epochs // 4))
-            print(f"Training phase: {phase + 1}/4")
+            print(f"Epoch {epoch + 1}/{args.epochs} - Training phase: {phase + 1}/4")
         else:
             phase = 0
+            print(f"Epoch {epoch + 1}/{args.epochs}")
 
         # Training
         epoch_losses = defaultdict(list)
         epoch_metrics = defaultdict(list)
 
+        num_batches = 0
         for step, batch in enumerate(train_loader):
-            result = train_step(model, batch, loss_fn, optimizer, args, device)
+            try:
+                result = train_step(model, batch, loss_fn, optimizer, args, device)
 
-            # Accumulate results
-            for k, v in result['losses'].items():
-                epoch_losses[k].append(v)
-            for k, v in result['metrics'].items():
-                epoch_metrics[k].append(v)
+                # Accumulate results
+                for k, v in result['losses'].items():
+                    epoch_losses[k].append(v)
+                for k, v in result['metrics'].items():
+                    epoch_metrics[k].append(v)
 
-            # Log progress
-            if (step + 1) % 10 == 0:
-                print(f"Epoch {epoch + 1}/{args.epochs} | Step {step + 1}/{len(train_loader)} | "
-                      f"Loss: {result['total_loss']:.4f} | "
-                      f"3D Error: {result['metrics'].get('iris_mesh_3d_l2_error', 0):.4f}")
+                num_batches += 1
+
+                # Log progress
+                if (step + 1) % 10 == 0:
+                    print(f"  Step {step + 1}/{len(train_loader)} | "
+                          f"Loss: {result['total_loss']:.4f} | "
+                          f"3D Error: {result['metrics'].get('iris_mesh_3d_l2_error', 0):.4f}")
+
+            except Exception as e:
+                print(f"Error in training step {step}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        if num_batches == 0:
+            print(f"WARNING: No successful training steps in epoch {epoch}")
+            continue
+
+        print(f"Completed {num_batches} training steps")
 
         # Validation
         val_losses, val_metrics = {}, {}
         if val_loader:
+            print("Running validation...")
             val_losses, val_metrics = validate_step(model, val_loader, loss_fn, args, device)
             print(f"Validation - Total Loss: {val_losses['total']:.4f} | "
                   f"3D Error: {val_metrics.get('iris_mesh_3d_l2_error', 0):.4f}")
 
-        # Update learning rate
+        # Update learning rate (after optimizer.step())
         scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Learning rate: {current_lr:.6f}")
 
         # Log to CSV
         log_dict = {
@@ -485,7 +606,7 @@ def main():
 
         # Save checkpoint
         if (epoch + 1) % args.checkpoint_freq == 0 or (epoch + 1) == args.epochs:
-            ckpt_path = os.path.join(args.checkpoint_dir, f"raynet_epoch{epoch + 1}.pth")
+            ckpt_path = os.path.join(args.checkpoint_dir, f"enhanced_raynet_epoch{epoch + 1}.pth")
             torch.save({
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),

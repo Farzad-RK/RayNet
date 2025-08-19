@@ -71,51 +71,96 @@ class GazeGeneDataset(Dataset):
                 if os.path.exists(camera_path):
                     with open(camera_path, 'rb') as f:
                         camera_info = pickle.load(f)
-                    self.camera_params[subj_num] = camera_info
+
+                    # Convert list to dictionary indexed by camera ID
+                    if isinstance(camera_info, list):
+                        camera_dict = {}
+                        for cam_data in camera_info:
+                            if isinstance(cam_data, dict) and 'cam_id' in cam_data:
+                                camera_dict[cam_data['cam_id']] = cam_data
+                        self.camera_params[subj_num] = camera_dict
+                    else:
+                        # Assume it's already a dictionary
+                        self.camera_params[subj_num] = camera_info
 
     def _load_samples(self, base_dir, subject_ids, camera_ids, samples_per_subject):
         """Load all samples with full annotations."""
-        subjects = subject_ids if subject_ids else sorted([
-            d for d in os.listdir(base_dir) if d.startswith('subject')
-        ])
+        if subject_ids is None:
+            subjects = sorted([d for d in os.listdir(base_dir) if d.startswith('subject')])
+        else:
+            # Handle both string and integer subject IDs
+            if isinstance(subject_ids[0], int):
+                subjects = [f"subject{i}" for i in subject_ids]
+            else:
+                subjects = subject_ids
+
+        print(
+            f"Processing {len(subjects)} subjects: {subjects[:3]}...{subjects[-3:] if len(subjects) > 3 else subjects}")
 
         for subject in subjects:
+            if not os.path.exists(os.path.join(base_dir, subject)):
+                print(f"Warning: Subject directory {subject} not found, skipping...")
+                continue
+
             subj_num = int(subject.replace('subject', ''))
             label_dir = os.path.join(base_dir, subject, 'labels')
+
+            if not os.path.exists(label_dir):
+                print(f"Warning: Labels directory not found for {subject}, skipping...")
+                continue
 
             # Load labels for all cameras
             complex_labels = {}
             gaze_labels = {}
 
             camera_list = camera_ids if camera_ids is not None else range(9)
-            for cam_id in camera_list:
-                cstr = f'camera{cam_id}'
+            labels_loaded = 0
 
+            for cam_id in camera_list:
                 # Load complex labels (3D eyeball annotations)
-                complex_path = os.path.join(label_dir, f'complex_label_{cstr}.pkl')
+                complex_path = os.path.join(label_dir, f'complex_label_camera{cam_id}.pkl')
                 if os.path.exists(complex_path):
-                    with open(complex_path, 'rb') as f:
-                        complex_labels[cam_id] = pickle.load(f)
+                    try:
+                        with open(complex_path, 'rb') as f:
+                            complex_labels[cam_id] = pickle.load(f)
+                        labels_loaded += 1
+                    except Exception as e:
+                        print(f"Error loading {complex_path}: {e}")
+                        continue
+                else:
+                    print(f"Warning: {complex_path} not found")
 
                 # Load gaze labels (gaze directions and head poses)
-                gaze_path = os.path.join(label_dir, f'gaze_label_{cstr}.pkl')
+                gaze_path = os.path.join(label_dir, f'gaze_label_camera{cam_id}.pkl')
                 if os.path.exists(gaze_path):
-                    with open(gaze_path, 'rb') as f:
-                        gaze_labels[cam_id] = pickle.load(f)
+                    try:
+                        with open(gaze_path, 'rb') as f:
+                            gaze_labels[cam_id] = pickle.load(f)
+                    except Exception as e:
+                        print(f"Error loading {gaze_path}: {e}")
+                        continue
+                else:
+                    print(f"Warning: {gaze_path} not found")
 
             if not complex_labels or not gaze_labels:
+                print(f"Warning: No valid labels found for {subject}, skipping...")
                 continue
+
+            print(f"Loaded labels for {subject}: {labels_loaded} cameras")
 
             # Determine number of frames
             num_frames = len(complex_labels[list(complex_labels.keys())[0]]['img_path'])
+            print(f"  {num_frames} frames available")
 
             # Sample frames if specified
             if samples_per_subject is not None:
                 frame_idxs = random.sample(range(num_frames), min(samples_per_subject, num_frames))
+                print(f"  Sampling {len(frame_idxs)} frames")
             else:
                 frame_idxs = range(num_frames)
 
             # Create samples for each frame and camera
+            samples_created = 0
             for idx in frame_idxs:
                 for cam_id in camera_list:
                     if cam_id not in complex_labels or cam_id not in gaze_labels:
@@ -124,6 +169,11 @@ class GazeGeneDataset(Dataset):
                     complex_label = complex_labels[cam_id]
                     gaze_label = gaze_labels[cam_id]
 
+                    # Check if image path exists
+                    img_path = os.path.join(base_dir, subject, complex_label['img_path'][idx])
+                    if not os.path.exists(img_path):
+                        continue
+
                     sample = self._create_sample(
                         base_dir, subject, subj_num, cam_id, idx,
                         complex_label, gaze_label
@@ -131,6 +181,11 @@ class GazeGeneDataset(Dataset):
 
                     self.samples.append(sample)
                     self.index_by_key[(subj_num, idx)].append(len(self.samples) - 1)
+                    samples_created += 1
+
+            print(f"  Created {samples_created} samples for {subject}")
+
+        print(f"Total samples created: {len(self.samples)}")
 
     def _create_sample(self, base_dir, subject, subj_num, cam_id, idx, complex_label, gaze_label):
         """Create a single sample with all annotations."""
