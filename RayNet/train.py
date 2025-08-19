@@ -3,24 +3,19 @@ import os
 import csv
 import torch
 import torch.optim as optim
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 import numpy as np
 
 # Import our enhanced components
-from raynet_integration import create_raynet_model, RayNetLoss, compute_enhanced_metrics
-from enhanced_dataset import GazeGeneDataset, EnhancedMultiViewBatchSampler
-
-from head_pose.loss import multiview_headpose_losses
-from iris_mesh.loss import enhanced_iris_mesh_loss
+from raynet import create_raynet_model, RayNetLoss, compute_metrics
+from dataset import GazeGeneDataset, EnhancedMultiViewBatchSampler
 
 from collections import defaultdict
-import torch.nn as nn
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Enhanced RayNet Training with Iris Mesh Regression")
+    parser = argparse.ArgumentParser(description="RayNet Training with Iris Mesh Regression")
     parser.add_argument('--base_dir', type=str, required=True, help="Root of GazeGene dataset")
     parser.add_argument('--backbone_name', type=str, default="repnext_m3")
     parser.add_argument('--weight_path', type=str, default="./repnext_m3_pretrained.pt")
@@ -150,7 +145,7 @@ class RunningNormalizer:
 
 
 def create_datasets_and_loaders(args):
-    """Create enhanced datasets and loaders."""
+    """Create datasets and loaders."""
     if args.split == "train":
         train_subjects = list(range(1, 47))  # Subjects 1-46
         val_subjects = list(range(47, 57))  # Subjects 47-56
@@ -289,7 +284,7 @@ def train_step(model, batch, loss_fn, optimizer, args, device):
 
     # Compute metrics
     with torch.no_grad():
-        metrics = compute_enhanced_metrics(predictions, targets)
+        metrics = compute_metrics(predictions, targets)
 
     return {
         'total_loss': total_loss.item(),
@@ -344,7 +339,7 @@ def validate_step(model, val_loader, loss_fn, args, device):
 
             # Compute loss and metrics
             total_loss, individual_losses = loss_fn(predictions, targets)
-            metrics = compute_enhanced_metrics(predictions, targets)
+            metrics = compute_metrics(predictions, targets)
 
             # Accumulate results
             val_losses['total'].append(total_loss.item())
@@ -490,7 +485,7 @@ def main():
 
         # Save checkpoint
         if (epoch + 1) % args.checkpoint_freq == 0 or (epoch + 1) == args.epochs:
-            ckpt_path = os.path.join(args.checkpoint_dir, f"enhanced_raynet_epoch{epoch + 1}.pth")
+            ckpt_path = os.path.join(args.checkpoint_dir, f"raynet_epoch{epoch + 1}.pth")
             torch.save({
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
