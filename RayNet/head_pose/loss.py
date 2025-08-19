@@ -28,7 +28,7 @@ class GeodesicLoss(nn.Module):
         Returns:
             mean geodesic loss (scalar)
         """
-        m = torch.bmm(m1, m2.transpose(1,2))  # [B, 3, 3]
+        m = torch.bmm(m1, m2.to(m1.device).transpose(1,2))  # [B, 3, 3]
         cos = (m[:,0,0] + m[:,1,1] + m[:,2,2] - 1) / 2
         theta = torch.acos(torch.clamp(cos, -1 + self.eps, 1 - self.eps))  # [B]
         return torch.mean(theta)

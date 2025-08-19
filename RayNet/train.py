@@ -6,14 +6,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
 
-try:
-    from raynet import create_raynet_model, RayNetLoss, compute_enhanced_metrics
-    ENHANCED_MODEL = True
-except ImportError:
-    print("Warning: Enhanced RayNet integration not found, using basic training")
-    from raynet import RayNet
-    from backbone.repnext_utils import load_pretrained_repnext
-    ENHANCED_MODEL = False
+from raynet import create_raynet_model, RayNetLoss, compute_enhanced_metrics
+
+ENHANCED_MODEL = True
 
 from dataset import GazeGeneDataset, EnhancedMultiViewBatchSampler
 from head_pose.loss import multiview_headpose_losses
@@ -295,12 +290,17 @@ def train_step(model, batch, loss_fn, optimizer, args, device):
                     predictions[key] = predictions[key].view(B, 9, *predictions[key].shape[1:])
 
         # Prepare targets (ensure consistent shapes)
-        targets = batch.copy()
+        targets = {}
         for key in ['mesh', 'head_pose']:
-            if key in targets:
-                for subkey in targets[key]:
-                    if torch.is_tensor(targets[key][subkey]):
-                        targets[key][subkey] = targets[key][subkey].view(B, 9, *targets[key][subkey].shape[1:])
+            if key in batch:
+                targets[key] = {}
+                for subkey in batch[key]:
+                    if torch.is_tensor(batch[key][subkey]):
+                        # Move to device and reshape
+                        target_tensor = batch[key][subkey].to(device)
+                        targets[key][subkey] = target_tensor.view(B, 9, *target_tensor.shape[1:])
+                    else:
+                        targets[key][subkey] = batch[key][subkey]
 
         # Add image size to targets for 2D normalization
         targets['image_size'] = tuple(args.image_size)
@@ -309,7 +309,7 @@ def train_step(model, batch, loss_fn, optimizer, args, device):
         # Basic model - original RayNet
         predictions = model(images)
 
-        # Prepare targets for basic loss
+        # Prepare targets for basic loss - MOVE TO DEVICE
         targets = {
             'head_pose': {
                 'R': batch['head_pose']['R'].to(device)
@@ -396,6 +396,21 @@ def validate_step(model, val_loader, loss_fn, args, device):
 
             targets['image_size'] = tuple(args.image_size)
 
+            if 'mesh' in targets and 'iris_mesh_3D' in targets['mesh']:
+                targets['mesh']['iris_mesh_3D'] = targets['mesh']['iris_mesh_3D'].to(device)
+
+            def move_all_to_device(obj, device):
+                if isinstance(obj, torch.Tensor):
+                    return obj.to(device)
+                elif isinstance(obj, dict):
+                    return {k: move_all_to_device(v, device) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [move_all_to_device(item, device) for item in obj]
+                else:
+                    return obj
+
+            targets = move_all_to_device(targets, device)
+
             # Compute loss and metrics
             total_loss, individual_losses = loss_fn(predictions, targets)
             metrics = compute_enhanced_metrics(predictions, targets)
@@ -466,18 +481,19 @@ def main():
         def basic_loss_fn(predictions, targets):
             # Simple head pose loss only
             if "head_pose_6d" in predictions and "head_pose" in targets:
-                pred_6d = predictions["head_pose_6d"]
-                gt_rotmat = targets["head_pose"]["R"]
+                pred_6d = predictions["head_pose_6d"]  # [B*9, 6]
+                gt_rotmat = targets["head_pose"]["R"]  # [B*9, 3, 3]
 
+                # Reshape for multi-view processing
                 B = pred_6d.shape[0] // 9
-                pred_6d = pred_6d.view(B, 9, 6)
-                gt_rotmat = gt_rotmat.view(B, 9, 3, 3)
+                pred_6d_reshaped = pred_6d.view(B, 9, 6)
+                gt_rotmat_reshaped = gt_rotmat.view(B, 9, 3, 3)
 
-                head_pose_losses = multiview_headpose_losses(pred_6d, gt_rotmat)
+                head_pose_losses = multiview_headpose_losses(pred_6d_reshaped, gt_rotmat_reshaped)
                 total_loss = head_pose_losses['accuracy'] + 0.1 * head_pose_losses['consistency']
                 return total_loss, {'total': total_loss, **head_pose_losses}
             else:
-                return torch.tensor(0.0, device=device), {'total': torch.tensor(0.0)}
+                return torch.tensor(0.0, device=device), {'total': torch.tensor(0.0, device=device)}
 
         loss_fn = basic_loss_fn
 
