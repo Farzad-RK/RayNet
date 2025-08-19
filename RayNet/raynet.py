@@ -11,8 +11,8 @@ from utils import ortho6d_to_rotmat
 
 # Import new iris mesh components
 from iris_mesh.model import IrisMeshRegressionHead
-from iris_mesh.loss import iris_mesh_loss
-from loss import multiview_headpose_losses
+from iris_mesh.loss import enhanced_iris_mesh_loss
+from head_pose.loss import multiview_headpose_losses
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -141,7 +141,7 @@ class RayNetLoss(nn.Module):
 
         # 2. Iris mesh loss (new)
         if "iris_mesh_3d" in predictions:
-            iris_total_loss, iris_losses = iris_mesh_loss(
+            iris_total_loss, iris_losses = enhanced_iris_mesh_loss(
                 predictions, targets, **self.iris_loss_config
             )
             losses['iris_total'] = iris_total_loss
