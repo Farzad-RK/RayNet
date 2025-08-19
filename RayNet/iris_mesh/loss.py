@@ -30,101 +30,48 @@ class SphericalConstraintLoss(nn.Module):
 
 
 class CircularBoundaryLoss(nn.Module):
-    """Fixed CircularBoundaryLoss that accepts the correct number of arguments"""
-
-    def __init__(self, num_boundary_points=20):
-        super().__init__()
-        self.num_boundary_points = num_boundary_points
-
-    def forward(self, predictions, targets, **kwargs):
-        """
-        Forward method that accepts variable arguments to match your calling convention
-
-        Args:
-            predictions: dict containing iris mesh predictions
-            targets: dict containing target iris data
-            **kwargs: any additional arguments passed by your loss function
-        """
+    def forward(self, iris_mesh, iris_centers, iris_radii):
         try:
-            # Extract iris mesh predictions
-            # Based on your output, iris mesh shape is [2, 100, 3]
-            if 'iris_mesh_3D' in predictions:
-                iris_mesh_pred = predictions['iris_mesh_3D']  # [B, N_points, 3]
-            elif 'iris_mesh' in predictions:
-                iris_mesh_pred = predictions['iris_mesh']
-            else:
-                # If no iris mesh found, return zero loss
-                return torch.tensor(0.0, device=next(iter(predictions.values())).device, requires_grad=True)
 
-            # Extract iris geometry (centers and radii)
-            if 'iris_geometry' in predictions:
-                iris_geometry = predictions['iris_geometry']
-            elif 'iris_centers' in predictions and 'iris_radii' in predictions:
-                iris_geometry = {
-                    'iris_centers': predictions['iris_centers'],
-                    'iris_radii': predictions['iris_radii']
-                }
-            else:
-                # Try to extract from targets
-                if 'iris_centers' in targets and 'iris_radii' in targets:
-                    iris_geometry = {
-                        'iris_centers': targets['iris_centers'],
-                        'iris_radii': targets['iris_radii']
-                    }
-                else:
-                    # Return zero loss if no geometry available
-                    return torch.tensor(0.0, device=iris_mesh_pred.device, requires_grad=True)
+            # Handle 5D input: [B, N_views, 2, 100, 3]
+            if len(iris_mesh.shape) == 5:
+                B, N_views, num_eyes, num_points, _ = iris_mesh.shape
 
-            # Check shapes and adjust if needed
-            if len(iris_mesh_pred.shape) == 3:  # [B, N_points, 3]
-                B, N_points, _ = iris_mesh_pred.shape
-                # We need to handle the case where there's no explicit "2 eyes" dimension
-                # Your data shows [2, 100, 3] which suggests 2 samples, not 2 eyes
-                # Let's treat each sample as a separate iris
+                # Reshape iris_mesh to [B*N_views, 2, 100, 3]
+                iris_mesh_reshaped = iris_mesh.view(B * N_views, num_eyes, num_points, 3)
 
-                # Create dummy centers and radii if not properly shaped
-                if 'iris_centers' not in iris_geometry:
-                    # Create default centers at origin
-                    iris_centers = torch.zeros(B, 3, device=iris_mesh_pred.device)
-                else:
-                    iris_centers = iris_geometry['iris_centers']
-                    if len(iris_centers.shape) == 3 and iris_centers.shape[1] == 2:
-                        # If shape is [B, 2, 3], take mean of both eyes
-                        iris_centers = iris_centers.mean(dim=1)  # [B, 3]
-                    elif len(iris_centers.shape) == 2:
-                        iris_centers = iris_centers  # Already [B, 3]
+                # iris_centers is already [9, 2, 3] = [N_views, 2, 3]
+                # iris_radii is already [9, 2, 1] = [N_views, 2, 1]
+                # These match the reshaped iris_mesh which is [9, 2, 100, 3]
 
-                if 'iris_radii' not in iris_geometry:
-                    # Create default radius
-                    iris_radii = torch.ones(B, 1, device=iris_mesh_pred.device) * 0.1
-                else:
-                    iris_radii = iris_geometry['iris_radii']
-                    if len(iris_radii.shape) == 3 and iris_radii.shape[1] == 2:
-                        # If shape is [B, 2, 1], take mean of both eyes
-                        iris_radii = iris_radii.mean(dim=1, keepdim=True)  # [B, 1]
-                    elif len(iris_radii.shape) == 2:
-                        iris_radii = iris_radii  # Already [B, 1]
+                total_loss = 0.0
 
-                # Calculate distance from each mesh point to iris center
-                iris_centers_expanded = iris_centers.unsqueeze(1)  # [B, 1, 3]
-                distances = torch.norm(iris_mesh_pred - iris_centers_expanded, dim=-1)  # [B, N_points]
+                for eye_idx in range(num_eyes):
+                    # Extract data for current eye
+                    eye_mesh = iris_mesh_reshaped[:, eye_idx, :, :]  # [9, 100, 3]
+                    eye_center = iris_centers[:, eye_idx, :]  # [9, 3]
+                    eye_radius = iris_radii[:, eye_idx, :]  # [9, 1]
 
-                # Expected radius for all points
-                expected_radius = iris_radii.squeeze(-1).unsqueeze(1)  # [B, 1]
+                    # Calculate distances
+                    distances = torch.norm(eye_mesh - eye_center.unsqueeze(1), dim=-1)  # [9, 100]
+                    expected_radius = eye_radius.squeeze(-1).unsqueeze(1)  # [9, 1]
 
-                # Loss: difference between actual distance and expected radius
-                radius_loss = torch.mean((distances - expected_radius) ** 2)
+                    # Compute loss for this eye
+                    eye_loss = torch.mean((distances - expected_radius) ** 2)
+                    total_loss += eye_loss
 
-                return radius_loss
+
+
+                final_loss = total_loss / num_eyes
+                return final_loss
 
             else:
-                # If shape is different, return zero loss
-                return torch.tensor(0.0, device=iris_mesh_pred.device, requires_grad=True)
+                print(f"[DEBUG] Unexpected shape {iris_mesh.shape}, returning zero")
+                return torch.tensor(0.0, device=iris_mesh.device, requires_grad=True)
 
         except Exception as e:
-            print(f"Error in CircularBoundaryLoss: {e}")
-            # Return zero loss on error to keep training going
-            device = next(iter(predictions.values())).device if predictions else torch.device('cpu')
+            print(f"[DEBUG] Error in circular loss: {e}")
+            device = iris_mesh.device if hasattr(iris_mesh, 'device') else torch.device('cpu')
             return torch.tensor(0.0, device=device, requires_grad=True)
 
 
@@ -463,7 +410,12 @@ class IrisMeshLoss(nn.Module):
             eyeball_geometry['eyeball_radii']
         )
 
-        losses['circular'] = self.circular_loss(predictions, targets)
+        # Circular boundary loss
+        losses['circular'] = self.circular_loss(
+            pred_mesh_3d,
+            iris_geometry['iris_centers'],
+            iris_geometry['iris_radii']
+        )
 
         losses['smoothing'] = self.smoothing_loss(pred_mesh_3d)
         # losses['edge_consistency'] = torch.tensor(0.0, device=pred_mesh_3d.device, requires_grad=True)
