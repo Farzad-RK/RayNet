@@ -521,6 +521,88 @@ def create_gazegene_dataloaders(base_dir, train_subjects, val_subjects,
     return train_loader, val_loader
 
 
+def convert_dataset_to_model_format(batch):
+    """
+    Convert dataset batch to format expected by EyeFLAME model
+
+    Args:
+        batch: Batch from GazeGeneDataset
+
+    Returns:
+        Dictionary with model inputs and ground truth
+    """
+    batch_size = len(batch)
+    device = batch[0]['img'].device
+
+    # Extract images
+    images = torch.stack([item['img'] for item in batch])  # [B, 3, H, W]
+
+    # Extract subject-specific parameters (β_shape)
+    gazegene_subject_params = {}
+    for param_name in ['eyecenter_L', 'eyecenter_R', 'eyeball_radius', 'iris_radius',
+                       'cornea_radius', 'cornea2center', 'UVRadius', 'L_kappa', 'R_kappa']:
+        param_values = []
+        for item in batch:
+            subject_attrs = item['subject_attributes']
+            if subject_attrs and param_name in subject_attrs:
+                param_val = subject_attrs[param_name]
+                # Convert to tensor and ensure correct shape
+                if isinstance(param_val, (int, float)):
+                    param_val = torch.tensor([param_val], dtype=torch.float32)
+                else:
+                    param_val = torch.tensor(param_val, dtype=torch.float32)
+                param_values.append(param_val)
+            else:
+                # Default values if missing
+                if param_name in ['eyecenter_L', 'eyecenter_R']:
+                    param_values.append(torch.zeros(3))
+                elif param_name in ['L_kappa', 'R_kappa']:
+                    param_values.append(torch.zeros(3))
+                else:
+                    param_values.append(torch.tensor([0.6]))  # Default iris radius
+
+        gazegene_subject_params[param_name] = torch.stack(param_values).to(device)
+
+    # Extract camera parameters
+    camera_params = {}
+    if 'intrinsic' in batch[0]:
+        camera_params['intrinsic_matrix'] = torch.stack([item['intrinsic'] for item in batch])
+
+    # Extract ground truth data
+    ground_truth = {}
+
+    # 3D mesh data
+    ground_truth['eyeball_center_3D'] = torch.stack([item['mesh']['eyeball_center_3D'] for item in batch])
+    ground_truth['pupil_center_3D'] = torch.stack([item['mesh']['pupil_center_3D'] for item in batch])
+
+    # Reshape iris mesh from [B, 2, 100, 3] to [B, 200, 3]
+    iris_mesh_3d = torch.stack([item['mesh']['iris_mesh_3D'] for item in batch])  # [B, 2, 100, 3]
+    ground_truth['iris_mesh_3D'] = iris_mesh_3d.reshape(batch_size, 200, 3)  # [B, 200, 3]
+
+    # Gaze data
+    ground_truth['gaze_C'] = torch.stack([item['gaze']['gaze_vector_C'] for item in batch])
+    ground_truth['optic_axis_L'] = torch.stack([item['gaze']['optic_axis_L'] for item in batch])
+    ground_truth['optic_axis_R'] = torch.stack([item['gaze']['optic_axis_R'] for item in batch])
+    ground_truth['visual_axis_L'] = torch.stack([item['gaze']['visual_axis_L'] for item in batch])
+    ground_truth['visual_axis_R'] = torch.stack([item['gaze']['visual_axis_R'] for item in batch])
+
+    # 2D mesh data (if available)
+    if 'mesh_2d' in batch[0] and batch[0]['mesh_2d'] is not None:
+        ground_truth['eyeball_center_2D'] = torch.stack([item['mesh_2d']['eyeball_center_2D'] for item in batch])
+        ground_truth['pupil_center_2D'] = torch.stack([item['mesh_2d']['pupil_center_2D'] for item in batch])
+
+        # Reshape 2D iris mesh
+        iris_mesh_2d = torch.stack([item['mesh_2d']['iris_mesh_2D'] for item in batch])  # [B, 2, 100, 2]
+        ground_truth['iris_mesh_2D'] = iris_mesh_2d.reshape(batch_size, 200, 2)  # [B, 200, 2]
+
+    return {
+        'images': images,
+        'gazegene_subject_params': gazegene_subject_params,
+        'camera_params': camera_params,
+        'ground_truth': ground_truth
+    }
+
+
 # Example usage
 if __name__ == "__main__":
     # Example usage with full annotations

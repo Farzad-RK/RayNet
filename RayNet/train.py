@@ -6,12 +6,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
 
-from raynet import create_raynet_model, RayNetLoss, compute_enhanced_metrics
-
-ENHANCED_MODEL = True
-
-from dataset import GazeGeneDataset, EnhancedMultiViewBatchSampler
-from head_pose.loss import multiview_headpose_losses
+from EyeFLAME.loss import EyeFLAMELoss
+from dataset import GazeGeneDataset, EnhancedMultiViewBatchSampler,convert_dataset_to_model_format
+from raynet import create_raynet_model
 
 from collections import defaultdict
 
@@ -32,119 +29,11 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--split', type=str, default="train", choices=["train", "test"],
                         help="Use official GazeGene train/test split")
-
-    # New arguments for enhanced training
     parser.add_argument('--include_2d_landmarks', action="store_true", default=True,
                         help="Include 2D landmark supervision")
-    parser.add_argument('--progressive_training', action="store_true", default=False,
-                        help="Use progressive training strategy")
     parser.add_argument('--image_size', type=int, nargs=2, default=[448, 448],
                         help="Input image size (H W)")
-
-    # Loss weights
-    parser.add_argument('--head_pose_weight', type=float, default=1.0)
-    parser.add_argument('--iris_mesh_weight', type=float, default=1.0)
-    parser.add_argument('--reconstruction_3d_weight', type=float, default=1.0)
-    parser.add_argument('--reconstruction_2d_weight', type=float, default=0.5)
-    parser.add_argument('--projection_consistency_weight', type=float, default=0.3)
-    parser.add_argument('--spherical_weight', type=float, default=0.1)
-    parser.add_argument('--circular_weight', type=float, default=0.1)
-    parser.add_argument('--smoothing_weight', type=float, default=0.05)
-    parser.add_argument('--edge_weight', type=float, default=0.05)
-    parser.add_argument('--geometric_weight', type=float, default=0.1)
-    parser.add_argument('--depth_consistency_weight', type=float, default=0.05)
-
     return parser.parse_args()
-
-
-class ProgressiveTrainingScheduler:
-    """
-    Manages progressive training phases for iris mesh regression.
-    """
-
-    def __init__(self, total_epochs):
-        self.total_epochs = total_epochs
-        self.phase_transitions = [
-            int(0.3 * total_epochs),  # Phase 1: 30% - 3D only
-            int(0.6 * total_epochs),  # Phase 2: 60% - Add 2D supervision
-            int(0.8 * total_epochs),  # Phase 3: 80% - Add projection consistency
-        ]
-
-    def get_phase_weights(self, epoch):
-        """Get loss weights for current training phase."""
-        if epoch < self.phase_transitions[0]:
-            # Phase 1: 3D reconstruction + geometric constraints only
-            return {
-                'reconstruction_3d_weight': 1.0,
-                'reconstruction_2d_weight': 0.0,
-                'projection_consistency_weight': 0.0,
-                'spherical_weight': 0.1,
-                'circular_weight': 0.1,
-                'smoothing_weight': 0.05,
-                'edge_weight': 0.05,
-                'geometric_weight': 0.1,
-                'depth_consistency_weight': 0.05
-            }
-        elif epoch < self.phase_transitions[1]:
-            # Phase 2: Add 2D supervision
-            return {
-                'reconstruction_3d_weight': 1.0,
-                'reconstruction_2d_weight': 0.3,
-                'projection_consistency_weight': 0.0,
-                'spherical_weight': 0.1,
-                'circular_weight': 0.1,
-                'smoothing_weight': 0.05,
-                'edge_weight': 0.05,
-                'geometric_weight': 0.1,
-                'depth_consistency_weight': 0.05
-            }
-        elif epoch < self.phase_transitions[2]:
-            # Phase 3: Add projection consistency
-            return {
-                'reconstruction_3d_weight': 1.0,
-                'reconstruction_2d_weight': 0.5,
-                'projection_consistency_weight': 0.2,
-                'spherical_weight': 0.1,
-                'circular_weight': 0.1,
-                'smoothing_weight': 0.05,
-                'edge_weight': 0.05,
-                'geometric_weight': 0.1,
-                'depth_consistency_weight': 0.05
-            }
-        else:
-            # Phase 4: Full training
-            return {
-                'reconstruction_3d_weight': 1.0,
-                'reconstruction_2d_weight': 0.5,
-                'projection_consistency_weight': 0.3,
-                'spherical_weight': 0.1,
-                'circular_weight': 0.1,
-                'smoothing_weight': 0.05,
-                'edge_weight': 0.05,
-                'geometric_weight': 0.1,
-                'depth_consistency_weight': 0.05
-            }
-
-
-class RunningNormalizer:
-    """Simple online normalizer for loss values."""
-
-    def __init__(self, init_min=1e8, init_max=-1e8):
-        self.min = init_min
-        self.max = init_max
-
-    def update(self, val):
-        v = float(val)
-        if v < self.min:
-            self.min = v
-        if v > self.max:
-            self.max = v
-
-    def normalize(self, val):
-        if self.max - self.min < 1e-8:
-            return 0.0
-        return (float(val) - self.min) / (self.max - self.min)
-
 
 def create_datasets_and_loaders(args):
     """Create enhanced datasets and loaders."""
@@ -233,117 +122,73 @@ def create_datasets_and_loaders(args):
 
     return train_loader, val_loader
 
-
-def get_loss_config(args, epoch=None, progressive_scheduler=None):
-    """Get loss configuration based on arguments and training phase."""
-    if progressive_scheduler and epoch is not None:
-        return progressive_scheduler.get_phase_weights(epoch)
-    else:
-        return {
-            'reconstruction_3d_weight': args.reconstruction_3d_weight,
-            'reconstruction_2d_weight': args.reconstruction_2d_weight,
-            'projection_consistency_weight': args.projection_consistency_weight,
-            'spherical_weight': args.spherical_weight,
-            'circular_weight': args.circular_weight,
-            'smoothing_weight': args.smoothing_weight,
-            'edge_weight': args.edge_weight,
-            'geometric_weight': args.geometric_weight,
-            'depth_consistency_weight': args.depth_consistency_weight
-        }
-
-
 def train_step(model, batch, loss_fn, optimizer, args, device):
     """Single training step."""
     model.train()
     optimizer.zero_grad()
+    # Convert batch to model format
+    model_inputs = convert_dataset_to_model_format(batch)
+    # Move to device
+    images = model_inputs['images'].to(device)
+    gazegene_subject_params = {k: v.to(device) for k, v in model_inputs['gazegene_subject_params'].items()}
+    camera_params = {k: v.to(device) for k, v in model_inputs['camera_params'].items()} if model_inputs[
+        'camera_params'] else None
+    ground_truth = {k: v.to(device) for k, v in model_inputs['ground_truth'].items()}
 
-    # Extract data from batch
-    images = batch['img'].to(device)  # [B*9, 3, H, W]
 
-    # Get batch size (accounting for 9 views per sample)
-    total_batch_size = images.shape[0]
-    B = total_batch_size // 9
 
-    # Reshape for multi-view processing
-    images = images.view(B * 9, *images.shape[1:])
+    # # Extract data from batch
+    # images = batch['img'].to(device)  # [B*9, 3, H, W]
+    #
+    # # Get batch size (accounting for 9 views per sample)
+    # total_batch_size = images.shape[0]
+    # B = total_batch_size // 9
+    #
+    # # Reshape for multi-view processing
+    # images = images.view(B * 9, *images.shape[1:])
 
-    # Forward pass - handle both enhanced and basic models
-    if ENHANCED_MODEL and hasattr(model, 'iris_mesh_regression'):
-        # Enhanced model with iris mesh regression
-        intrinsics = batch['intrinsic'].to(device)  # [B*9, 3, 3]
-        intrinsics = intrinsics.view(B * 9, *intrinsics.shape[1:])
-
-        predictions = model(
-            images,
-            intrinsic_matrix=intrinsics,
-            image_size=tuple(args.image_size)
-        )
-
-        # Reshape predictions for multi-view loss computation
-        for key in predictions:
-            if torch.is_tensor(predictions[key]):
-                if key == "head_pose_6d":
-                    predictions[key] = predictions[key].view(B, 9, -1)
-                elif "iris_mesh" in key:
-                    predictions[key] = predictions[key].view(B, 9, *predictions[key].shape[1:])
-                elif key == "pupil_centers_3d":
-                    predictions[key] = predictions[key].view(B, 9, *predictions[key].shape[1:])
-
-        # Prepare targets (ensure consistent shapes)
-        targets = {}
-        for key in ['mesh', 'head_pose']:
-            if key in batch:
-                targets[key] = {}
-                for subkey in batch[key]:
-                    if torch.is_tensor(batch[key][subkey]):
-                        # Move to device and reshape
-                        target_tensor = batch[key][subkey].to(device)
-                        targets[key][subkey] = target_tensor.view(B, 9, *target_tensor.shape[1:])
-                    else:
-                        targets[key][subkey] = batch[key][subkey]
-
-        # Add image size to targets for 2D normalization
-        targets['image_size'] = tuple(args.image_size)
-
-    else:
-        # Basic model - original RayNet
-        predictions = model(images)
-
-        # Prepare targets for basic loss - MOVE TO DEVICE
-        targets = {
-            'head_pose': {
-                'R': batch['head_pose']['R'].to(device)
-            }
+    # Subject specific parameters
+    """
+        subject_params =
+        {
+            'ID': int,                     # Subject ID from 1 to 56
+            'gender': str,                 # ['F', 'M'] refers to female and male
+            'ethicity': str,               # ['B', 'Y', 'W'] refers to Black, Yellow and White
+            'eyecenter_L': np.array(3,)    # Left eyeball center coordinates under HCS
+            'eyecenter_R': np.array(3,)    # Right eyeball center coordinates under HCS
+            'eyeball_radius': float,       # Eyeball radius
+            'iris_radius': float,          # Iris radius
+            'cornea_radius': float,        # Cornea radius
+            'cornea2center': float,        # Distance from cornea center to eyeball center
+            'UVRadius': float,             # Normalized relative pupil size
+            'L_kappa': np.array(3,),       # Euler angles of left eye kappa
+            'R_kappa': np.array(3,)        # Euler angles of right eye kappa
         }
+    """
+    # subject_params = batch['subject_attributes'].to(device)
+    # subject_params= subject_params.view(B * 9, *subject_params.shape[1:])
+    #
+    # # Camera intrinsics parameters 3x3 matrix for each view
+    # camera_params = batch['intrinsic'].to(device)  # [B*9, 3, 3]
+    # camera_params = camera_params.view(B * 9, *camera_params.shape[1:])
+
+    predictions = model(
+        images,
+        subject_params=gazegene_subject_params,
+        camera_params=camera_params)
 
     # Compute loss
-    total_loss, individual_losses = loss_fn(predictions, targets)
+    total_loss, individual_losses = loss_fn(predictions, ground_truth, gazegene_subject_params, camera_params)
 
     # Backward pass
     total_loss.backward()
-
-    # Gradient clipping
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
     optimizer.step()
 
     # Compute metrics
     with torch.no_grad():
-        if ENHANCED_MODEL:
-            metrics = compute_enhanced_metrics(predictions, targets)
-        else:
-            # Basic metrics - just head pose error
-            metrics = {}
-            if "head_pose_6d" in predictions:
-                from utils import ortho6d_to_rotmat
-                pred_rotmat = ortho6d_to_rotmat(predictions["head_pose_6d"].view(-1, 6))
-                gt_rotmat = targets["head_pose"]["R"].view(-1, 3, 3)
+        metrics = compute_metrics(predictions, ground_truth)
 
-                trace = torch.sum(pred_rotmat * gt_rotmat, dim=(1, 2))
-                cos_angle = (trace - 1) / 2
-                cos_angle = torch.clamp(cos_angle, -1, 1)
-                angle_error = torch.acos(cos_angle) * 180 / 3.14159
-                metrics['head_pose_error_deg'] = torch.mean(angle_error)
 
     return {
         'total_loss': total_loss.item(),
@@ -352,7 +197,7 @@ def train_step(model, batch, loss_fn, optimizer, args, device):
     }
 
 
-def validate_step(model, val_loader, loss_fn, args, device):
+def validation_step(model, val_loader, loss_fn, args, device):
     """Validation step."""
     model.eval()
     val_losses = defaultdict(list)
@@ -360,60 +205,28 @@ def validate_step(model, val_loader, loss_fn, args, device):
 
     with torch.no_grad():
         for batch in val_loader:
-            # Same processing as training step
-            images = batch['img'].to(device)
-            intrinsics = batch['intrinsic'].to(device)
+            # Convert batch to model format (same as train_step)
+            model_inputs = convert_dataset_to_model_format(batch)
 
-            total_batch_size = images.shape[0]
-            B = total_batch_size // 9
+            # Move to device (same as train_step)
+            images = model_inputs['images'].to(device)
+            gazegene_subject_params = {k: v.to(device) for k, v in model_inputs['gazegene_subject_params'].items()}
+            camera_params = {k: v.to(device) for k, v in model_inputs['camera_params'].items()} if model_inputs[
+                'camera_params'] else None
+            ground_truth = {k: v.to(device) for k, v in model_inputs['ground_truth'].items()}
 
-            images = images.view(B * 9, *images.shape[1:])
-            intrinsics = intrinsics.view(B * 9, *intrinsics.shape[1:])
-
+            # Model prediction (same as train_step)
             predictions = model(
                 images,
-                intrinsic_matrix=intrinsics,
-                image_size=tuple(args.image_size)
+                subject_params=gazegene_subject_params,
+                camera_params=camera_params
             )
 
-            # Reshape predictions
-            for key in predictions:
-                if torch.is_tensor(predictions[key]):
-                    if key == "head_pose_6d":
-                        predictions[key] = predictions[key].view(B, 9, -1)
-                    elif "iris_mesh" in key:
-                        predictions[key] = predictions[key].view(B, 9, *predictions[key].shape[1:])
-                    elif key == "pupil_centers_3d":
-                        predictions[key] = predictions[key].view(B, 9, *predictions[key].shape[1:])
+            # Compute loss (same as train_step)
+            total_loss, individual_losses = loss_fn(predictions, ground_truth, gazegene_subject_params, camera_params)
 
-            # Prepare targets
-            targets = batch.copy()
-            for key in ['mesh', 'head_pose']:
-                if key in targets:
-                    for subkey in targets[key]:
-                        if torch.is_tensor(targets[key][subkey]):
-                            targets[key][subkey] = targets[key][subkey].view(B, 9, *targets[key][subkey].shape[1:])
-
-            targets['image_size'] = tuple(args.image_size)
-
-            if 'mesh' in targets and 'iris_mesh_3D' in targets['mesh']:
-                targets['mesh']['iris_mesh_3D'] = targets['mesh']['iris_mesh_3D'].to(device)
-
-            def move_all_to_device(obj, device):
-                if isinstance(obj, torch.Tensor):
-                    return obj.to(device)
-                elif isinstance(obj, dict):
-                    return {k: move_all_to_device(v, device) for k, v in obj.items()}
-                elif isinstance(obj, list):
-                    return [move_all_to_device(item, device) for item in obj]
-                else:
-                    return obj
-
-            targets = move_all_to_device(targets, device)
-
-            # Compute loss and metrics
-            total_loss, individual_losses = loss_fn(predictions, targets)
-            metrics = compute_enhanced_metrics(predictions, targets)
+            # Compute metrics (same as train_step)
+            metrics = compute_metrics(predictions, ground_truth)
 
             # Accumulate results
             val_losses['total'].append(total_loss.item())
@@ -427,6 +240,72 @@ def validate_step(model, val_loader, loss_fn, args, device):
     avg_metrics = {k: np.mean(v) for k, v in val_metrics.items()}
 
     return avg_losses, avg_metrics
+
+
+def compute_metrics(predictions, ground_truth):
+    """
+    Compute evaluation metrics
+
+    Args:
+        predictions: Model predictions
+        ground_truth: Ground truth data
+
+    Returns:
+        Dictionary of metrics
+    """
+    metrics = {}
+
+    # 3D reconstruction errors (in cm)
+    if 'eyeball_centers' in predictions:
+        eyeball_error = torch.mean(torch.norm(
+            predictions['eyeball_centers'] - ground_truth['eyeball_center_3D'], dim=-1
+        ))
+        metrics['eyeball_error_cm'] = eyeball_error.item()
+
+    if 'pupil_centers' in predictions:
+        pupil_error = torch.mean(torch.norm(
+            predictions['pupil_centers'] - ground_truth['pupil_center_3D'], dim=-1
+        ))
+        metrics['pupil_error_cm'] = pupil_error.item()
+
+    if 'iris_landmarks_100' in predictions:
+        iris_error = torch.mean(torch.norm(
+            predictions['iris_landmarks_100'] - ground_truth['iris_mesh_3D'], dim=-1
+        ))
+        metrics['iris_error_cm'] = iris_error.item()
+
+    # Angular errors (in degrees)
+    if 'head_gaze_direction' in predictions:
+        gaze_cosine_sim = torch.sum(
+            predictions['head_gaze_direction'] * ground_truth['gaze_C'], dim=-1
+        )
+        gaze_angle_error = torch.acos(torch.clamp(gaze_cosine_sim, -1 + 1e-7, 1 - 1e-7))
+        metrics['gaze_angle_error_deg'] = torch.mean(gaze_angle_error).item() * 180 / np.pi
+
+    if 'optical_axes' in predictions:
+        # Left eye optical axis error
+        left_optical_cosine = torch.sum(
+            predictions['optical_axes'][:, 0] * ground_truth['optic_axis_L'], dim=-1
+        )
+        left_optical_error = torch.acos(torch.clamp(left_optical_cosine, -1 + 1e-7, 1 - 1e-7))
+
+        # Right eye optical axis error
+        right_optical_cosine = torch.sum(
+            predictions['optical_axes'][:, 1] * ground_truth['optic_axis_R'], dim=-1
+        )
+        right_optical_error = torch.acos(torch.clamp(right_optical_cosine, -1 + 1e-7, 1 - 1e-7))
+
+        metrics['optical_axis_error_deg'] = (torch.mean(left_optical_error) + torch.mean(
+            right_optical_error)).item() * 90 / np.pi
+
+    # 2D projection errors (in pixels, if available)
+    if 'projections_2d' in predictions and 'iris_mesh_2D' in ground_truth:
+        iris_2d_error = torch.mean(torch.norm(
+            predictions['projections_2d']['iris_landmarks_2d'] - ground_truth['iris_mesh_2D'], dim=-1
+        ))
+        metrics['iris_2d_error_px'] = iris_2d_error.item()
+
+    return metrics
 
 
 def main():
@@ -445,57 +324,12 @@ def main():
 
     # Create model
     print("Creating model...")
-    if ENHANCED_MODEL:
-        model = create_raynet_model(args.backbone_name, args.weight_path)
-    else:
-        print("Using fallback basic RayNet model")
-        # Fallback to basic model creation
-        backbone_channels_dict = {
-            'repnext_m0': [40, 80, 160, 320],
-            'repnext_m1': [48, 96, 192, 384],
-            'repnext_m2': [56, 112, 224, 448],
-            'repnext_m3': [64, 128, 256, 512],
-            'repnext_m4': [64, 128, 256, 512],
-            'repnext_m5': [80, 160, 320, 640],
-        }
-        backbone = load_pretrained_repnext(args.backbone_name, args.weight_path)
-        in_channels_list = backbone_channels_dict[args.backbone_name]
-        model = RayNet(backbone, in_channels_list, panet_out_channels=256).to(device)
+    model = create_raynet_model(args.backbone_name, args.weight_path)
 
-    # Progressive training scheduler
-    progressive_scheduler = None
-    if args.progressive_training:
-        progressive_scheduler = ProgressiveTrainingScheduler(args.epochs)
-        print("Using progressive training strategy")
-
-    # Create loss function
-    if ENHANCED_MODEL:
-        iris_loss_config = get_loss_config(args, epoch=0, progressive_scheduler=progressive_scheduler)
-        loss_fn = RayNetLoss(
-            head_pose_weight=args.head_pose_weight,
-            iris_mesh_weight=args.iris_mesh_weight,
-            iris_loss_config=iris_loss_config
-        )
-    else:
-        # Fallback: use only head pose loss
-        def basic_loss_fn(predictions, targets):
-            # Simple head pose loss only
-            if "head_pose_6d" in predictions and "head_pose" in targets:
-                pred_6d = predictions["head_pose_6d"]  # [B*9, 6]
-                gt_rotmat = targets["head_pose"]["R"]  # [B*9, 3, 3]
-
-                # Reshape for multi-view processing
-                B = pred_6d.shape[0] // 9
-                pred_6d_reshaped = pred_6d.view(B, 9, 6)
-                gt_rotmat_reshaped = gt_rotmat.view(B, 9, 3, 3)
-
-                head_pose_losses = multiview_headpose_losses(pred_6d_reshaped, gt_rotmat_reshaped)
-                total_loss = head_pose_losses['accuracy'] + 0.1 * head_pose_losses['consistency']
-                return total_loss, {'total': total_loss, **head_pose_losses}
-            else:
-                return torch.tensor(0.0, device=device), {'total': torch.tensor(0.0, device=device)}
-
-        loss_fn = basic_loss_fn
+    loss_fn = EyeFLAMELoss(
+            use_uncertainty_weighting=args.use_uncertainty_weighting,
+            use_scale_weighting=args.use_scale_weighting
+        ).to(device)
 
     # Optimizer
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
@@ -504,14 +338,9 @@ def main():
     # Setup logging
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     logfile = open(args.log_csv, "w", newline="")
-    fieldnames = [
-        "epoch", "step", "batch_size", "lr", "phase",
-        "total_loss", "head_pose_accuracy", "head_pose_consistency",
-        "iris_reconstruction_3d", "iris_reconstruction_2d", "iris_projection_consistency",
-        "iris_spherical", "iris_circular", "iris_smoothing", "iris_edge_consistency",
-        "iris_mesh_3d_l2_error", "iris_mesh_2d_pixel_error", "projection_consistency_error",
-        "val_total_loss", "val_iris_mesh_3d_l2_error"
-    ]
+    fieldnames = ['epoch', 'train_loss', 'val_loss', 'lr',
+                 'eyeball_error_cm', 'pupil_error_cm', 'iris_error_cm',
+                 'gaze_angle_error_deg', 'optical_axis_error_deg']
     csv_writer = csv.DictWriter(logfile, fieldnames=fieldnames)
     csv_writer.writeheader()
 
@@ -537,15 +366,7 @@ def main():
 
     for epoch in range(start_epoch, args.epochs):
         # Update loss weights for progressive training
-        if progressive_scheduler:
-            iris_loss_config = get_loss_config(args, epoch, progressive_scheduler)
-            loss_fn.iris_loss_config = iris_loss_config
-            phase = min(3, epoch // (args.epochs // 4))
-            print(f"Epoch {epoch + 1}/{args.epochs} - Training phase: {phase + 1}/4")
-        else:
-            phase = 0
-            print(f"Epoch {epoch + 1}/{args.epochs}")
-
+        print(f"Epoch {epoch + 1}/{args.epochs}")
         # Training
         epoch_losses = defaultdict(list)
         epoch_metrics = defaultdict(list)
@@ -553,12 +374,12 @@ def main():
         num_batches = 0
         for step, batch in enumerate(train_loader):
             try:
-                result = train_step(model, batch, loss_fn, optimizer, args, device)
+                train_results = train_step(model, batch, loss_fn, optimizer, args, device)
 
                 # Accumulate results
-                for k, v in result['losses'].items():
+                for k, v in train_results['losses'].items():
                     epoch_losses[k].append(v)
-                for k, v in result['metrics'].items():
+                for k, v in train_results['metrics'].items():
                     epoch_metrics[k].append(v)
 
                 num_batches += 1
@@ -566,9 +387,9 @@ def main():
                 # Log progress
                 if (step + 1) % 10 == 0:
                     print(f"  Step {step + 1}/{len(train_loader)} | "
-                          f"Loss: {result['total_loss']:.4f} | "
-                          f"3D Error: {result['metrics'].get('iris_mesh_3d_l2_error', 0):.4f}")
-
+                          f"Total loss: {train_results['total_loss']} | "
+                          f"Losses: {train_results['losses']} | "
+                          f"Metrics Error: {train_results['metrics']}")
             except Exception as e:
                 print(f"Error in training step {step}: {e}")
                 import traceback
@@ -585,7 +406,7 @@ def main():
         val_losses, val_metrics = {}, {}
         if val_loader:
             print("Running validation...")
-            val_losses, val_metrics = validate_step(model, val_loader, loss_fn, args, device)
+            val_losses, val_metrics = validation_step(model, val_loader, loss_fn, args, device)
             print(f"Validation - Total Loss: {val_losses['total']:.4f} | "
                   f"3D Error: {val_metrics.get('iris_mesh_3d_l2_error', 0):.4f}")
 
@@ -595,29 +416,25 @@ def main():
         print(f"Learning rate: {current_lr:.6f}")
 
         # Log to CSV
-        log_dict = {
-            "epoch": epoch + 1,
-            "step": len(train_loader),
-            "batch_size": args.batch_size,
-            "lr": optimizer.param_groups[0]['lr'],
-            "phase": phase,
-            "total_loss": np.mean(epoch_losses['total']),
-            "head_pose_accuracy": np.mean(epoch_losses.get('head_pose_accuracy', [0])),
-            "head_pose_consistency": np.mean(epoch_losses.get('head_pose_consistency', [0])),
-            "iris_reconstruction_3d": np.mean(epoch_losses.get('iris_reconstruction_3d', [0])),
-            "iris_reconstruction_2d": np.mean(epoch_losses.get('iris_reconstruction_2d', [0])),
-            "iris_projection_consistency": np.mean(epoch_losses.get('iris_projection_consistency', [0])),
-            "iris_spherical": np.mean(epoch_losses.get('iris_spherical', [0])),
-            "iris_circular": np.mean(epoch_losses.get('iris_circular', [0])),
-            "iris_smoothing": np.mean(epoch_losses.get('iris_smoothing', [0])),
-            "iris_edge_consistency": np.mean(epoch_losses.get('iris_edge_consistency', [0])),
-            "iris_mesh_3d_l2_error": np.mean(epoch_metrics.get('iris_mesh_3d_l2_error', [0])),
-            "iris_mesh_2d_pixel_error": np.mean(epoch_metrics.get('iris_mesh_2d_pixel_error', [0])),
-            "projection_consistency_error": np.mean(epoch_metrics.get('projection_consistency_error', [0])),
-            "val_total_loss": val_losses.get('total', 0),
-            "val_iris_mesh_3d_l2_error": val_metrics.get('iris_mesh_3d_l2_error', 0),
-        }
-        csv_writer.writerow(log_dict)
+        csv_row = [
+            epoch,
+            epoch_losses.get('total', 0),
+            val_losses.get('total', 0),
+            optimizer.param_groups[0]['lr'],
+            # Training metrics
+            epoch_metrics.get('eyeball_error_cm', 0),
+            epoch_metrics.get('pupil_error_cm', 0),
+            epoch_metrics.get('iris_error_cm', 0),
+            epoch_metrics.get('gaze_angle_error_deg', 0),
+            epoch_metrics.get('optical_axis_error_deg', 0),
+            #Validation metrics
+            val_metrics.get('eyeball_error_cm', 0),
+            val_metrics.get('pupil_error_cm', 0),
+            val_metrics.get('iris_error_cm', 0),
+            val_metrics.get('gaze_angle_error_deg', 0),
+            val_metrics.get('optical_axis_error_deg', 0)
+        ]
+        csv_writer.writerow(csv_row)
         logfile.flush()
 
         # Save checkpoint
@@ -629,7 +446,6 @@ def main():
                 'scheduler': scheduler.state_dict(),
                 'epoch': epoch,
                 'args': vars(args),
-                'iris_loss_config': iris_loss_config
             }, ckpt_path)
             print(f"Checkpoint saved to {ckpt_path}")
 
