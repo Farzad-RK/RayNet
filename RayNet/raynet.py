@@ -19,7 +19,7 @@ class RayNet(nn.Module):
         self.backbone = backbone
 
         # Coordinate attention module
-        self.coord_att_module = CoordAtt(256, 256, reduction=32)
+        # self.coord_att_module = CoordAtt(256, 256, reduction=32)
 
         # Initialize PANet with all four stage channels
         self.panet = PANet(channels_list=in_channels_list, out_channels=panet_out_channels)
@@ -45,7 +45,7 @@ class RayNet(nn.Module):
         # All four stages used
         features = [c1, c2, c3, c4]
         # Apply coordinate attention before feature fusion
-        features = self.coord_att_module(features)
+        # features = self.coord_att_module(features)
         # --- PANet & Fusion ---
         panet_features = self.panet(features)  # List of [B, C, H, W]
         fused = self.fusion(panet_features)  # [B, 256, H_fused, W_fused]
@@ -82,7 +82,7 @@ class RayNet(nn.Module):
         return eye_FLAME_results
 
 
-@staticmethod
+
 def create_raynet_model(backbone_name="repnext_m3", weight_path="./repnext_m3_pretrained.pt"):
     """
     Factory function to create RayNet model with iris mesh capabilities.

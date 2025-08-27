@@ -105,15 +105,35 @@ def euler_to_rotation_matrix(euler_angles):
     Returns:
         rotation_matrices: [..., 3, 3] rotation matrices
     """
+    if euler_angles is None:
+        raise ValueError("euler_angles cannot be None")
+
+    # Ensure input is a tensor
+    if not torch.is_tensor(euler_angles):
+        euler_angles = torch.tensor(euler_angles, dtype=torch.float32)
+
+    # Debug info
+    print(f"euler_to_rotation_matrix input shape: {euler_angles.shape}")
+    print(f"euler_to_rotation_matrix input size: {euler_angles.numel()}")
+
+    # Validate input shape
+    if euler_angles.shape[-1] != 3:
+        raise ValueError(f"Expected last dimension to be 3, got shape {euler_angles.shape}")
+
     # Handle batch dimensions
     original_shape = euler_angles.shape[:-1]
-    euler_angles = euler_angles.view(-1, 3)  # [B, 3]
-    batch_size = euler_angles.shape[0]
+    print(f"Original shape (without last dim): {original_shape}")
+
+    # Reshape to [N, 3] for processing
+    euler_angles_flat = euler_angles.view(-1, 3)  # [N, 3]
+    batch_size = euler_angles_flat.shape[0]
+
+    print(f"Flattened shape: {euler_angles_flat.shape}, batch_size: {batch_size}")
 
     # Extract individual angles
-    roll = euler_angles[:, 0]  # [B]
-    pitch = euler_angles[:, 1]  # [B]
-    yaw = euler_angles[:, 2]  # [B]
+    roll = euler_angles_flat[:, 0]  # [N]
+    pitch = euler_angles_flat[:, 1]  # [N]
+    yaw = euler_angles_flat[:, 2]  # [N]
 
     # Compute trigonometric values
     cos_roll = torch.cos(roll)
@@ -124,7 +144,7 @@ def euler_to_rotation_matrix(euler_angles):
     sin_yaw = torch.sin(yaw)
 
     # Build rotation matrix (ZYX convention)
-    R = torch.zeros(batch_size, 3, 3, device=euler_angles.device)
+    R = torch.zeros(batch_size, 3, 3, device=euler_angles.device, dtype=euler_angles.dtype)
 
     R[:, 0, 0] = cos_yaw * cos_pitch
     R[:, 0, 1] = cos_yaw * sin_pitch * sin_roll - sin_yaw * cos_roll
@@ -138,8 +158,22 @@ def euler_to_rotation_matrix(euler_angles):
     R[:, 2, 1] = cos_pitch * sin_roll
     R[:, 2, 2] = cos_pitch * cos_roll
 
-    # Reshape back to original batch dimensions
-    return R.view(*original_shape, 3, 3)
+    print(f"R shape before reshape: {R.shape}")
+    print(f"Expected final shape: {(*original_shape, 3, 3)}")
+
+    # Reshape back to original batch dimensions plus [3, 3]
+    try:
+        result = R.view(*original_shape, 3, 3)
+        print(f"Successfully reshaped to: {result.shape}")
+        return result
+    except RuntimeError as e:
+        print(f"Reshape failed: {e}")
+        print(f"R has {R.numel()} elements, trying to reshape to {original_shape + (3, 3)}")
+        print(f"Required elements: {np.prod(original_shape) * 9}")
+
+        # Fallback: if reshape fails, return without reshaping and let caller handle it
+        print("Returning flattened batch shape [batch_size, 3, 3]")
+        return R  # [batch_size, 3, 3]
 
 
 def transform_HCS_to_CCS(points_hcs, head_rotation):

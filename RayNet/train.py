@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 import numpy as np
 
 from EyeFLAME.loss import EyeFLAMELoss
-from dataset import GazeGeneDataset, EnhancedMultiViewBatchSampler,convert_dataset_to_model_format
+from dataset import GazeGeneDataset, EnhancedMultiViewBatchSampler, convert_dataset_to_model_format
 from raynet import create_raynet_model
 
 from collections import defaultdict
@@ -34,6 +34,7 @@ def parse_args():
     parser.add_argument('--image_size', type=int, nargs=2, default=[448, 448],
                         help="Input image size (H W)")
     return parser.parse_args()
+
 
 def create_datasets_and_loaders(args):
     """Create enhanced datasets and loaders."""
@@ -70,7 +71,8 @@ def create_datasets_and_loaders(args):
         train_dataset,
         batch_sampler=train_sampler,
         num_workers=args.num_workers,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=gazegene_collate_fn  # Use custom collate function
     )
 
     # Validation dataset (if available)
@@ -97,7 +99,8 @@ def create_datasets_and_loaders(args):
             val_dataset,
             batch_sampler=val_sampler,
             num_workers=args.num_workers,
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=gazegene_collate_fn  # Use custom collate function
         )
 
     print(f"Dataset statistics:")
@@ -122,20 +125,21 @@ def create_datasets_and_loaders(args):
 
     return train_loader, val_loader
 
+
 def train_step(model, batch, loss_fn, optimizer, args, device):
     """Single training step."""
     model.train()
     optimizer.zero_grad()
     # Convert batch to model format
-    model_inputs = convert_dataset_to_model_format(batch)
+    model_inputs = convert_dataset_to_model_format(batch, device)
     # Move to device
-    images = model_inputs['images'].to(device)
+    images = model_inputs['images']
     gazegene_subject_params = {k: v.to(device) for k, v in model_inputs['gazegene_subject_params'].items()}
     camera_params = {k: v.to(device) for k, v in model_inputs['camera_params'].items()} if model_inputs[
         'camera_params'] else None
     ground_truth = {k: v.to(device) for k, v in model_inputs['ground_truth'].items()}
 
-
+    subject_attrs_list = batch.get('subject_attributes', [])
 
     # # Extract data from batch
     # images = batch['img'].to(device)  # [B*9, 3, H, W]
@@ -189,7 +193,6 @@ def train_step(model, batch, loss_fn, optimizer, args, device):
     with torch.no_grad():
         metrics = compute_metrics(predictions, ground_truth)
 
-
     return {
         'total_loss': total_loss.item(),
         'losses': {k: v.item() if torch.is_tensor(v) else v for k, v in individual_losses.items()},
@@ -206,7 +209,7 @@ def validation_step(model, val_loader, loss_fn, args, device):
     with torch.no_grad():
         for batch in val_loader:
             # Convert batch to model format (same as train_step)
-            model_inputs = convert_dataset_to_model_format(batch)
+            model_inputs = convert_dataset_to_model_format(batch, device)
 
             # Move to device (same as train_step)
             images = model_inputs['images'].to(device)
@@ -308,6 +311,137 @@ def compute_metrics(predictions, ground_truth):
     return metrics
 
 
+def gazegene_collate_fn(batch):
+    """
+    Custom collate function for GazeGene dataset that handles:
+    - Multi-view samples (9 cameras per subject)
+    - Complex nested dictionaries
+    - Mixed data types (tensors, scalars, None values)
+
+    Args:
+        batch: List of samples from dataset.__getitem__()
+
+    Returns:
+        Collated batch dictionary
+    """
+    if len(batch) == 0:
+        return {}
+
+    # Handle case where some samples might be None or invalid
+    valid_batch = [item for item in batch if item is not None]
+    if len(valid_batch) == 0:
+        return {}
+
+    # Initialize collated batch
+    collated = {}
+
+    # Collate simple tensor fields
+    tensor_fields = ['img', 'intrinsic']
+    for field in tensor_fields:
+        if field in valid_batch[0]:
+            try:
+                collated[field] = torch.stack([item[field] for item in valid_batch])
+            except Exception as e:
+                print(f"Error collating {field}: {e}")
+                # If stacking fails, keep as list
+                collated[field] = [item[field] for item in valid_batch]
+
+    # Collate simple scalar fields
+    scalar_fields = ['subject', 'camera', 'frame_idx']
+    for field in scalar_fields:
+        if field in valid_batch[0]:
+            collated[field] = [item[field] for item in valid_batch]
+
+    # Collate nested dictionary fields
+    nested_dict_fields = ['mesh', 'gaze', 'head_pose']
+    for field in nested_dict_fields:
+        if field in valid_batch[0] and valid_batch[0][field] is not None:
+            collated[field] = {}
+
+            # Get all keys from the nested dictionary
+            all_keys = set()
+            for item in valid_batch:
+                if item[field] is not None:
+                    all_keys.update(item[field].keys())
+
+            # Collate each key in the nested dictionary
+            for key in all_keys:
+                try:
+                    values = []
+                    for item in valid_batch:
+                        if item[field] is not None and key in item[field]:
+                            values.append(item[field][key])
+                        else:
+                            # Handle missing values by using None or zero tensor
+                            values.append(None)
+
+                    # Filter out None values
+                    non_none_values = [v for v in values if v is not None]
+                    if non_none_values:
+                        if torch.is_tensor(non_none_values[0]):
+                            # Try to stack tensors
+                            try:
+                                collated[field][key] = torch.stack(non_none_values)
+                            except Exception as e:
+                                print(f"Error stacking {field}.{key}: {e}")
+                                collated[field][key] = non_none_values
+                        else:
+                            # Keep as list for non-tensor values
+                            collated[field][key] = non_none_values
+                    else:
+                        collated[field][key] = None
+
+                except Exception as e:
+                    print(f"Error collating {field}.{key}: {e}")
+                    collated[field][key] = [item[field][key] if item[field] else None for item in valid_batch]
+
+    # Handle optional nested fields that might be None
+    optional_nested_fields = ['mesh_2d', 'camera_params']
+    for field in optional_nested_fields:
+        if field in valid_batch[0]:
+            # Check if any item has non-None values for this field
+            has_valid_data = any(item[field] is not None for item in valid_batch)
+
+            if has_valid_data:
+                collated[field] = {}
+
+                # Get all possible keys
+                all_keys = set()
+                for item in valid_batch:
+                    if item[field] is not None:
+                        all_keys.update(item[field].keys())
+
+                # Collate each key
+                for key in all_keys:
+                    values = []
+                    for item in valid_batch:
+                        if item[field] is not None and key in item[field]:
+                            values.append(item[field][key])
+                        else:
+                            values.append(None)
+
+                    # Filter and collate non-None values
+                    non_none_values = [v for v in values if v is not None]
+                    if non_none_values:
+                        if torch.is_tensor(non_none_values[0]):
+                            try:
+                                collated[field][key] = torch.stack(non_none_values)
+                            except:
+                                collated[field][key] = non_none_values
+                        else:
+                            collated[field][key] = non_none_values
+                    else:
+                        collated[field][key] = None
+            else:
+                collated[field] = None
+
+    # Handle subject_attributes specially (list of dictionaries)
+    if 'subject_attributes' in valid_batch[0]:
+        collated['subject_attributes'] = [item['subject_attributes'] for item in valid_batch]
+
+    return collated
+
+
 def main():
     args = parse_args()
 
@@ -327,9 +461,9 @@ def main():
     model = create_raynet_model(args.backbone_name, args.weight_path)
 
     loss_fn = EyeFLAMELoss(
-            use_uncertainty_weighting=args.use_uncertainty_weighting,
-            use_scale_weighting=args.use_scale_weighting
-        ).to(device)
+        use_uncertainty_weighting=True,
+        use_scale_weighting=True
+    ).to(device)
 
     # Optimizer
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
@@ -339,8 +473,8 @@ def main():
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     logfile = open(args.log_csv, "w", newline="")
     fieldnames = ['epoch', 'train_loss', 'val_loss', 'lr',
-                 'eyeball_error_cm', 'pupil_error_cm', 'iris_error_cm',
-                 'gaze_angle_error_deg', 'optical_axis_error_deg']
+                  'eyeball_error_cm', 'pupil_error_cm', 'iris_error_cm',
+                  'gaze_angle_error_deg', 'optical_axis_error_deg']
     csv_writer = csv.DictWriter(logfile, fieldnames=fieldnames)
     csv_writer.writeheader()
 
@@ -427,7 +561,7 @@ def main():
             epoch_metrics.get('iris_error_cm', 0),
             epoch_metrics.get('gaze_angle_error_deg', 0),
             epoch_metrics.get('optical_axis_error_deg', 0),
-            #Validation metrics
+            # Validation metrics
             val_metrics.get('eyeball_error_cm', 0),
             val_metrics.get('pupil_error_cm', 0),
             val_metrics.get('iris_error_cm', 0),

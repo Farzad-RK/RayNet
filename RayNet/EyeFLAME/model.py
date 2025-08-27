@@ -144,6 +144,12 @@ class EyeFLAME_Model(nn.Module):
             'θ_right_eyeball': θ_right_eyeball
         }
 
+        print("=== RAW MODEL OUTPUTS (before kinematics) ===")
+        print(f"Head pose 6D range: {θ_head_pose_6d.min()} to {θ_head_pose_6d.max()}")
+        print(f"Head gaze range: {θ_head_gaze.min()} to {θ_head_gaze.max()}")
+        print(f"Left eyeball 6D range: {θ_left_eyeball_6d.min()} to {θ_left_eyeball_6d.max()}")
+        print(f"Right eyeball 6D range: {θ_right_eyeball_6d.min()} to {θ_right_eyeball_6d.max()}")
+
         return eye_structures
 
     def forward_kinematics(self, θ_joints, β_shape, batch_size):
@@ -215,6 +221,10 @@ class EyeFLAME_Model(nn.Module):
             torch.bmm(L_kappa_rotation, optical_axes[:, 0:1].transpose(1, 2)).squeeze(-1),
             torch.bmm(R_kappa_rotation, optical_axes[:, 1:2].transpose(1, 2)).squeeze(-1)
         ], dim=1)  # [B, 2, 3]
+
+        print("=== BEFORE/AFTER KINEMATICS ===")
+        print(f"Template eyeball centers range: {template_eyeball_centers.min()} to {template_eyeball_centers.max()}")
+        print(f"Final eyeball centers range: {final_eyeball_centers.min()} to {final_eyeball_centers.max()}")
 
         return {
             'eyeball_centers': final_eyeball_centers,  # [B, 2, 3] in cm

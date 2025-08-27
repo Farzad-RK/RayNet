@@ -191,44 +191,87 @@ class EyeFLAMELoss(nn.Module):
             raw_losses['projection_2d'] = torch.tensor(0.0, device=predictions['eyeball_centers'].device)
 
         # === JOINT CONSISTENCY LOSSES ===
-
+        # These are additional losses not included in the main weighting scheme
         joint_losses = self.joint_consistency_losses(
             predictions, ground_truth
         )
-        raw_losses.update(joint_losses)
+
+        # Combine joint losses into a single term for weighting
+        joint_consistency_total = sum(joint_losses.values()) if joint_losses else torch.tensor(0.0, device=predictions[
+            'eyeball_centers'].device)
 
         # === GEOMETRIC-AWARE LOSS BALANCING ===
 
+        # Only use the main 8 loss terms for uncertainty/scale weighting
+        main_losses = {
+            'eyeball_l1': raw_losses['eyeball_l1'],
+            'pupil_l1': raw_losses['pupil_l1'],
+            'iris_100_l1': raw_losses['iris_100_l1'],
+            'head_gaze_l1': raw_losses['head_gaze_l1'],
+            'optical_axis': raw_losses['optical_axis'],
+            'perfect_planarity': raw_losses['perfect_planarity'],
+            'perfect_circle': raw_losses['perfect_circle'],
+            'projection_2d': raw_losses['projection_2d']
+        }
+
         if self.use_uncertainty_weighting:
-            uncertainty_loss, uncertainty_info = self.uncertainty_weighter(raw_losses)
+            uncertainty_loss, uncertainty_info = self.uncertainty_weighter(main_losses)
         else:
-            uncertainty_loss = sum(raw_losses.values())
+            uncertainty_loss = sum(main_losses.values())
             uncertainty_info = {'learned_weights': None, 'uncertainties': None}
 
         if self.use_scale_weighting:
-            scale_weights = self.scale_weighter.compute_scale_normalized_weights(raw_losses)
-            scale_loss = sum(raw_losses[key] * scale_weights[key] for key in raw_losses.keys())
+            scale_weights = self.scale_weighter.compute_scale_normalized_weights(main_losses)
+            scale_loss = sum(main_losses[key] * scale_weights[key] for key in main_losses.keys())
         else:
-            scale_loss = sum(raw_losses.values())
+            scale_loss = sum(main_losses.values())
             scale_weights = None
 
-        # Final loss combines uncertainty weighting + scale awareness
+        # Final loss combines weighted main losses + joint consistency losses
         if self.use_uncertainty_weighting and self.use_scale_weighting:
-            total_loss = 0.7 * uncertainty_loss + 0.3 * scale_loss
+            total_loss = 0.7 * uncertainty_loss + 0.3 * scale_loss + 0.1 * joint_consistency_total
         elif self.use_uncertainty_weighting:
-            total_loss = uncertainty_loss
+            total_loss = uncertainty_loss + 0.1 * joint_consistency_total
         elif self.use_scale_weighting:
-            total_loss = scale_loss
+            total_loss = scale_loss + 0.1 * joint_consistency_total
         else:
-            total_loss = sum(raw_losses.values())
+            total_loss = sum(main_losses.values()) + 0.1 * joint_consistency_total
+
+        # Combine all losses for logging - ensure all values are scalars
+        all_losses = {**raw_losses, **joint_losses}
+
+        # Convert multi-element tensors to scalars for logging
+        def ensure_scalar(v):
+            if torch.is_tensor(v):
+                if v.numel() == 1:
+                    return v
+                else:
+                    return v.mean()  # Convert multi-element to scalar
+            return v
+
+        # Convert uncertainty weights and scale weights to scalars for logging
+        uncertainty_weights_scalar = None
+        if uncertainty_info.get('learned_weights') is not None:
+            weights = uncertainty_info['learned_weights']
+            uncertainty_weights_scalar = weights.mean() if torch.is_tensor(weights) else weights
+
+        scale_weights_scalar = None
+        if scale_weights is not None:
+            if isinstance(scale_weights, dict):
+                # Take mean of all scale weights
+                scale_values = list(scale_weights.values())
+                scale_weights_scalar = sum(scale_values) / len(scale_values) if scale_values else 0.0
+            else:
+                scale_weights_scalar = scale_weights.mean() if torch.is_tensor(scale_weights) else scale_weights
 
         return total_loss, {
-            'raw_losses': raw_losses,
-            'uncertainty_weights': uncertainty_info.get('learned_weights'),
-            'scale_weights': scale_weights,
-            'uncertainty_loss': uncertainty_loss,
-            'scale_loss': scale_loss,
-            'joint_losses': joint_losses
+            'raw_losses': {k: ensure_scalar(v) for k, v in all_losses.items()},
+            'uncertainty_weights_mean': uncertainty_weights_scalar,  # Scalar version
+            'scale_weights_mean': scale_weights_scalar,  # Scalar version
+            'uncertainty_loss': ensure_scalar(uncertainty_loss),
+            'scale_loss': ensure_scalar(scale_loss),
+            'joint_consistency_total': ensure_scalar(joint_consistency_total),
+            'num_loss_terms': len(main_losses),  # For reference
         }
 
     def optical_axis_loss(self, predictions, ground_truth):
