@@ -5,16 +5,115 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
-
-from EyeFLAME.loss import EyeFLAMELoss
-from dataset import GazeGeneDataset, EnhancedMultiViewBatchSampler, convert_dataset_to_model_format
-from raynet import create_raynet_model
-
 from collections import defaultdict
+from datetime import datetime
+
+# Import the new model and loss
+from EyeFLAME.loss import WeakPerspectiveLoss
+from dataset import GazeGeneDataset, EnhancedMultiViewBatchSampler, gazegene_collate_fn
+from raynet import create_raynet_model_with_depth_aware
+
+
+class DynamicTrainingStrategy:
+    """
+    Dynamic training strategy with automatic phase transitions
+    based on loss thresholds and convergence metrics
+    """
+
+    def __init__(self):
+        self.phase = 1  # Start with phase 1
+        self.phase_epochs = 0  # Epochs in current phase
+        self.best_2d_loss = float('inf')
+        self.best_3d_loss = float('inf')
+        self.loss_history = []
+
+        # Phase transition thresholds
+        self.thresholds = {
+            'phase1_to_2': {
+                '2d_loss': 100.0,  # pixels - when 2D projection is reasonably good
+                'min_epochs': 3,  # Minimum epochs in phase 1
+                'convergence_rate': 0.05  # Loss should be decreasing
+            },
+            'phase2_to_3': {
+                '2d_loss': 50.0,  # pixels - when 2D projection is quite good
+                '3d_loss': 50.0,  # cm - when 3D is starting to converge
+                'min_epochs': 5,  # Minimum epochs in phase 2
+                'convergence_rate': 0.02
+            }
+        }
+
+        # Loss weights for each phase
+        self.phase_weights = {
+            1: {'2d': 1.0, '3d': 0.01, 'angular': 1.0, 'reg': 0.01},
+            2: {'2d': 1.0, '3d': 0.1, 'angular': 1.0, 'reg': 0.01},
+            3: {'2d': 0.5, '3d': 0.5, 'angular': 1.0, 'reg': 0.005}
+        }
+
+    def should_transition(self, metrics):
+        """Check if we should transition to next phase"""
+        self.phase_epochs += 1
+
+        # Extract key metrics
+        loss_2d = metrics.get('loss_2d_avg', float('inf'))
+        loss_3d = metrics.get('loss_3d_avg', float('inf'))
+
+        # Update best losses
+        self.best_2d_loss = min(self.best_2d_loss, loss_2d)
+        self.best_3d_loss = min(self.best_3d_loss, loss_3d)
+
+        # Check phase 1 -> 2 transition
+        if self.phase == 1:
+            thresh = self.thresholds['phase1_to_2']
+            if (loss_2d < thresh['2d_loss'] and
+                    self.phase_epochs >= thresh['min_epochs']):
+
+                # Check convergence rate
+                if len(self.loss_history) > 2:
+                    recent_improvement = (self.loss_history[-3] - loss_2d) / (self.loss_history[-3] + 1e-8)
+                    if recent_improvement > thresh['convergence_rate']:
+                        print(f"\n=== PHASE TRANSITION 1->2 ===")
+                        print(f"  2D loss: {loss_2d:.2f} < {thresh['2d_loss']}")
+                        print(f"  Convergence rate: {recent_improvement:.3f}")
+                        self.phase = 2
+                        self.phase_epochs = 0
+                        return True
+
+        # Check phase 2 -> 3 transition
+        elif self.phase == 2:
+            thresh = self.thresholds['phase2_to_3']
+            if (loss_2d < thresh['2d_loss'] and
+                    loss_3d < thresh['3d_loss'] and
+                    self.phase_epochs >= thresh['min_epochs']):
+                print(f"\n=== PHASE TRANSITION 2->3 ===")
+                print(f"  2D loss: {loss_2d:.2f} < {thresh['2d_loss']}")
+                print(f"  3D loss: {loss_3d:.2f} < {thresh['3d_loss']}")
+                self.phase = 3
+                self.phase_epochs = 0
+                return True
+
+        self.loss_history.append(loss_2d)
+        if len(self.loss_history) > 10:
+            self.loss_history.pop(0)
+
+        return False
+
+    def get_current_weights(self):
+        """Get current phase weights"""
+        return self.phase_weights[self.phase]
+
+    def get_status(self):
+        """Get training strategy status"""
+        return {
+            'phase': self.phase,
+            'phase_epochs': self.phase_epochs,
+            'weights': self.phase_weights[self.phase],
+            'best_2d_loss': self.best_2d_loss,
+            'best_3d_loss': self.best_3d_loss
+        }
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Enhanced RayNet Training with Iris Mesh Regression")
+    parser = argparse.ArgumentParser(description="EyeFLAME Training with Depth-Aware Model")
     parser.add_argument('--base_dir', type=str, required=True, help="Root of GazeGene dataset")
     parser.add_argument('--backbone_name', type=str, default="repnext_m3")
     parser.add_argument('--weight_path', type=str, default="./repnext_m3_pretrained.pt")
@@ -23,47 +122,45 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--samples_per_subject', type=int, default=None)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--checkpoint_dir', type=str, default="checkpoints")
-    parser.add_argument('--log_csv', type=str, default="train_log.csv")
+    parser.add_argument('--weight_decay', type=float, default=1e-5)
+    parser.add_argument('--gradient_clip', type=float, default=1.0)
+    parser.add_argument('--checkpoint_dir', type=str, default="checkpoints_depth_aware")
+    parser.add_argument('--log_csv', type=str, default="train_log_depth_aware.csv")
     parser.add_argument('--checkpoint_freq', type=int, default=5)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--split', type=str, default="train", choices=["train", "test"],
-                        help="Use official GazeGene train/test split")
-    parser.add_argument('--include_2d_landmarks', action="store_true", default=True,
-                        help="Include 2D landmark supervision")
-    parser.add_argument('--image_size', type=int, nargs=2, default=[448, 448],
-                        help="Input image size (H W)")
+    parser.add_argument('--resume', type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument('--validate_freq', type=int, default=1, help="Validation frequency (epochs)")
+    parser.add_argument('--log_freq', type=int, default=50, help="Logging frequency (steps)")
+    parser.add_argument('--debug', action='store_true', help="Debug mode with verbose output")
     return parser.parse_args()
 
 
 def create_datasets_and_loaders(args):
-    """Create enhanced datasets and loaders."""
-    if args.split == "train":
-        # Use string format like original dataset expects
-        train_subjects = [f"subject{i}" for i in range(1, 47)]  # Subjects 1-46
-        val_subjects = [f"subject{i}" for i in range(47, 57)]  # Subjects 47-56
-    else:
-        # For testing, use the official test split
-        train_subjects = [f"subject{i}" for i in range(47, 57)]
-        val_subjects = None
+    """Create datasets ensuring 2D annotations are included"""
 
-    print(f"Loading training subjects: {train_subjects[:5]}...{train_subjects[-5:]}")
+    # Use official train/val split
+    train_subjects = [f"subject{i}" for i in range(1, 47)]  # Subjects 1-46
+    val_subjects = [f"subject{i}" for i in range(47, 57)]  # Subjects 47-56
 
-    # Training dataset
+    print(f"Loading training subjects: {len(train_subjects)} subjects")
+    print(f"Loading validation subjects: {len(val_subjects)} subjects")
+
+    # Training dataset - MUST include 2D landmarks
     train_dataset = GazeGeneDataset(
         base_dir=args.base_dir,
         subject_ids=train_subjects,
-        samples_per_subject=args.samples_per_subject,
-        include_2d_landmarks=args.include_2d_landmarks,
+        samples_per_subject=args.samples_per_subject,  # Use all samples
+        include_2d_landmarks=True,  # CRITICAL for depth-aware model
         include_camera_params=True,
         balance_attributes=['ethicity']
     )
 
+    # Multi-view batch sampler
     train_sampler = EnhancedMultiViewBatchSampler(
         train_dataset,
         batch_size=args.batch_size,
         balance_attributes=['ethicity'],
-        ensure_multiview=True,
+        ensure_multiview=True,  # Ensure 9 views per sample
         shuffle=True
     )
 
@@ -72,519 +169,652 @@ def create_datasets_and_loaders(args):
         batch_sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
-        collate_fn=gazegene_collate_fn  # Use custom collate function
+        collate_fn=gazegene_collate_fn
     )
 
-    # Validation dataset (if available)
-    val_loader = None
-    if val_subjects is not None:
-        print(f"Loading validation subjects: {val_subjects[:3]}...{val_subjects[-3:]}")
-        val_dataset = GazeGeneDataset(
-            base_dir=args.base_dir,
-            subject_ids=val_subjects,
-            samples_per_subject=min(100, args.samples_per_subject) if args.samples_per_subject else 100,
-            include_2d_landmarks=args.include_2d_landmarks,
-            include_camera_params=True,
-            balance_attributes=None
-        )
+    # Validation dataset
+    val_dataset = GazeGeneDataset(
+        base_dir=args.base_dir,
+        subject_ids=val_subjects,
+        samples_per_subject=100,  # Fewer samples for faster validation
+        include_2d_landmarks=True,
+        include_camera_params=True,
+        balance_attributes=None
+    )
 
-        val_sampler = EnhancedMultiViewBatchSampler(
-            val_dataset,
-            batch_size=args.batch_size,
-            ensure_multiview=True,
-            shuffle=False
-        )
+    val_sampler = EnhancedMultiViewBatchSampler(
+        val_dataset,
+        batch_size=args.batch_size,
+        ensure_multiview=True,
+        shuffle=False
+    )
 
-        val_loader = DataLoader(
-            val_dataset,
-            batch_sampler=val_sampler,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            collate_fn=gazegene_collate_fn  # Use custom collate function
-        )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_sampler=val_sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=gazegene_collate_fn
+    )
 
     print(f"Dataset statistics:")
     print(f"  Training samples: {len(train_dataset)}")
-    if val_loader:
-        print(f"  Validation samples: {len(val_loader.dataset)}")
+    print(f"  Validation samples: {len(val_dataset)}")
 
-    # Debug: Print some dataset info
-    if len(train_dataset) > 0:
-        sample = train_dataset[0]
-        print(f"  Sample keys: {list(sample.keys())}")
-        print(f"  Image shape: {sample['img'].shape}")
-        if 'mesh' in sample:
-            print(f"  3D mesh keys: {list(sample['mesh'].keys())}")
-            print(f"  Iris mesh 3D shape: {sample['mesh']['iris_mesh_3D'].shape}")
-    else:
-        print("  WARNING: No training samples found!")
-        print(f"  Base directory exists: {os.path.exists(args.base_dir)}")
-        if os.path.exists(args.base_dir):
-            subdirs = [d for d in os.listdir(args.base_dir) if os.path.isdir(os.path.join(args.base_dir, d))]
-            print(f"  Subdirectories found: {subdirs[:10]}")
+    # Verify 2D annotations are present
+    sample = train_dataset[0]
+    if 'mesh_2d' not in sample or sample['mesh_2d'] is None:
+        raise ValueError("CRITICAL: Dataset does not contain 2D annotations! Cannot train depth-aware model.")
 
     return train_loader, val_loader
 
 
-def train_step(model, batch, loss_fn, optimizer, args, device):
-    """Single training step."""
-    model.train()
-    optimizer.zero_grad()
-    # Convert batch to model format
-    model_inputs = convert_dataset_to_model_format(batch, device)
-    # Move to device
-    images = model_inputs['images']
-    gazegene_subject_params = {k: v.to(device) for k, v in model_inputs['gazegene_subject_params'].items()}
-    camera_params = {k: v.to(device) for k, v in model_inputs['camera_params'].items()} if model_inputs[
-        'camera_params'] else None
-    ground_truth = {k: v.to(device) for k, v in model_inputs['ground_truth'].items()}
+def fix_parameter_expansion(val, batch_size, param_name):
+    """
+    Properly expand parameters to batch size
+    """
+    if not isinstance(val, torch.Tensor):
+        if isinstance(val, (int, float)):
+            val = torch.tensor([val], dtype=torch.float32)
+        else:
+            val = torch.tensor(val, dtype=torch.float32)
 
+    # Special handling for kappa (2D -> 3D)
+    if param_name in ['L_kappa', 'R_kappa']:
+        if val.numel() == 2:  # If it's 2D kappa
+            val = torch.cat([val.reshape(-1), torch.zeros(1)])  # Add zero roll
+        elif val.shape[-1] == 2:  # [1, 2] or [2]
+            val = torch.cat([val.reshape(-1)[:2], torch.zeros(1)])
+
+    # Ensure at least 1D
+    if val.dim() == 0:
+        val = val.unsqueeze(0)
+
+    # Flatten to 1D if needed for expansion
+    if val.dim() > 1:
+        # Keep the last dimension, flatten the rest
+        original_shape = val.shape
+        if len(original_shape) > 1:
+            val = val.reshape(-1, original_shape[-1])
+            if val.shape[0] == 1:
+                val = val.squeeze(0)  # Now it's 1D
+
+    # Now expand to batch size
+    if val.dim() == 1:
+        if val.shape[0] == 1:
+            val = val.expand(batch_size)
+        elif val.shape[0] == 2 and param_name not in ['eyecenter_L', 'eyecenter_R']:
+            # For 2-element params that aren't eye centers
+            val = val.unsqueeze(0).expand(batch_size, -1)
+        elif val.shape[0] == 3:
+            # For 3-element params (like kappa, eye centers)
+            val = val.unsqueeze(0).expand(batch_size, -1)
+        else:
+            # General case
+            val = val.unsqueeze(0).expand(batch_size, -1)
+
+    return val
+
+
+def convert_batch_for_depth_aware_kappa_2d(batch, device):
+    """
+    Convert batch with CORRECT 2D kappa handling
+    Note: In in the original GazeGene document mistakenly states kappa is 3D, but it's actually 2D!
+    """
+    batch_size = batch['img'].shape[0]
+
+    # Images
+    images = batch['img'].to(device)
+
+    # Extract subject parameters
+    gazegene_subject_params = {}
     subject_attrs_list = batch.get('subject_attributes', [])
 
-    # # Extract data from batch
-    # images = batch['img'].to(device)  # [B*9, 3, H, W]
-    #
-    # # Get batch size (accounting for 9 views per sample)
-    # total_batch_size = images.shape[0]
-    # B = total_batch_size // 9
-    #
-    # # Reshape for multi-view processing
-    # images = images.view(B * 9, *images.shape[1:])
+    # Get reference attributes
+    reference_attrs = None
+    for attrs in subject_attrs_list:
+        if attrs is not None and isinstance(attrs, dict):
+            reference_attrs = attrs
+            break
 
-    # Subject specific parameters
-    """
-        subject_params =
-        {
-            'ID': int,                     # Subject ID from 1 to 56
-            'gender': str,                 # ['F', 'M'] refers to female and male
-            'ethicity': str,               # ['B', 'Y', 'W'] refers to Black, Yellow and White
-            'eyecenter_L': np.array(3,)    # Left eyeball center coordinates under HCS
-            'eyecenter_R': np.array(3,)    # Right eyeball center coordinates under HCS
-            'eyeball_radius': float,       # Eyeball radius
-            'iris_radius': float,          # Iris radius
-            'cornea_radius': float,        # Cornea radius
-            'cornea2center': float,        # Distance from cornea center to eyeball center
-            'UVRadius': float,             # Normalized relative pupil size
-            'L_kappa': np.array(3,),       # Euler angles of left eye kappa
-            'R_kappa': np.array(3,)        # Euler angles of right eye kappa
-        }
-    """
-    # subject_params = batch['subject_attributes'].to(device)
-    # subject_params= subject_params.view(B * 9, *subject_params.shape[1:])
-    #
-    # # Camera intrinsics parameters 3x3 matrix for each view
-    # camera_params = batch['intrinsic'].to(device)  # [B*9, 3, 3]
-    # camera_params = camera_params.view(B * 9, *camera_params.shape[1:])
+    if reference_attrs:
+        for param_name in ['eyecenter_L', 'eyecenter_R', 'eyeball_radius',
+                           'iris_radius', 'cornea_radius', 'cornea2center',
+                           'UVRadius', 'L_kappa', 'R_kappa']:
 
+            if param_name in reference_attrs:
+                val = reference_attrs[param_name]
+
+                # Convert to tensor
+                if isinstance(val, (int, float)):
+                    tensor_val = torch.tensor([val], dtype=torch.float32)
+                else:
+                    tensor_val = torch.tensor(val, dtype=torch.float32)
+
+                # DO NOT expand kappa to 3D - keep it as 2D!
+                # Kappa is [horizontal, vertical] only
+
+                # Ensure proper shape
+                if tensor_val.dim() == 0:
+                    tensor_val = tensor_val.unsqueeze(0)
+
+                # Expand to batch size
+                if tensor_val.shape[0] == 1:
+                    if tensor_val.dim() == 1:
+                        tensor_val = tensor_val.unsqueeze(0).expand(batch_size, -1)
+                    else:
+                        tensor_val = tensor_val.expand(batch_size, *tensor_val.shape[1:])
+
+                gazegene_subject_params[param_name] = tensor_val.to(device)
+
+    # Camera parameters
+    camera_params = {
+        'intrinsic_matrix': batch['intrinsic'].to(device)
+    }
+
+    # Ground truth
+    ground_truth = {}
+
+    # 3D annotations
+    if 'mesh' in batch:
+        mesh = batch['mesh']
+        ground_truth['eyeball_center_3D'] = mesh['eyeball_center_3D'].to(device)
+        ground_truth['pupil_center_3D'] = mesh['pupil_center_3D'].to(device)
+
+        # Reshape iris 3D: [B, 2, 100, 3] -> [B, 200, 3]
+        iris_3d = mesh['iris_mesh_3D'].to(device)
+        if iris_3d.dim() == 4 and iris_3d.shape[1] == 2:
+            ground_truth['iris_mesh_3D'] = iris_3d.reshape(batch_size, -1, 3)
+        else:
+            ground_truth['iris_mesh_3D'] = iris_3d
+
+    # 2D annotations
+    if 'mesh_2d' in batch and batch['mesh_2d'] is not None:
+        mesh_2d = batch['mesh_2d']
+
+        if 'eyeball_center_2D' in mesh_2d and mesh_2d['eyeball_center_2D'] is not None:
+            ground_truth['eyeball_center_2D'] = mesh_2d['eyeball_center_2D'].to(device)
+
+        if 'pupil_center_2D' in mesh_2d and mesh_2d['pupil_center_2D'] is not None:
+            ground_truth['pupil_center_2D'] = mesh_2d['pupil_center_2D'].to(device)
+
+        if 'iris_mesh_2D' in mesh_2d and mesh_2d['iris_mesh_2D'] is not None:
+            iris_2d = mesh_2d['iris_mesh_2D'].to(device)
+            if iris_2d.dim() == 4 and iris_2d.shape[1] == 2:
+                ground_truth['iris_mesh_2D'] = iris_2d.reshape(batch_size, -1, 2)
+            else:
+                ground_truth['iris_mesh_2D'] = iris_2d
+
+    # Gaze annotations
+    if 'gaze' in batch:
+        gaze = batch['gaze']
+        ground_truth['gaze_C'] = gaze['gaze_vector_C'].to(device)
+        ground_truth['optic_axis_L'] = gaze['optic_axis_L'].to(device)
+        ground_truth['optic_axis_R'] = gaze['optic_axis_R'].to(device)
+
+        if 'visual_axis_L' in gaze:
+            ground_truth['visual_axis_L'] = gaze['visual_axis_L'].to(device)
+        if 'visual_axis_R' in gaze:
+            ground_truth['visual_axis_R'] = gaze['visual_axis_R'].to(device)
+
+    return {
+        'images': images,
+        'gazegene_subject_params': gazegene_subject_params,
+        'camera_params': camera_params,
+        'ground_truth': ground_truth
+    }
+
+
+def train_step(model, batch, loss_fn, optimizer, strategy, args, device):
+    """
+        Single training step with dynamic loss weighting and gradient clipping
+    """
+    model.train()
+    optimizer.zero_grad()
+
+    # Convert batch with fixed parameter expansion
+    model_inputs = convert_batch_for_depth_aware_kappa_2d(batch, device)
+
+    # Verify 2D annotations exist
+    if 'iris_mesh_2D' not in model_inputs['ground_truth']:
+        raise ValueError("2D annotations are required for depth-aware training.")
+
+    # Forward pass through FULL RayNet model (not just EyeFLAME)
     predictions = model(
-        images,
-        subject_params=gazegene_subject_params,
-        camera_params=camera_params)
+        model_inputs['images'],  # Raw images go to RayNet
+        subject_params=model_inputs['gazegene_subject_params'],
+        camera_params=model_inputs['camera_params']
+    )
 
-    # Compute loss
-    total_loss, individual_losses = loss_fn(predictions, ground_truth, gazegene_subject_params, camera_params)
+    # Compute losses
+    total_loss, individual_losses = loss_fn(
+        predictions,
+        model_inputs['ground_truth'],
+        model_inputs['gazegene_subject_params'],
+        model_inputs['camera_params']
+    )
 
-    # Backward pass
-    total_loss.backward()
+    # Apply dynamic weighting based on strategy phase
+    weights = strategy.get_current_weights()
+    weighted_loss = 0
+    weighted_losses = {}
 
+    for loss_name, loss_val in individual_losses.items():
+        if '2d' in loss_name:
+            weight = weights['2d']
+        elif '3d' in loss_name:
+            weight = weights['3d']
+        elif 'gaze' in loss_name or 'optical' in loss_name:
+            weight = weights['angular']
+        else:  # Regularization
+            weight = weights['reg']
+
+        weighted_losses[loss_name] = weight * loss_val
+        weighted_loss += weighted_losses[loss_name]
+
+    # Backward pass with gradient clipping
+    weighted_loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
     optimizer.step()
 
     # Compute metrics
     with torch.no_grad():
-        metrics = compute_metrics(predictions, ground_truth)
+        metrics = compute_metrics(predictions, model_inputs['ground_truth'])
+
+    # Aggregate losses for strategy
+    loss_2d_avg = np.mean([v.item() for k, v in individual_losses.items() if '2d' in k and v > 0])
+    loss_3d_avg = np.mean([v.item() for k, v in individual_losses.items() if '3d' in k and v > 0])
 
     return {
-        'total_loss': total_loss.item(),
-        'losses': {k: v.item() if torch.is_tensor(v) else v for k, v in individual_losses.items()},
-        'metrics': {k: v.item() if torch.is_tensor(v) else v for k, v in metrics.items()}
+        'total_loss': weighted_loss.item(),
+        'losses': {k: v.item() if torch.is_tensor(v) else v for k, v in weighted_losses.items()},
+        'raw_losses': {k: v.item() if torch.is_tensor(v) else v for k, v in individual_losses.items()},
+        'metrics': metrics,
+        'loss_2d_avg': loss_2d_avg if not np.isnan(loss_2d_avg) else 0,
+        'loss_3d_avg': loss_3d_avg if not np.isnan(loss_3d_avg) else 0,
+        'strategy_phase': strategy.phase
     }
-
-
-def validation_step(model, val_loader, loss_fn, args, device):
-    """Validation step."""
-    model.eval()
-    val_losses = defaultdict(list)
-    val_metrics = defaultdict(list)
-
-    with torch.no_grad():
-        for batch in val_loader:
-            # Convert batch to model format (same as train_step)
-            model_inputs = convert_dataset_to_model_format(batch, device)
-
-            # Move to device (same as train_step)
-            images = model_inputs['images'].to(device)
-            gazegene_subject_params = {k: v.to(device) for k, v in model_inputs['gazegene_subject_params'].items()}
-            camera_params = {k: v.to(device) for k, v in model_inputs['camera_params'].items()} if model_inputs[
-                'camera_params'] else None
-            ground_truth = {k: v.to(device) for k, v in model_inputs['ground_truth'].items()}
-
-            # Model prediction (same as train_step)
-            predictions = model(
-                images,
-                subject_params=gazegene_subject_params,
-                camera_params=camera_params
-            )
-
-            # Compute loss (same as train_step)
-            total_loss, individual_losses = loss_fn(predictions, ground_truth, gazegene_subject_params, camera_params)
-
-            # Compute metrics (same as train_step)
-            metrics = compute_metrics(predictions, ground_truth)
-
-            # Accumulate results
-            val_losses['total'].append(total_loss.item())
-            for k, v in individual_losses.items():
-                val_losses[k].append(v.item() if torch.is_tensor(v) else v)
-            for k, v in metrics.items():
-                val_metrics[k].append(v.item() if torch.is_tensor(v) else v)
-
-    # Average results
-    avg_losses = {k: np.mean(v) for k, v in val_losses.items()}
-    avg_metrics = {k: np.mean(v) for k, v in val_metrics.items()}
-
-    return avg_losses, avg_metrics
 
 
 def compute_metrics(predictions, ground_truth):
     """
-    Compute evaluation metrics
-
-    Args:
-        predictions: Model predictions
-        ground_truth: Ground truth data
-
-    Returns:
-        Dictionary of metrics
+    Compute evaluation metrics with error handling
     """
     metrics = {}
 
-    # 3D reconstruction errors (in cm)
-    if 'eyeball_centers' in predictions:
-        eyeball_error = torch.mean(torch.norm(
-            predictions['eyeball_centers'] - ground_truth['eyeball_center_3D'], dim=-1
-        ))
-        metrics['eyeball_error_cm'] = eyeball_error.item()
+    # 3D metrics (in cm)
+    if 'eyeball_centers' in predictions and 'eyeball_center_3D' in ground_truth:
+        if predictions['eyeball_centers'].shape == ground_truth['eyeball_center_3D'].shape:
+            error = torch.norm(predictions['eyeball_centers'] - ground_truth['eyeball_center_3D'], dim=-1)
+            metrics['eyeball_error_cm'] = torch.mean(error).item()
 
-    if 'pupil_centers' in predictions:
-        pupil_error = torch.mean(torch.norm(
-            predictions['pupil_centers'] - ground_truth['pupil_center_3D'], dim=-1
-        ))
-        metrics['pupil_error_cm'] = pupil_error.item()
+    if 'pupil_centers' in predictions and 'pupil_center_3D' in ground_truth:
+        if predictions['pupil_centers'].shape == ground_truth['pupil_center_3D'].shape:
+            error = torch.norm(predictions['pupil_centers'] - ground_truth['pupil_center_3D'], dim=-1)
+            metrics['pupil_error_cm'] = torch.mean(error).item()
 
-    if 'iris_landmarks_100' in predictions:
-        iris_error = torch.mean(torch.norm(
-            predictions['iris_landmarks_100'] - ground_truth['iris_mesh_3D'], dim=-1
-        ))
-        metrics['iris_error_cm'] = iris_error.item()
+    if 'iris_landmarks_100' in predictions and 'iris_mesh_3D' in ground_truth:
+        if predictions['iris_landmarks_100'].shape == ground_truth['iris_mesh_3D'].shape:
+            error = torch.norm(predictions['iris_landmarks_100'] - ground_truth['iris_mesh_3D'], dim=-1)
+            metrics['iris_error_cm'] = torch.mean(error).item()
 
-    # Angular errors (in degrees)
-    if 'head_gaze_direction' in predictions:
-        gaze_cosine_sim = torch.sum(
-            predictions['head_gaze_direction'] * ground_truth['gaze_C'], dim=-1
-        )
-        gaze_angle_error = torch.acos(torch.clamp(gaze_cosine_sim, -1 + 1e-7, 1 - 1e-7))
-        metrics['gaze_angle_error_deg'] = torch.mean(gaze_angle_error).item() * 180 / np.pi
+    # Angular metrics (in degrees)
+    if 'head_gaze_direction' in predictions and 'gaze_C' in ground_truth:
+        if predictions['head_gaze_direction'].shape == ground_truth['gaze_C'].shape:
+            cosine_sim = torch.sum(predictions['head_gaze_direction'] * ground_truth['gaze_C'], dim=-1)
+            cosine_sim = torch.clamp(cosine_sim, -1 + 1e-7, 1 - 1e-7)
+            angle_error = torch.acos(cosine_sim)
+            metrics['gaze_angle_error_deg'] = torch.mean(angle_error).item() * 180 / np.pi
 
-    if 'optical_axes' in predictions:
-        # Left eye optical axis error
-        left_optical_cosine = torch.sum(
-            predictions['optical_axes'][:, 0] * ground_truth['optic_axis_L'], dim=-1
-        )
-        left_optical_error = torch.acos(torch.clamp(left_optical_cosine, -1 + 1e-7, 1 - 1e-7))
+    # 2D metrics (in pixels)
+    if 'projections_2d' in predictions and predictions['projections_2d'] is not None:
+        if 'iris_landmarks_2d' in predictions['projections_2d'] and 'iris_mesh_2D' in ground_truth:
+            pred_2d = predictions['projections_2d']['iris_landmarks_2d']
+            gt_2d = ground_truth['iris_mesh_2D']
+            if pred_2d.shape == gt_2d.shape:
+                error = torch.norm(pred_2d - gt_2d, dim=-1)
+                metrics['iris_2d_error_px'] = torch.mean(error).item()
 
-        # Right eye optical axis error
-        right_optical_cosine = torch.sum(
-            predictions['optical_axes'][:, 1] * ground_truth['optic_axis_R'], dim=-1
-        )
-        right_optical_error = torch.acos(torch.clamp(right_optical_cosine, -1 + 1e-7, 1 - 1e-7))
+    # Weak perspective metrics
+    if 'weak_perspective' in predictions:
+        wp = predictions['weak_perspective']
+        metrics['depth_scale'] = wp['scale'].mean().item()
+        metrics['translation_magnitude'] = torch.norm(wp['translation_2d'], dim=-1).mean().item()
 
-        metrics['optical_axis_error_deg'] = (torch.mean(left_optical_error) + torch.mean(
-            right_optical_error)).item() * 90 / np.pi
+    # Add defaults for missing metrics
+    default_metrics = {
+        'eyeball_error_cm': 0,
+        'pupil_error_cm': 0,
+        'iris_error_cm': 0,
+        'gaze_angle_error_deg': 0,
+        'iris_2d_error_px': 0,
+        'depth_scale': 1.0,
+        'translation_magnitude': 0
+    }
 
-    # 2D projection errors (in pixels, if available)
-    if 'projections_2d' in predictions and 'iris_mesh_2D' in ground_truth:
-        iris_2d_error = torch.mean(torch.norm(
-            predictions['projections_2d']['iris_landmarks_2d'] - ground_truth['iris_mesh_2D'], dim=-1
-        ))
-        metrics['iris_2d_error_px'] = iris_2d_error.item()
+    for key, default_val in default_metrics.items():
+        if key not in metrics:
+            metrics[key] = default_val
 
     return metrics
 
 
-def gazegene_collate_fn(batch):
-    """
-    Custom collate function for GazeGene dataset that handles:
-    - Multi-view samples (9 cameras per subject)
-    - Complex nested dictionaries
-    - Mixed data types (tensors, scalars, None values)
+def validation_step(model, val_loader, loss_fn, strategy, args, device):
+    """Validation step"""
 
-    Args:
-        batch: List of samples from dataset.__getitem__()
+    model.eval()
+    val_losses = defaultdict(list)
+    val_metrics = defaultdict(list)
+    val_raw_losses = defaultdict(list)
 
-    Returns:
-        Collated batch dictionary
-    """
-    if len(batch) == 0:
-        return {}
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_loader):
+            # Convert batch
+            model_inputs = convert_batch_for_depth_aware_kappa_2d(batch, device)
+            # Verify 2D annotations exist
+            if 'iris_mesh_2D' not in model_inputs['ground_truth']:
+                print("Warning: Missing 2D annotations in batch!")
+                # Could skip this batch or use dummy 2D loss
 
-    # Handle case where some samples might be None or invalid
-    valid_batch = [item for item in batch if item is not None]
-    if len(valid_batch) == 0:
-        return {}
+            # Forward pass
+            predictions = model(
+                model_inputs['images'],
+                subject_params=model_inputs['gazegene_subject_params'],
+                camera_params=model_inputs['camera_params']
+            )
 
-    # Initialize collated batch
-    collated = {}
+            # Compute losses
+            total_loss, individual_losses = loss_fn(
+                predictions,
+                model_inputs['ground_truth'],
+                model_inputs['gazegene_subject_params'],
+                model_inputs['camera_params']
+            )
 
-    # Collate simple tensor fields
-    tensor_fields = ['img', 'intrinsic']
-    for field in tensor_fields:
-        if field in valid_batch[0]:
-            try:
-                collated[field] = torch.stack([item[field] for item in valid_batch])
-            except Exception as e:
-                print(f"Error collating {field}: {e}")
-                # If stacking fails, keep as list
-                collated[field] = [item[field] for item in valid_batch]
+            # Apply strategy weights
+            weights = strategy.get_current_weights()
+            weighted_loss = 0
 
-    # Collate simple scalar fields
-    scalar_fields = ['subject', 'camera', 'frame_idx']
-    for field in scalar_fields:
-        if field in valid_batch[0]:
-            collated[field] = [item[field] for item in valid_batch]
+            for loss_name, loss_val in individual_losses.items():
+                if '2d' in loss_name:
+                    weight = weights['2d']
+                elif '3d' in loss_name:
+                    weight = weights['3d']
+                elif 'gaze' in loss_name or 'optical' in loss_name:
+                    weight = weights['angular']
+                else:
+                    weight = weights['reg']
 
-    # Collate nested dictionary fields
-    nested_dict_fields = ['mesh', 'gaze', 'head_pose']
-    for field in nested_dict_fields:
-        if field in valid_batch[0] and valid_batch[0][field] is not None:
-            collated[field] = {}
+                weighted_loss += weight * loss_val
+                val_losses[loss_name].append(loss_val.item())
+                val_raw_losses[f"raw_{loss_name}"].append(loss_val.item())
 
-            # Get all keys from the nested dictionary
-            all_keys = set()
-            for item in valid_batch:
-                if item[field] is not None:
-                    all_keys.update(item[field].keys())
+            val_losses['total'].append(weighted_loss.item())
 
-            # Collate each key in the nested dictionary
-            for key in all_keys:
-                try:
-                    values = []
-                    for item in valid_batch:
-                        if item[field] is not None and key in item[field]:
-                            values.append(item[field][key])
-                        else:
-                            # Handle missing values by using None or zero tensor
-                            values.append(None)
+            # Compute metrics
+            metrics = compute_metrics(predictions, model_inputs['ground_truth'])
+            for k, v in metrics.items():
+                val_metrics[k].append(v)
 
-                    # Filter out None values
-                    non_none_values = [v for v in values if v is not None]
-                    if non_none_values:
-                        if torch.is_tensor(non_none_values[0]):
-                            # Try to stack tensors
-                            try:
-                                collated[field][key] = torch.stack(non_none_values)
-                            except Exception as e:
-                                print(f"Error stacking {field}.{key}: {e}")
-                                collated[field][key] = non_none_values
-                        else:
-                            # Keep as list for non-tensor values
-                            collated[field][key] = non_none_values
-                    else:
-                        collated[field][key] = None
+    # Average results
+    avg_losses = {k: np.mean(v) for k, v in val_losses.items()}
+    avg_metrics = {k: np.mean(v) for k, v in val_metrics.items()}
+    avg_raw_losses = {k: np.mean(v) for k, v in val_raw_losses.items()}
 
-                except Exception as e:
-                    print(f"Error collating {field}.{key}: {e}")
-                    collated[field][key] = [item[field][key] if item[field] else None for item in valid_batch]
+    # Compute average 2D and 3D losses for strategy
+    loss_2d_avg = np.mean([v for k, v in avg_raw_losses.items() if '2d' in k])
+    loss_3d_avg = np.mean([v for k, v in avg_raw_losses.items() if '3d' in k])
 
-    # Handle optional nested fields that might be None
-    optional_nested_fields = ['mesh_2d', 'camera_params']
-    for field in optional_nested_fields:
-        if field in valid_batch[0]:
-            # Check if any item has non-None values for this field
-            has_valid_data = any(item[field] is not None for item in valid_batch)
+    return {
+        'avg_losses': avg_losses,
+        'avg_metrics': avg_metrics,
+        'avg_raw_losses': avg_raw_losses,
+        'loss_2d_avg': loss_2d_avg,
+        'loss_3d_avg': loss_3d_avg
+    }
 
-            if has_valid_data:
-                collated[field] = {}
 
-                # Get all possible keys
-                all_keys = set()
-                for item in valid_batch:
-                    if item[field] is not None:
-                        all_keys.update(item[field].keys())
+def save_checkpoint(model, optimizer, scheduler, epoch, strategy, metrics, checkpoint_path):
+    """Save training checkpoint"""
 
-                # Collate each key
-                for key in all_keys:
-                    values = []
-                    for item in valid_batch:
-                        if item[field] is not None and key in item[field]:
-                            values.append(item[field][key])
-                        else:
-                            values.append(None)
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'strategy': {
+            'phase': strategy.phase,
+            'phase_epochs': strategy.phase_epochs,
+            'best_2d_loss': strategy.best_2d_loss,
+            'best_3d_loss': strategy.best_3d_loss
+        },
+        'metrics': metrics,
+        'timestamp': datetime.now().isoformat()
+    }
 
-                    # Filter and collate non-None values
-                    non_none_values = [v for v in values if v is not None]
-                    if non_none_values:
-                        if torch.is_tensor(non_none_values[0]):
-                            try:
-                                collated[field][key] = torch.stack(non_none_values)
-                            except:
-                                collated[field][key] = non_none_values
-                        else:
-                            collated[field][key] = non_none_values
-                    else:
-                        collated[field][key] = None
-            else:
-                collated[field] = None
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Checkpoint saved to {checkpoint_path}")
 
-    # Handle subject_attributes specially (list of dictionaries)
-    if 'subject_attributes' in valid_batch[0]:
-        collated['subject_attributes'] = [item['subject_attributes'] for item in valid_batch]
 
-    return collated
+def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, strategy=None):
+    """Load training checkpoint"""
+
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+    model.load_state_dict(checkpoint['model_state_dict'])
+
+    if optimizer and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    if scheduler and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+    if strategy and 'strategy' in checkpoint:
+        strategy.phase = checkpoint['strategy']['phase']
+        strategy.phase_epochs = checkpoint['strategy']['phase_epochs']
+        strategy.best_2d_loss = checkpoint['strategy']['best_2d_loss']
+        strategy.best_3d_loss = checkpoint['strategy']['best_3d_loss']
+
+    print(f"Checkpoint loaded from {checkpoint_path}")
+    print(f"  Epoch: {checkpoint['epoch']}")
+    print(f"  Strategy phase: {checkpoint['strategy']['phase']}")
+
+    return checkpoint['epoch']
 
 
 def main():
     args = parse_args()
 
+    # Set seeds
     torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Create datasets and loaders
-    print("Creating datasets...")
-    train_loader, val_loader = create_datasets_and_loaders(args)
-    print(f"Training samples: {len(train_loader.dataset)}")
-    if val_loader:
-        print(f"Validation samples: {len(val_loader.dataset)}")
-
-    # Create model
-    print("Creating model...")
-    model = create_raynet_model(args.backbone_name, args.weight_path)
-
-    loss_fn = EyeFLAMELoss(
-        use_uncertainty_weighting=True,
-        use_scale_weighting=True
-    ).to(device)
-
-    # Optimizer
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-
-    # Setup logging
+    # Create output directories
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    logfile = open(args.log_csv, "w", newline="")
-    fieldnames = ['epoch', 'train_loss', 'val_loss', 'lr',
+
+    # Initialize CSV logger
+    csv_file = open(args.log_csv, 'w', newline='')
+    csv_fields = ['epoch', 'phase', 'train_loss', 'val_loss', 'lr',
+                  'loss_2d_avg', 'loss_3d_avg',
                   'eyeball_error_cm', 'pupil_error_cm', 'iris_error_cm',
-                  'gaze_angle_error_deg', 'optical_axis_error_deg']
-    csv_writer = csv.DictWriter(logfile, fieldnames=fieldnames)
+                  'gaze_angle_error_deg', 'optical_axis_error_deg', 'iris_2d_error_px']
+    csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fields)
     csv_writer.writeheader()
 
-    # Resume from checkpoint if available
+    # Create datasets
+    print("Creating datasets...")
+    train_loader, val_loader = create_datasets_and_loaders(args)
+
+    # Create model
+    print("Creating depth-aware model...")
+    model = create_raynet_model_with_depth_aware(
+        backbone_name=args.backbone_name,
+        weight_path=args.weight_path,
+    )
+    model = model.to(device)
+
+    # Create loss function
+    loss_fn = WeakPerspectiveLoss().to(device)
+
+    # Create optimizer and scheduler
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    # Initialize dynamic strategy
+    strategy = DynamicTrainingStrategy()
+
+    # Resume from checkpoint if specified
     start_epoch = 0
-    checkpoint_files = sorted([f for f in os.listdir(args.checkpoint_dir) if f.endswith('.pth')])
-    if checkpoint_files:
-        last_ckpt = os.path.join(args.checkpoint_dir, checkpoint_files[-1])
-        print(f"Resuming from checkpoint: {last_ckpt}")
-        checkpoint = torch.load(last_ckpt, map_location=device)
-        model.load_state_dict(checkpoint['model'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        start_epoch = checkpoint['epoch'] + 1
+    if args.resume:
+        start_epoch = load_checkpoint(args.resume, model, optimizer, scheduler, strategy)
 
     # Training loop
-    print("Starting training...")
+    print("\n=== Starting Training ===")
     print(f"Total epochs: {args.epochs}")
+    print(f"Batch size: {args.batch_size}")
     print(f"Steps per epoch: {len(train_loader)}")
 
-    if len(train_loader) == 0:
-        print("ERROR: No training data available! Check your dataset path and subject IDs.")
-        return
+    best_val_loss = float('inf')
 
     for epoch in range(start_epoch, args.epochs):
-        # Update loss weights for progressive training
-        print(f"Epoch {epoch + 1}/{args.epochs}")
+        print(f"\n{'=' * 50}")
+        print(f"Epoch {epoch + 1}/{args.epochs} - Phase {strategy.phase}")
+        print(f"Learning rate: {optimizer.param_groups[0]['lr']:.6f}")
+        print(f"Current weights: {strategy.get_current_weights()}")
+
         # Training
         epoch_losses = defaultdict(list)
         epoch_metrics = defaultdict(list)
 
-        num_batches = 0
         for step, batch in enumerate(train_loader):
             try:
-                train_results = train_step(model, batch, loss_fn, optimizer, args, device)
 
+                train_results = train_step(
+                    model, batch, loss_fn, optimizer, strategy, args, device
+                )
                 # Accumulate results
-                for k, v in train_results['losses'].items():
-                    epoch_losses[k].append(v)
+                epoch_losses['total'].append(train_results['total_loss'])
+                epoch_losses['2d_avg'].append(train_results['loss_2d_avg'])
+                epoch_losses['3d_avg'].append(train_results['loss_3d_avg'])
+
                 for k, v in train_results['metrics'].items():
                     epoch_metrics[k].append(v)
 
-                num_batches += 1
+                # Logging
+                if (step + 1) % args.log_freq == 0:
+                    print(f"  Step {step + 1}/{len(train_loader)}")
+                    print(f"    Total loss: {train_results['total_loss']:.4f}")
+                    print(f"    2D loss avg: {train_results['loss_2d_avg']:.2f} px")
+                    print(f"    3D loss avg: {train_results['loss_3d_avg']:.2f} cm")
 
-                # Log progress
-                if (step + 1) % 10 == 0:
-                    print(f"  Step {step + 1}/{len(train_loader)} | "
-                          f"Total loss: {train_results['total_loss']} | "
-                          f"Losses: {train_results['losses']} | "
-                          f"Metrics Error: {train_results['metrics']}")
+                    if args.debug:
+                        print(f"    Raw losses: {train_results['raw_losses']}")
+                        print(f"    Metrics: {train_results['metrics']}")
+
             except Exception as e:
                 print(f"Error in training step {step}: {e}")
-                import traceback
-                traceback.print_exc()
+                if args.debug:
+                    import traceback
+                    traceback.print_exc()
                 continue
 
-        if num_batches == 0:
-            print(f"WARNING: No successful training steps in epoch {epoch}")
-            continue
+        # Compute epoch averages
+        avg_train_loss = np.mean(epoch_losses['total'])
+        avg_2d_loss = np.mean(epoch_losses['2d_avg'])
+        avg_3d_loss = np.mean(epoch_losses['3d_avg'])
 
-        print(f"Completed {num_batches} training steps")
+        print(f"\nTraining Summary:")
+        print(f"  Average loss: {avg_train_loss:.4f}")
+        print(f"  Average 2D loss: {avg_2d_loss:.2f} px")
+        print(f"  Average 3D loss: {avg_3d_loss:.2f} cm")
 
         # Validation
-        val_losses, val_metrics = {}, {}
-        if val_loader:
-            print("Running validation...")
-            val_losses, val_metrics = validation_step(model, val_loader, loss_fn, args, device)
-            print(f"Validation - Total Loss: {val_losses['total']:.4f} | "
-                  f"3D Error: {val_metrics.get('iris_mesh_3d_l2_error', 0):.4f}")
+        val_results = None
+        if (epoch + 1) % args.validate_freq == 0:
+            print("\nRunning validation...")
+            val_results = validation_step(
+                model, val_loader, loss_fn, strategy, args, device
+            )
 
-        # Update learning rate (after optimizer.step())
+            print(f"Validation Summary:")
+            print(f"  Average loss: {val_results['avg_losses']['total']:.4f}")
+            print(f"  Average 2D loss: {val_results['loss_2d_avg']:.2f} px")
+            print(f"  Average 3D loss: {val_results['loss_3d_avg']:.2f} cm")
+            print(f"  Metrics: {val_results['avg_metrics']}")
+
+            # Check for best model
+            if val_results['avg_losses']['total'] < best_val_loss:
+                best_val_loss = val_results['avg_losses']['total']
+                best_checkpoint_path = os.path.join(args.checkpoint_dir, 'best_model.pth')
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch, strategy,
+                    val_results['avg_metrics'], best_checkpoint_path
+                )
+                print(f"  New best model saved!")
+
+        # Check phase transition
+        transition_metrics = {
+            'loss_2d_avg': avg_2d_loss,
+            'loss_3d_avg': avg_3d_loss
+        }
+
+        if strategy.should_transition(transition_metrics):
+            print(f"\n{'*' * 50}")
+            print(f"* TRANSITIONING TO PHASE {strategy.phase} *")
+            print(f"{'*' * 50}\n")
+
+        # Update learning rate
         scheduler.step()
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"Learning rate: {current_lr:.6f}")
 
         # Log to CSV
-        csv_row = [
-            epoch,
-            epoch_losses.get('total', 0),
-            val_losses.get('total', 0),
-            optimizer.param_groups[0]['lr'],
-            # Training metrics
-            epoch_metrics.get('eyeball_error_cm', 0),
-            epoch_metrics.get('pupil_error_cm', 0),
-            epoch_metrics.get('iris_error_cm', 0),
-            epoch_metrics.get('gaze_angle_error_deg', 0),
-            epoch_metrics.get('optical_axis_error_deg', 0),
-            # Validation metrics
-            val_metrics.get('eyeball_error_cm', 0),
-            val_metrics.get('pupil_error_cm', 0),
-            val_metrics.get('iris_error_cm', 0),
-            val_metrics.get('gaze_angle_error_deg', 0),
-            val_metrics.get('optical_axis_error_deg', 0)
-        ]
+        csv_row = {
+            'epoch': epoch + 1,
+            'phase': strategy.phase,
+            'train_loss': avg_train_loss,
+            'val_loss': val_results['avg_losses']['total'] if val_results else 0,
+            'lr': optimizer.param_groups[0]['lr'],
+            'loss_2d_avg': avg_2d_loss,
+            'loss_3d_avg': avg_3d_loss
+        }
+
+        # Add metrics if validation was performed
+        if val_results:
+            for metric_name in ['eyeball_error_cm', 'pupil_error_cm', 'iris_error_cm',
+                                'gaze_angle_error_deg', 'optical_axis_error_deg', 'iris_2d_error_px']:
+                csv_row[metric_name] = val_results['avg_metrics'].get(metric_name, 0)
+
         csv_writer.writerow(csv_row)
-        logfile.flush()
+        csv_file.flush()
 
-        # Save checkpoint
-        if (epoch + 1) % args.checkpoint_freq == 0 or (epoch + 1) == args.epochs:
-            ckpt_path = os.path.join(args.checkpoint_dir, f"enhanced_raynet_epoch{epoch + 1}.pth")
-            torch.save({
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'epoch': epoch,
-                'args': vars(args),
-            }, ckpt_path)
-            print(f"Checkpoint saved to {ckpt_path}")
+        # Save checkpoint periodically
+        if (epoch + 1) % args.checkpoint_freq == 0:
+            checkpoint_path = os.path.join(
+                args.checkpoint_dir,
+                f"checkpoint_epoch{epoch + 1}_phase{strategy.phase}.pth"
+            )
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, strategy,
+                val_results['avg_metrics'] if val_results else epoch_metrics,
+                checkpoint_path
+            )
 
-    logfile.close()
-    print("Training complete!")
+    # Save final model
+    final_checkpoint_path = os.path.join(args.checkpoint_dir, 'final_model.pth')
+    save_checkpoint(
+        model, optimizer, scheduler, args.epochs - 1, strategy,
+        val_results['avg_metrics'] if val_results else epoch_metrics,
+        final_checkpoint_path
+    )
+
+    csv_file.close()
+    print("\n=== Training Complete ===")
+    print(f"Best validation loss: {best_val_loss:.4f}")
+    print(f"Final strategy phase: {strategy.phase}")
+    print(f"Checkpoints saved to: {args.checkpoint_dir}")
+    print(f"Training log saved to: {args.log_csv}")
 
 
 if __name__ == "__main__":
