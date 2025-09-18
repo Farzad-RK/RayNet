@@ -367,7 +367,7 @@ Since BIWI is no longer publicly available, consider these alternative datasets 
 
 | Model | Yaw (°) | Pitch (°) | Roll (°) | MAE (°) | Params (M) | Latency (ms) | Device |
 |-------|---------|-----------|----------|---------|------------|--------------|--------|
-| RepNeXt-M4(The model used in this repo) [7] | 3.68 | 4.75 | 3.31 | 3.91 | 12.8 | (Not tested for head pose estimation) | iPhone 12 |
+| RepNeXt-M4(The model used in this repo) [7] | 3.68 | 4.75 | 3.31 | 3.91 | 13.8 | (Not tested for head pose estimation) | iPhone 12 |
 | 6DRepNet (ResNet50) [1] | 3.65 | 4.87 | 3.43 | 3.97 | 25.6 | 15.8 | iPhone 12 |
 | 6DRepNet (RepVGG-B1) [1] | 3.71 | 4.93 | 3.52 | 4.05 | 20.3 | 8.7 | iPhone 12 |
 | FSA-Net [2] | 4.50 | 6.08 | 4.64 | 5.07 | 0.27 | 2.1 | iPhone 12 |
