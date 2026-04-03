@@ -7,6 +7,9 @@
 - [[Training Guide]]
 - [[Loss Functions]]
 - [[Multi-View Consistency]]
-- [[WebDataset Streaming]]
+- **Data Streaming**
+  - [[WebDataset Streaming]]
+  - [[MosaicML Streaming]]
+
 - [[Geometry and Kappa]]
 - [[API Reference]]
