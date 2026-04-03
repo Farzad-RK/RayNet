@@ -1,14 +1,14 @@
 config==0.5.1
 face_detection==0.2.2
-matplotlib==3.7.5
-numpy==1.24.4
+matplotlib==3.8.2
+numpy==1.26.4
 onnx==1.18.0
 onnxruntime==1.22.1
-opencv_python==4.12.0.88
-pandas==2.0.3
+opencv-python-headless==4.12.0.88
+pandas==2.1.4
 Pillow==11.3.0
 pytorch_model_summary==0.1.2
-scipy==1.16.1
+scipy==1.11.4
 timm==1.0.19
 torch==2.4.1
 torchvision==0.19.1
@@ -17,4 +17,6 @@ cvxpy
 webdataset>=0.2.86
 huggingface_hub>=0.21.0
 mosaicml-streaming>=0.7.0
+bugfix/MosaicLM
 minio>=7.2.0
+

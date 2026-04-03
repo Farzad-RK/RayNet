@@ -10,6 +10,5 @@
 - **Data Streaming**
   - [[WebDataset Streaming]]
   - [[MosaicML Streaming]]
-
 - [[Geometry and Kappa]]
 - [[API Reference]]

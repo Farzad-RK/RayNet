@@ -137,6 +137,98 @@ def _build_multiview_order(dataset):
     return ordered
 
 
+def convert_to_mds_chunked(data_dir, output_dir, subject_ids,
+                           split='train', multiview_grouped=True,
+                           samples_per_subject=None, eye='L',
+                           chunk_size=3):
+    """
+    Convert GazeGene dataset to MDS shards, loading subjects in chunks
+    to avoid exceeding RAM.
+
+    Args:
+        data_dir: path to GazeGene_FaceCrops root
+        output_dir: directory for MDS shards
+        subject_ids: list of subject IDs to convert
+        split: 'train' or 'val' (metadata)
+        multiview_grouped: sort so 9-camera groups are consecutive
+        samples_per_subject: limit frames per subject (None = all)
+        eye: which eye ('L' or 'R')
+        chunk_size: number of subjects to load at a time
+
+    Returns:
+        total number of samples written
+    """
+    assert MDSWriter is not None, "pip install mosaicml-streaming"
+    os.makedirs(output_dir, exist_ok=True)
+
+    from RayNet.dataset import GazeGeneDataset
+    import gc
+
+    total_written = 0
+    chunks = [subject_ids[i:i + chunk_size]
+              for i in range(0, len(subject_ids), chunk_size)]
+
+    print(f"Converting {len(subject_ids)} subjects in "
+          f"{len(chunks)} chunks of ≤{chunk_size}")
+
+    with MDSWriter(
+        out=output_dir,
+        columns=MDS_COLUMNS,
+        compression='zstd',
+        hashes=['sha1'],
+        size_limit=1 << 27,  # 128 MB per shard
+    ) as writer:
+        for ci, chunk_subjs in enumerate(chunks):
+            print(f"\nChunk {ci + 1}/{len(chunks)}: "
+                  f"subjects {chunk_subjs}")
+
+            ds = GazeGeneDataset(
+                base_dir=data_dir,
+                subject_ids=chunk_subjs,
+                samples_per_subject=samples_per_subject,
+                eye=eye,
+                augment=False,
+            )
+
+            if multiview_grouped:
+                indices = _build_multiview_order(ds)
+            else:
+                indices = list(range(len(ds)))
+
+            for idx in tqdm(indices,
+                            desc=f'MDS {split} chunk {ci + 1}'):
+                sample = ds[idx]
+                mds_sample = {
+                    'image': _tensor_image_to_pil(sample['image']),
+                    'landmark_coords':
+                        sample['landmark_coords'].numpy(),
+                    'landmark_coords_px':
+                        sample['landmark_coords_px'].numpy(),
+                    'optical_axis': sample['optical_axis'].numpy(),
+                    'R_norm': sample['R_norm'].numpy(),
+                    'R_kappa': sample['R_kappa'].numpy(),
+                    'K': sample['K'].numpy(),
+                    'R_cam': sample['R_cam'].numpy(),
+                    'T_cam': sample['T_cam'].numpy(),
+                    'M_norm_inv': sample['M_norm_inv'].numpy(),
+                    'eyeball_center_3d':
+                        sample['eyeball_center_3d'].numpy(),
+                    'subject': sample['subject'],
+                    'cam_id': sample['cam_id'],
+                    'frame_idx': sample['frame_idx'],
+                }
+                writer.write(mds_sample)
+
+            total_written += len(indices)
+
+            # Free memory before loading next chunk
+            del ds, indices
+            gc.collect()
+
+    print(f"\nDone. {total_written} samples written to {output_dir}")
+    return total_written
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(
@@ -150,18 +242,22 @@ def main():
     parser.add_argument('--samples_per_subject', type=int, default=None)
     parser.add_argument('--eye', type=str, default='L', choices=['L', 'R'])
     parser.add_argument('--no_multiview_group', action='store_true')
+    parser.add_argument('--chunk_size', type=int, default=3,
+                        help='Subjects to load at a time (default: 3)')
     args = parser.parse_args()
 
-    from RayNet.dataset import GazeGeneDataset
-    ds = GazeGeneDataset(
-        base_dir=args.data_dir,
-        subject_ids=list(range(args.subject_start, args.subject_end + 1)),
+    subject_ids = list(range(args.subject_start, args.subject_end + 1))
+
+    convert_to_mds_chunked(
+        data_dir=args.data_dir,
+        output_dir=args.output_dir,
+        subject_ids=subject_ids,
+        split=args.split,
+        multiview_grouped=not args.no_multiview_group,
         samples_per_subject=args.samples_per_subject,
         eye=args.eye,
-        augment=False,
+        chunk_size=args.chunk_size,
     )
-    convert_to_mds(ds, args.output_dir, split=args.split,
-                   multiview_grouped=not args.no_multiview_group)
 
 
 if __name__ == '__main__':
