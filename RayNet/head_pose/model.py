@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from RayNet.coordatt import CoordAtt  # Import your efficient CoordAtt block
 
 class HeadPoseRegressionHead(nn.Module):
     """
@@ -17,7 +16,6 @@ class HeadPoseRegressionHead(nn.Module):
             attn_groups (int): Number of groups for CoordAtt (usually 32 or 64).
         """
         super().__init__()
-        self.coord_att = CoordAtt(in_channels, in_channels, reduction=reduction)  # Efficient CoordAtt block
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.fc1 = nn.Linear(in_channels, hidden_dim)
         self.act = nn.ReLU(inplace=True)
@@ -31,7 +29,6 @@ class HeadPoseRegressionHead(nn.Module):
         Returns:
             rot6d: [B, 6], 6D rotation representation for each sample in batch
         """
-        x = self.coord_att(x)
         x = self.pool(x)
         x = x.flatten(1)
         x = self.fc1(x)
