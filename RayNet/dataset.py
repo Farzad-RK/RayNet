@@ -294,6 +294,9 @@ class GazeGeneDataset(Dataset):
         pixel_to_feat = feat_scale / self.img_size  # 56/224 = 0.25
         landmarks_feat = landmarks_norm * pixel_to_feat
 
+        # Inverse normalization warp for denormalizing predictions back to original pixel space
+        M_inv = np.linalg.inv(M)
+
         return {
             'image': img_tensor,                                        # (3, 224, 224)
             'landmark_coords': torch.from_numpy(landmarks_feat).float(),  # (14, 2)
@@ -301,8 +304,15 @@ class GazeGeneDataset(Dataset):
             'optical_axis': torch.from_numpy(optical_axis_norm).float(),  # (3,)
             'R_norm': torch.from_numpy(R_norm).float(),                   # (3, 3)
             'R_kappa': torch.from_numpy(R_kappa).float(),                 # (3, 3)
+            # Camera parameters for multi-view consistency
+            'K': torch.from_numpy(K).float(),                             # (3, 3) intrinsics
+            'R_cam': torch.from_numpy(R_cam).float(),                     # (3, 3) extrinsic rotation
+            'T_cam': torch.from_numpy(T_cam).float(),                     # (3,) extrinsic translation
+            'M_norm_inv': torch.from_numpy(M_inv).float(),                # (3, 3) inverse warp
+            'eyeball_center_3d': torch.from_numpy(t_eye).float(),         # (3,) eye center in CCS
             'subject': subj_num,
             'cam_id': s['cam_id'],
+            'frame_idx': s['frame_idx'],
         }
 
     def _augment(self, img_tensor):
@@ -368,8 +378,9 @@ def gazegene_collate_fn(batch):
 
     collated = {}
     tensor_keys = ['image', 'landmark_coords', 'landmark_coords_px',
-                   'optical_axis', 'R_norm', 'R_kappa']
-    scalar_keys = ['subject', 'cam_id']
+                   'optical_axis', 'R_norm', 'R_kappa',
+                   'K', 'R_cam', 'T_cam', 'M_norm_inv', 'eyeball_center_3d']
+    scalar_keys = ['subject', 'cam_id', 'frame_idx']
 
     for key in tensor_keys:
         if key in batch[0]:
