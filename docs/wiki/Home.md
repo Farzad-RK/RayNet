@@ -82,9 +82,18 @@ RayNet/
 │   ├── dataset.py              # GazeGeneDataset + samplers
 │   ├── train.py                # Training script
 │   ├── webdataset_utils.py     # WebDataset shard creation + streaming
+│   ├── streaming/              # MosaicML Streaming + MinIO integration
+│   │   ├── convert_to_mds.py   # Convert dataset to MDS format
+│   │   ├── dataset.py           # StreamingGazeGeneDataset
+│   │   └── minio_utils.py       # MinIO upload + configuration
 │   ├── EyeFLAME/               # Experimental FLAME-based model
 │   ├── head_pose/              # Head pose estimation module
 │   └── iris_mesh/              # Iris mesh regression module
+├── deploy/                     # Docker Compose for MinIO
+│   ├── docker-compose.yml
+│   ├── .env.example
+│   ├── setup_minio.sh
+│   └── README.md
 ├── notebooks/
 │   └── train_colab_a100.ipynb  # Colab A100 training notebook
 ├── docs/wiki/                  # This wiki
@@ -112,5 +121,6 @@ RayNet/
 | [[Loss Functions]] | All loss functions with formulas and weighting |
 | [[Multi-View Consistency]] | Reprojection loss, triangulation masking, geometry |
 | [[WebDataset Streaming]] | Shard creation, HF Hub upload, streaming dataloaders |
+| [[MosaicML Streaming]] | MDS shards, MinIO deployment, high-performance streaming |
 | [[Geometry and Kappa]] | Kappa angles, pupil diameter, gaze-to-screen projection |
 | [[API Reference]] | Function signatures for all public modules |
