@@ -124,3 +124,4 @@ RayNet/
 | [[MosaicML Streaming]] | MDS shards, MinIO deployment, high-performance streaming |
 | [[Geometry and Kappa]] | Kappa angles, pupil diameter, gaze-to-screen projection |
 | [[API Reference]] | Function signatures for all public modules |
+

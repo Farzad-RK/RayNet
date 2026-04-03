@@ -26,6 +26,7 @@ try:
 except ImportError:
     StreamingDataset = None
 
+
 # Defer class definition so the module can be imported even when
 # mosaicml-streaming is not installed.  Functions that actually
 # *use* the class guard with an assert at runtime.
@@ -33,6 +34,7 @@ _Base = StreamingDataset if StreamingDataset is not None else object
 
 
 class StreamingGazeGeneDataset(_Base):
+
     """
     Streaming dataset that reads MDS shards and returns sample dicts
     matching GazeGeneDataset.__getitem__ format.
