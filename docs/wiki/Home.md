@@ -122,5 +122,3 @@ RayNet/
 | [[Multi-View Consistency]] | Reprojection loss, triangulation masking, geometry |
 | [[WebDataset Streaming]] | Shard creation, HF Hub upload, streaming dataloaders |
 | [[MosaicML Streaming]] | MDS shards, MinIO deployment, high-performance streaming |
-| [[Geometry and Kappa]] | Kappa angles, pupil diameter, gaze-to-screen projection |
-| [[API Reference]] | Function signatures for all public modules |
