@@ -17,14 +17,19 @@ Usage:
     )
 """
 
+import os
+import logging
 import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import DataLoader
 
 try:
     from streaming import StreamingDataset
 except ImportError:
     StreamingDataset = None
+
+log = logging.getLogger(__name__)
 
 # Defer class definition so the module can be imported even when
 # mosaicml-streaming is not installed.  Functions that actually
@@ -41,14 +46,33 @@ class StreamingGazeGeneDataset(_Base):
     via mosaicml-streaming.
     """
 
+    def __init__(self, transform=None, **kwargs):
+        super().__init__(**kwargs)
+        self.transform = transform
+
     def __getitem__(self, idx):
         raw = super().__getitem__(idx)
 
-        # Image: PIL -> (3, 224, 224) float tensor
+        # Image: MDS 'jpeg' column -> PIL Image -> (3, 224, 224) float tensor
         img = raw['image']
-        if not isinstance(img, torch.Tensor):
+        if isinstance(img, bytes):
+            # Some MDS versions return raw JPEG bytes instead of PIL
+            import io
+            img = Image.open(io.BytesIO(img))
+        if isinstance(img, Image.Image):
+            img = img.convert('RGB')
             img_np = np.array(img, dtype=np.float32) / 255.0
             img = torch.from_numpy(img_np.transpose(2, 0, 1))
+        elif isinstance(img, np.ndarray):
+            if img.dtype == np.uint8:
+                img = torch.from_numpy(
+                    img.astype(np.float32).transpose(2, 0, 1)) / 255.0
+            else:
+                img = torch.from_numpy(img.transpose(2, 0, 1))
+        # else: already a Tensor
+
+        if self.transform is not None:
+            img = self.transform(img)
 
         return {
             'image': img,
@@ -108,6 +132,7 @@ def create_streaming_dataloaders(
     local_cache='./mds_cache',
     batch_size=512,
     num_workers=4,
+    transform=None,
     shuffle_train=True,
     pin_memory=True,
     prefetch_factor=2,
@@ -126,6 +151,7 @@ def create_streaming_dataloaders(
         local_cache: Local directory for shard caching.
         batch_size: Batch size.
         num_workers: DataLoader workers.
+        transform: Optional torchvision transform to apply to image tensors.
         shuffle_train: Shuffle training data.
         pin_memory: Pin memory for GPU transfer.
         prefetch_factor: Prefetch factor per worker.
@@ -151,6 +177,7 @@ def create_streaming_dataloaders(
     val_local = os.path.join(local_cache, 'val')
 
     train_dataset = StreamingGazeGeneDataset(
+        transform=transform,
         remote=remote_train,
         local=train_local,
         split=None,
@@ -160,6 +187,7 @@ def create_streaming_dataloaders(
     )
 
     val_dataset = StreamingGazeGeneDataset(
+        transform=transform,
         remote=remote_val,
         local=val_local,
         split=None,
@@ -190,6 +218,7 @@ def create_multiview_streaming_dataloaders(
     local_cache='./mds_cache',
     mv_groups=2,
     num_workers=4,
+    transform=None,
     **streaming_kwargs,
 ):
     """
@@ -206,6 +235,7 @@ def create_multiview_streaming_dataloaders(
         local_cache: Local cache directory.
         mv_groups: Number of multi-view groups per batch.
         num_workers: DataLoader workers.
+        transform: Optional torchvision transform to apply to image tensors.
         **streaming_kwargs: Extra kwargs for StreamingDataset.
 
     Returns:
@@ -219,9 +249,7 @@ def create_multiview_streaming_dataloaders(
         local_cache=local_cache,
         batch_size=actual_batch,
         num_workers=num_workers,
+        transform=transform,
         shuffle_train=False,  # preserve multi-view grouping order
         **streaming_kwargs,
     )
-
-
-import os  # noqa: E402 — needed by create_streaming_dataloaders
