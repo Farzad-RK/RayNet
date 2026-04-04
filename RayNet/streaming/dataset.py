@@ -38,6 +38,7 @@ _Base = StreamingDataset if StreamingDataset is not None else object
 
 
 class StreamingGazeGeneDataset(_Base):
+
     """
     Streaming dataset that reads MDS shards and returns sample dicts
     matching GazeGeneDataset.__getitem__ format.
@@ -151,7 +152,7 @@ def create_streaming_dataloaders(
         local_cache: Local directory for shard caching.
         batch_size: Batch size.
         num_workers: DataLoader workers.
-        transform: Optional torchvision transform to apply to image tensors.
+        transform: Optional torchvision transform to apply to image tensors.main
         shuffle_train: Shuffle training data.
         pin_memory: Pin memory for GPU transfer.
         prefetch_factor: Prefetch factor per worker.
@@ -219,6 +220,7 @@ def create_multiview_streaming_dataloaders(
     mv_groups=2,
     num_workers=4,
     transform=None,
+
     **streaming_kwargs,
 ):
     """
@@ -236,6 +238,7 @@ def create_multiview_streaming_dataloaders(
         mv_groups: Number of multi-view groups per batch.
         num_workers: DataLoader workers.
         transform: Optional torchvision transform to apply to image tensors.
+
         **streaming_kwargs: Extra kwargs for StreamingDataset.
 
     Returns:
@@ -253,3 +256,8 @@ def create_multiview_streaming_dataloaders(
         shuffle_train=False,  # preserve multi-view grouping order
         **streaming_kwargs,
     )
+        shuffle_train=False,  # preserve multi-view grouping order
+        **streaming_kwargs,
+    )
+
+
