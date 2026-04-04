@@ -212,13 +212,15 @@ class GazeGeneDataset(Dataset):
             raise FileNotFoundError(f"Image not found: {s['img_path']}")
 
         # Get camera parameters
+        # Always use K_cropped for the warp — it matches the 448×448 face crop.
+        # camera_info.pkl has full-resolution intrinsics (e.g. f=21549, cx=1280)
+        # which do NOT match the cropped image coordinates.
+        K = np.array(s['K_cropped'], dtype=np.float64)
         cam_info = self.camera_params.get(subj_num, {}).get(s['cam_id'], None)
         if cam_info is not None:
-            K = np.array(cam_info['intrinsic_matrix'], dtype=np.float64)
             R_cam = np.array(cam_info['R_mat'], dtype=np.float64)
             T_cam = np.array(cam_info['T_vec'], dtype=np.float64).flatten()
         else:
-            K = np.array(s['K_cropped'], dtype=np.float64)
             R_cam = np.eye(3, dtype=np.float64)
             T_cam = np.zeros(3, dtype=np.float64)
 
@@ -226,13 +228,11 @@ class GazeGeneDataset(Dataset):
         subject_attrs = self.attr_dict.get(subj_num, {})
 
         # --- Eye center in camera coordinates ---
-        eyecenter_key = f'eyecenter_{self.eye}'
-        if eyecenter_key in subject_attrs:
-            eyeball_center_wcs = np.array(subject_attrs[eyecenter_key], dtype=np.float64)
-            t_eye = R_cam @ eyeball_center_wcs + T_cam
-        else:
-            # Fallback: use 3D eyeball center from complex labels (already in CCS)
-            t_eye = np.array(s['eyeball_center_3D'][eye_idx], dtype=np.float64)
+        # Use per-frame eyeball_center_3D which is already in camera coords
+        # and consistent with the face crop.  The static subject_attrs
+        # eyecenter_L/R is in world coords; transforming it via R_cam/T_cam
+        # yields positions that project outside the 448×448 crop.
+        t_eye = np.array(s['eyeball_center_3D'][eye_idx], dtype=np.float64)
 
         # --- Per-frame normalization ---
         R_head = np.array(s['head_R'], dtype=np.float64)
