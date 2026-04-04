@@ -256,8 +256,5 @@ def create_multiview_streaming_dataloaders(
         shuffle_train=False,  # preserve multi-view grouping order
         **streaming_kwargs,
     )
-        shuffle_train=False,  # preserve multi-view grouping order
-        **streaming_kwargs,
-    )
 
 
