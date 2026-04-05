@@ -24,6 +24,7 @@ Usage:
 import argparse
 import os
 import csv
+import logging
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -35,6 +36,8 @@ from RayNet.raynet import create_raynet
 from RayNet.dataset import create_dataloaders, GazeGeneDataset
 from RayNet.losses import total_loss, angular_loss, landmark_loss
 from RayNet.multiview_loss import multiview_consistency_loss, sanity_check_roundtrip
+
+log = logging.getLogger(__name__)
 
 
 # ============== Hardware Profiles ==============
@@ -319,6 +322,41 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False):
 
 # ============== Main Training ==============
 
+def _build_run_config(args, hw):
+    """Collect all training configuration into a single dict for metadata."""
+    return {
+        'profile': args.profile,
+        'backbone': args.backbone,
+        'epochs': args.epochs,
+        'eye': args.eye,
+        'hardware': hw,
+        'phase_config': {
+            str(k): {kk: vv for kk, vv in v.items() if kk != 'description'}
+            for k, v in PHASE_CONFIG.items()
+        },
+        'streaming': args.streaming,
+        'dataset_url': getattr(args, 'dataset_url', None),
+        'data_dir': getattr(args, 'data_dir', None),
+        'weight_path': args.weight_path,
+        'started_at': datetime.now().isoformat(),
+    }
+
+
+def _init_checkpoint_manager(args):
+    """Create a CheckpointManager if MinIO checkpointing is enabled."""
+    if not args.ckpt_bucket:
+        return None
+    from RayNet.streaming.checkpoint import CheckpointManager
+    return CheckpointManager(
+        bucket=args.ckpt_bucket,
+        prefix=args.ckpt_prefix,
+        run_id=args.run_id,
+        endpoint=args.minio_endpoint,
+        local_cache=os.path.join(args.output_dir, 'ckpt_cache'),
+        save_local_copy=True,
+    )
+
+
 def train(args):
     """Main training function."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -335,9 +373,17 @@ def train(args):
     print(f"  Gradient accumulation: {hw['grad_accum_steps']} steps")
     print(f"  torch.compile: {hw['compile_model']}")
 
+    # Checkpoint manager (MinIO)
+    ckpt_mgr = _init_checkpoint_manager(args)
+    if ckpt_mgr is not None:
+        print(f"  MinIO checkpoints: s3://{args.ckpt_bucket}/{args.ckpt_prefix}/{ckpt_mgr.run_id}/")
+
     # Create output directory
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    output_dir = os.path.join(args.output_dir, f'run_{timestamp}')
+    if ckpt_mgr is not None:
+        output_dir = os.path.join(args.output_dir, ckpt_mgr.run_id)
+    else:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_dir = os.path.join(args.output_dir, f'run_{timestamp}')
     os.makedirs(output_dir, exist_ok=True)
 
     # Create model
@@ -355,9 +401,13 @@ def train(args):
     scaler = GradScaler(enabled=hw['amp']) if hw['amp'] else None
 
     # --- Data loading ---
-    if args.streaming:
+    # Three modes: local disk, MDS streaming (MosaicML + MinIO), WebDataset streaming
+    if args.mds_streaming:
+        train_loader_standard, train_loader_mv, val_loader = _create_mds_loaders(
+            args, hw)
+        streaming_mode = False  # MDS loaders are persistent, not recreated per-phase
+    elif args.streaming:
         _create_streaming_loaders(args, hw)
-        # Streaming mode: loaders created per-phase in the training loop
         train_loader_standard = None
         train_loader_mv = None
         val_loader = None
@@ -366,6 +416,11 @@ def train(args):
         streaming_mode = False
         train_loader_standard, train_loader_mv, val_loader = _create_local_loaders(
             args, hw)
+
+    # Record config in checkpoint metadata
+    run_config = _build_run_config(args, hw)
+    if ckpt_mgr is not None:
+        ckpt_mgr.set_config(run_config)
 
     # CSV logger
     csv_path = os.path.join(output_dir, 'training_log.csv')
@@ -381,8 +436,34 @@ def train(args):
     # Training loop with phase transitions
     best_val_loss = float('inf')
     current_phase = 0
+    start_epoch = 1
 
-    for epoch in range(1, args.epochs + 1):
+    # --- Resume from checkpoint ---
+    # We need a dummy optimizer/scheduler for resume, so we create them
+    # for the first phase first, then resume overwrites.
+    optimizer = None
+    scheduler = None
+
+    if args.resume and ckpt_mgr is not None:
+        print(f"Resuming from run {ckpt_mgr.run_id} ...")
+        # We need optimizer & scheduler to exist before resume_state.
+        # Create them for the starting phase; resume will overwrite state.
+        resume_phase_cfg = get_phase_config(1)
+        optimizer = optim.AdamW(model.parameters(), lr=resume_phase_cfg['lr'],
+                                betas=(0.5, 0.95), weight_decay=1e-4)
+        phase_start, phase_end = resume_phase_cfg['epochs']
+        scheduler = CosineAnnealingLR(optimizer, T_max=phase_end - phase_start + 1)
+
+        start_epoch, resume_ckpt = ckpt_mgr.resume_state(
+            model, optimizer, scheduler=scheduler, scaler=scaler,
+            map_location=device,
+        )
+        current_phase = get_phase(resume_ckpt['epoch'])
+        best_val_loss = resume_ckpt.get('val_metrics', {}).get('total', best_val_loss)
+        print(f"  Resumed at epoch {start_epoch} (phase {current_phase}), "
+              f"best_val_loss={best_val_loss:.4f}")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         phase = get_phase(epoch)
         cfg = get_phase_config(epoch)
 
@@ -471,37 +552,64 @@ def train(args):
         # Save best model
         if val_losses['total'] < best_val_loss:
             best_val_loss = val_losses['total']
-            save_dict = {
-                'epoch': epoch,
-                'phase': phase,
-                'model_state_dict': (model._orig_mod.state_dict()
-                                     if hasattr(model, '_orig_mod')
-                                     else model.state_dict()),
-                'val_loss': best_val_loss,
-                'val_landmark_px': val_losses['landmark_px'],
-                'val_angular_deg': val_losses['angular_deg'],
-                'profile': args.profile,
-            }
-            torch.save(save_dict, os.path.join(output_dir, 'best_model.pt'))
+
+            if ckpt_mgr is not None:
+                ckpt_mgr.save_best(
+                    epoch=epoch, model=model, val_loss=best_val_loss,
+                    val_metrics=val_losses, optimizer=optimizer,
+                    scheduler=scheduler, scaler=scaler,
+                    extra={'profile': args.profile},
+                )
+            else:
+                save_dict = {
+                    'epoch': epoch,
+                    'phase': phase,
+                    'model_state_dict': (model._orig_mod.state_dict()
+                                         if hasattr(model, '_orig_mod')
+                                         else model.state_dict()),
+                    'val_loss': best_val_loss,
+                    'val_landmark_px': val_losses['landmark_px'],
+                    'val_angular_deg': val_losses['angular_deg'],
+                    'profile': args.profile,
+                }
+                torch.save(save_dict, os.path.join(output_dir, 'best_model.pt'))
             print(f"  -> Saved best model (val_loss={best_val_loss:.4f})")
 
-        # Periodic checkpoint
-        if epoch % 5 == 0:
-            save_dict = {
-                'epoch': epoch,
-                'phase': phase,
-                'model_state_dict': (model._orig_mod.state_dict()
-                                     if hasattr(model, '_orig_mod')
-                                     else model.state_dict()),
-                'optimizer_state_dict': optimizer.state_dict(),
-            }
-            if scaler is not None:
-                save_dict['scaler_state_dict'] = scaler.state_dict()
-            torch.save(save_dict, os.path.join(output_dir, f'checkpoint_epoch{epoch}.pt'))
+        # Periodic + latest checkpoint
+        if ckpt_mgr is not None:
+            # Always save latest (for resume)
+            ckpt_mgr.save(
+                epoch=epoch, model=model, optimizer=optimizer,
+                scheduler=scheduler, scaler=scaler, phase=phase,
+                train_metrics=train_losses, val_metrics=val_losses,
+                tag='latest',
+            )
+            # Periodic named checkpoint
+            if epoch % args.ckpt_every == 0:
+                ckpt_mgr.save(
+                    epoch=epoch, model=model, optimizer=optimizer,
+                    scheduler=scheduler, scaler=scaler, phase=phase,
+                    train_metrics=train_losses, val_metrics=val_losses,
+                )
+        else:
+            if epoch % args.ckpt_every == 0:
+                save_dict = {
+                    'epoch': epoch,
+                    'phase': phase,
+                    'model_state_dict': (model._orig_mod.state_dict()
+                                         if hasattr(model, '_orig_mod')
+                                         else model.state_dict()),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                }
+                if scaler is not None:
+                    save_dict['scaler_state_dict'] = scaler.state_dict()
+                torch.save(save_dict, os.path.join(output_dir, f'checkpoint_epoch{epoch}.pt'))
 
     csv_file.close()
     print(f"\nTraining complete. Results saved to {output_dir}")
     print(f"Best val loss: {best_val_loss:.4f}")
+    if ckpt_mgr is not None:
+        print(f"Checkpoints: s3://{args.ckpt_bucket}/{args.ckpt_prefix}/{ckpt_mgr.run_id}/")
 
 
 # ============== Data Loader Helpers ==============
@@ -542,11 +650,55 @@ def _create_local_loaders(args, hw):
     return train_loader_standard, train_loader_mv, val_loader
 
 
+def _create_mds_loaders(args, hw):
+    """Create MosaicML MDS streaming dataloaders from MinIO / S3."""
+    from RayNet.streaming import create_streaming_dataloaders
+    from RayNet.streaming.dataset import create_multiview_streaming_dataloaders
+    from RayNet.streaming.minio_utils import configure_minio_env
+
+    # Configure MinIO env vars if endpoint is provided
+    if args.minio_endpoint:
+        configure_minio_env(
+            args.minio_endpoint,
+            os.environ.get('AWS_ACCESS_KEY_ID', 'minioadmin'),
+            os.environ.get('AWS_SECRET_ACCESS_KEY', 'minioadmin'),
+        )
+
+    mds_kwargs = dict(
+        num_workers=hw['num_workers'],
+        pin_memory=hw['pin_memory'],
+        prefetch_factor=hw['prefetch_factor'],
+        persistent_workers=hw['persistent_workers'],
+    )
+
+    print(f"MDS streaming: train={args.mds_train}, val={args.mds_val}")
+
+    # Standard loader (Phase 1)
+    train_loader_standard, val_loader = create_streaming_dataloaders(
+        remote_train=args.mds_train,
+        remote_val=args.mds_val,
+        local_cache=os.path.join(args.output_dir, 'mds_cache'),
+        batch_size=hw['batch_size'],
+        **mds_kwargs,
+    )
+
+    # Multi-view loader (Phase 2+)
+    train_loader_mv, _ = create_multiview_streaming_dataloaders(
+        remote_train=args.mds_train,
+        remote_val=args.mds_val,
+        local_cache=os.path.join(args.output_dir, 'mds_cache_mv'),
+        mv_groups=hw['mv_groups'],
+        **mds_kwargs,
+    )
+
+    return train_loader_standard, train_loader_mv, val_loader
+
+
 def _create_streaming_loaders(args, hw):
-    """Validate streaming args at startup."""
+    """Validate streaming args at startup (WebDataset mode)."""
     if not args.dataset_url:
         raise ValueError("--dataset_url required when --streaming is set")
-    print(f"Streaming mode: {args.dataset_url}")
+    print(f"WebDataset streaming mode: {args.dataset_url}")
 
 
 def _get_streaming_loaders(args, hw, cfg):
@@ -595,7 +747,15 @@ def parse_args():
     parser.add_argument('--samples_per_subject', type=int, default=200)
     parser.add_argument('--eye', type=str, default='L', choices=['L', 'R'])
 
-    # Streaming
+    # MDS streaming (MosaicML + MinIO)
+    parser.add_argument('--mds_streaming', action='store_true',
+                        help='Stream training data from MDS shards on MinIO/S3')
+    parser.add_argument('--mds_train', type=str, default=None,
+                        help='MDS shard URL for training (e.g. s3://gazegene/train)')
+    parser.add_argument('--mds_val', type=str, default=None,
+                        help='MDS shard URL for validation (e.g. s3://gazegene/val)')
+
+    # WebDataset streaming (legacy)
     parser.add_argument('--streaming', action='store_true',
                         help='Use WebDataset streaming instead of local disk')
     parser.add_argument('--dataset_url', type=str, default=None,
@@ -626,10 +786,32 @@ def parse_args():
     parser.add_argument('--grad_accum_steps', type=int, default=None,
                         help='Gradient accumulation steps')
 
+    # MinIO checkpoint storage
+    parser.add_argument('--ckpt_bucket', type=str, default=None,
+                        help='MinIO bucket for checkpoints (enables MinIO storage)')
+    parser.add_argument('--ckpt_prefix', type=str, default='checkpoints',
+                        help='Key prefix under the bucket (default: checkpoints)')
+    parser.add_argument('--minio_endpoint', type=str, default=None,
+                        help='MinIO endpoint URL (default: S3_ENDPOINT_URL env var)')
+    parser.add_argument('--ckpt_every', type=int, default=5,
+                        help='Save a named checkpoint every N epochs (default: 5)')
+    parser.add_argument('--run_id', type=str, default=None,
+                        help='Run ID for checkpoint grouping (auto-generated if omitted)')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume training from the latest checkpoint of --run_id')
+
     args = parser.parse_args()
 
-    if not args.streaming and args.data_dir is None:
-        parser.error("--data_dir is required when not using --streaming")
+    if not args.streaming and not args.mds_streaming and args.data_dir is None:
+        parser.error("--data_dir is required when not using --streaming or --mds_streaming")
+
+    if args.mds_streaming and (not args.mds_train or not args.mds_val):
+        parser.error("--mds_streaming requires both --mds_train and --mds_val")
+
+    if args.resume and not args.run_id:
+        parser.error("--resume requires --run_id to identify which run to resume")
+    if args.resume and not args.ckpt_bucket:
+        parser.error("--resume requires --ckpt_bucket")
 
     return args
 

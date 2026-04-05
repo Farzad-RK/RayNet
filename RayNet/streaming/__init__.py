@@ -1,3 +1,4 @@
 from RayNet.streaming.dataset import StreamingGazeGeneDataset, create_streaming_dataloaders
 from RayNet.streaming.convert_to_mds import convert_to_mds
 from RayNet.streaming.minio_utils import upload_to_minio, minio_shard_url
+from RayNet.streaming.checkpoint import CheckpointManager
