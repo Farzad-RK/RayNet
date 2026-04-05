@@ -3,7 +3,9 @@ Loss functions for RayNet.
 
 Two core losses:
   1. Landmark loss: heatmap MSE + coordinate L1
-  2. Angular loss: L1 on angle (more robust than cosine for large errors)
+  2. Gaze loss: L1 on unit gaze vectors (following GazeGene paper Sec 4.1.1)
+
+Angular error is computed for metrics only (not backpropagated).
 """
 
 import torch
@@ -64,20 +66,42 @@ def landmark_loss(pred_hm, pred_coords, gt_coords, feat_H, feat_W, sigma=2.0):
     return hm_loss + coord_loss
 
 
-def angular_loss(pred_gaze, gt_gaze):
+def gaze_loss(pred_gaze, gt_gaze):
     """
-    Angular error loss in radians. L1 on angle -- more robust than cosine
-    for large errors early in training.
+    L1 loss on unit gaze vectors, following GazeGene paper (Sec 4.1.1).
+
+    This is numerically stable everywhere (no acos singularity) and matches
+    the paper's training procedure.
 
     Args:
         pred_gaze: (B, 3) predicted gaze direction (unit vector)
         gt_gaze: (B, 3) ground-truth gaze direction (unit vector)
 
     Returns:
-        loss: scalar tensor (mean angular error in radians)
+        loss: scalar tensor (mean L1 error on vector components)
     """
-    cos_sim = F.cosine_similarity(pred_gaze, gt_gaze, dim=-1).clamp(-1.0, 1.0)
-    return torch.acos(cos_sim).mean()
+    return F.l1_loss(pred_gaze, gt_gaze)
+
+
+def angular_error(pred_gaze, gt_gaze):
+    """
+    Angular error in radians between predicted and GT gaze vectors.
+
+    Uses atan2 for numerical stability (no gradient singularity at 0° or 180°).
+    This is for METRICS ONLY — not used as a training loss.
+
+    Args:
+        pred_gaze: (B, 3) predicted gaze direction
+        gt_gaze: (B, 3) ground-truth gaze direction
+
+    Returns:
+        error: scalar tensor (mean angular error in radians)
+    """
+    # atan2(||cross||, dot) is stable everywhere unlike acos(dot)
+    cross = torch.cross(pred_gaze, gt_gaze, dim=-1)
+    dot = (pred_gaze * gt_gaze).sum(dim=-1)
+    angle = torch.atan2(cross.norm(dim=-1), dot)
+    return angle.mean()
 
 
 def total_loss(pred_hm, pred_coords, pred_gaze,
@@ -103,13 +127,17 @@ def total_loss(pred_hm, pred_coords, pred_gaze,
         components: dict of individual loss values (detached, for logging)
     """
     lm = landmark_loss(pred_hm, pred_coords, gt_coords, feat_H, feat_W, sigma)
-    gz = angular_loss(pred_gaze, gt_gaze)
+    gz = gaze_loss(pred_gaze, gt_gaze)
     total = lam_lm * lm + lam_gaze * gz
+
+    # Angular error for metrics only (detached, not in computation graph)
+    with torch.no_grad():
+        ang_err = angular_error(pred_gaze, gt_gaze)
 
     components = {
         'landmark_loss': lm.detach(),
-        'angular_loss': gz.detach(),
-        'angular_loss_deg': torch.rad2deg(gz.detach()),
+        'angular_loss': ang_err,
+        'angular_loss_deg': torch.rad2deg(ang_err),
         'total_loss': total.detach(),
     }
     return total, components

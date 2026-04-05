@@ -69,14 +69,10 @@ def gaze_ray_consistency_loss(pred_gaze, R_norm, n_pairs=3):
 
     # Compute mean world gaze direction per group as reference
     g_mean = _normalize_vec(g_world.mean(dim=1), dim=-1)  # (G, 3)
+    g_mean_exp = g_mean.unsqueeze(1).expand_as(g_world)   # (G, V, 3)
 
-    # Angular error of each view vs the group mean
-    cos_sim = F.cosine_similarity(
-        g_world, g_mean.unsqueeze(1).expand_as(g_world), dim=-1
-    ).clamp(-1.0, 1.0)  # (G, V)
-
-    angular_err = torch.acos(cos_sim)  # (G, V) in radians
-    return angular_err.mean()
+    # L1 loss on unit vectors (stable, matches paper's approach)
+    return F.l1_loss(g_world, g_mean_exp.detach())
 
 
 # ---------------------------------------------------------------------------

@@ -37,7 +37,7 @@ from datetime import datetime
 
 from RayNet.raynet import create_raynet
 from RayNet.dataset import create_dataloaders, GazeGeneDataset
-from RayNet.losses import total_loss, angular_loss, landmark_loss
+from RayNet.losses import total_loss, gaze_loss, angular_error, landmark_loss
 from RayNet.multiview_loss import multiview_consistency_loss, sanity_check_roundtrip
 
 log = logging.getLogger(__name__)
