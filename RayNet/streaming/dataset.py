@@ -97,6 +97,12 @@ class StreamingGazeGeneDataset(_Base):
                 raw['M_norm_inv'].astype(np.float32)),
             'eyeball_center_3d': torch.from_numpy(
                 raw['eyeball_center_3d'].astype(np.float32)),
+            'gaze_target': torch.from_numpy(
+                raw['gaze_target'].astype(np.float32))
+                if 'gaze_target' in raw else torch.zeros(3),
+            'gaze_depth': torch.tensor(
+                float(raw['gaze_depth']), dtype=torch.float32)
+                if 'gaze_depth' in raw else torch.tensor(0.0),
             'subject': int(raw['subject']),
             'cam_id': int(raw['cam_id']),
             'frame_idx': int(raw['frame_idx']),
@@ -113,6 +119,7 @@ def _collate_fn(batch):
         'image', 'landmark_coords', 'landmark_coords_px',
         'optical_axis', 'R_norm', 'R_kappa',
         'K', 'R_cam', 'T_cam', 'M_norm_inv', 'eyeball_center_3d',
+        'gaze_target', 'gaze_depth',
     ]
     scalar_keys = ['subject', 'cam_id', 'frame_idx']
 
@@ -134,6 +141,7 @@ def create_streaming_dataloaders(
     batch_size=512,
     num_workers=4,
     transform=None,
+    val_transform=None,
     shuffle_train=True,
     pin_memory=True,
     prefetch_factor=2,
@@ -188,7 +196,7 @@ def create_streaming_dataloaders(
     )
 
     val_dataset = StreamingGazeGeneDataset(
-        transform=transform,
+        transform=val_transform,
         remote=remote_val,
         local=val_local,
         split=None,

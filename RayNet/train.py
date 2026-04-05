@@ -206,9 +206,9 @@ def get_phase(epoch):
 
 
 def get_phase_config(epoch):
-    """Get loss weights and hyperparams for the current epoch."""
+    """Get loss weights and hyperparams for the current epoch (returns a copy)."""
     phase = get_phase(epoch)
-    return PHASE_CONFIG[phase]
+    return dict(PHASE_CONFIG[phase])
 
 
 AMP_DTYPE_MAP = {
@@ -255,7 +255,7 @@ def setup_hardware(hw, device):
 
 def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                     scaler=None, grad_accum_steps=1, amp_enabled=False,
-                    amp_dtype=torch.float16):
+                    amp_dtype=torch.float16, batch_csv_writer=None):
     """Run one training epoch with AMP and gradient accumulation support."""
     model.train()
     use_multiview = cfg.get('multiview', False) and cfg.get('lam_reproj', 0) > 0
@@ -336,6 +336,18 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
         running_losses['angular'] += components['angular_loss'].item()
         running_losses['angular_deg'] += components['angular_loss_deg'].item()
         n_batches += 1
+
+        # Per-batch CSV logging (high granularity)
+        if batch_csv_writer is not None:
+            batch_csv_writer.writerow([
+                epoch, step + 1,
+                f"{components['total_loss'].item():.6f}",
+                f"{components['landmark_loss'].item():.6f}",
+                f"{components['angular_loss_deg'].item():.4f}",
+                f"{running_losses['reproj'] / n_batches:.6f}",
+                f"{running_losses['mask'] / n_batches:.6f}",
+                f"{optimizer.param_groups[0]['lr']:.8f}",
+            ])
 
         # Progress logging
         total_batches = len(train_loader)
@@ -523,7 +535,7 @@ def train(args):
     if ckpt_mgr is not None:
         ckpt_mgr.set_config(run_config)
 
-    # CSV logger
+    # CSV logger (epoch-level)
     csv_path = os.path.join(output_dir, 'training_log.csv')
     csv_file = open(csv_path, 'w', newline='')
     csv_writer = csv.writer(csv_file)
@@ -532,6 +544,15 @@ def train(args):
         'train_total', 'train_landmark', 'train_angular_deg',
         'train_reproj', 'train_mask',
         'val_total', 'val_landmark', 'val_angular_deg', 'val_landmark_px',
+    ])
+
+    # Batch-level CSV logger (high granularity)
+    batch_csv_path = os.path.join(output_dir, 'batch_log.csv')
+    batch_csv_file = open(batch_csv_path, 'w', newline='')
+    batch_csv_writer = csv.writer(batch_csv_file)
+    batch_csv_writer.writerow([
+        'epoch', 'batch', 'loss', 'landmark', 'angular_deg',
+        'gaze_consist', 'shape', 'lr',
     ])
 
     # Training loop with phase transitions
@@ -568,6 +589,14 @@ def train(args):
     for epoch in range(start_epoch, args.epochs + 1):
         phase = get_phase(epoch)
         cfg = get_phase_config(epoch)
+
+        # Ablation overrides
+        if args.no_multiview:
+            cfg['multiview'] = False
+            cfg['lam_reproj'] = 0.0
+            cfg['lam_mask'] = 0.0
+        if args.gaze_only:
+            cfg['lam_lm'] = 0.0
 
         # Phase transition: update optimizer and scheduler
         if phase != current_phase:
@@ -617,7 +646,9 @@ def train(args):
             grad_accum_steps=hw['grad_accum_steps'],
             amp_enabled=hw['amp'],
             amp_dtype=amp_dtype,
+            batch_csv_writer=batch_csv_writer,
         )
+        batch_csv_file.flush()
 
         # Validate
         val_losses = validate(
@@ -701,6 +732,13 @@ def train(args):
                     scheduler=scheduler, scaler=scaler, phase=phase,
                     train_metrics=train_losses, val_metrics=val_losses,
                 )
+            # Upload batch log after each epoch (survives interruption)
+            try:
+                batch_csv_file.flush()
+                log_key = f"{args.ckpt_prefix}/{ckpt_mgr.run_id}/batch_log.csv"
+                ckpt_mgr._client.fput_object(args.ckpt_bucket, log_key, batch_csv_path)
+            except Exception:
+                pass  # non-critical
         else:
             if epoch % args.ckpt_every == 0:
                 save_dict = {
@@ -716,6 +754,19 @@ def train(args):
                 torch.save(save_dict, os.path.join(output_dir, f'checkpoint_epoch{epoch}.pt'))
 
     csv_file.close()
+    batch_csv_file.close()
+
+    # Upload training logs to MinIO
+    if ckpt_mgr is not None:
+        for log_file in [csv_path, batch_csv_path]:
+            if os.path.exists(log_file):
+                log_key = f"{args.ckpt_prefix}/{ckpt_mgr.run_id}/{os.path.basename(log_file)}"
+                try:
+                    ckpt_mgr._client.fput_object(args.ckpt_bucket, log_key, log_file)
+                    print(f"  Uploaded {os.path.basename(log_file)} to s3://{args.ckpt_bucket}/{log_key}")
+                except Exception as e:
+                    print(f"  Warning: failed to upload {os.path.basename(log_file)}: {e}")
+
     print(f"\nTraining complete. Results saved to {output_dir}")
     print(f"Best val loss: {best_val_loss:.4f}")
     if ckpt_mgr is not None:
@@ -775,12 +826,22 @@ def _create_mds_loaders(args, hw):
 
     print(f"MDS streaming: train={args.mds_train}, val={args.mds_val}")
 
+    # Data augmentation matching GazeGene paper (Sec 4.1.3):
+    # random translation + color jitter
+    from torchvision import transforms as T
+    train_transform = T.Compose([
+        T.ColorJitter(brightness=0.4, contrast=0.4,
+                      saturation=0.2, hue=0.1),
+        T.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+    ])
+
     train_loader, val_loader = create_streaming_dataloaders(
         remote_train=args.mds_train,
         remote_val=args.mds_val,
         local_cache=os.path.join(args.output_dir, 'mds_cache'),
         batch_size=hw['batch_size'],
         num_workers=hw['num_workers'],
+        transform=train_transform,
         pin_memory=hw['pin_memory'],
         prefetch_factor=hw['prefetch_factor'],
         persistent_workers=hw['persistent_workers'],
@@ -799,6 +860,14 @@ def _create_mds_mv_loader(args, hw):
     """Create multi-view MDS loader lazily (only called when Phase 2 starts)."""
     from RayNet.streaming.dataset import create_multiview_streaming_dataloaders
 
+    # Same augmentation as single-view loader
+    from torchvision import transforms as T
+    train_transform = T.Compose([
+        T.ColorJitter(brightness=0.4, contrast=0.4,
+                      saturation=0.2, hue=0.1),
+        T.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+    ])
+
     print("Creating multi-view MDS streaming loader...")
     train_loader_mv, _ = create_multiview_streaming_dataloaders(
         remote_train=args.mds_train,
@@ -806,6 +875,7 @@ def _create_mds_mv_loader(args, hw):
         local_cache=os.path.join(args.output_dir, 'mds_cache_mv'),
         mv_groups=hw['mv_groups'],
         num_workers=hw['num_workers'],
+        transform=train_transform,
         pin_memory=hw['pin_memory'],
         prefetch_factor=hw['prefetch_factor'],
         persistent_workers=hw['persistent_workers'],
@@ -895,6 +965,12 @@ def parse_args():
                         help=f'Hardware profile ({", ".join(HARDWARE_PROFILES.keys())})')
     parser.add_argument('--no_compile', action='store_true',
                         help='Disable torch.compile even if profile enables it')
+    parser.add_argument('--no_multiview', action='store_true',
+                        help='Disable multi-view losses in Phase 2/3 (use standard '
+                             'random batches throughout, for ablation)')
+    parser.add_argument('--gaze_only', action='store_true',
+                        help='Disable landmark loss (lam_lm=0) for gaze-only '
+                             'training, matching GazeGene paper baseline')
 
     # Overrides (None = use profile default)
     parser.add_argument('--batch_size', type=int, default=None)

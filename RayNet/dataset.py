@@ -1,13 +1,18 @@
 """
 GazeGene dataset loader for RayNet v2.
 
-Key changes from v1:
-  - Per-frame normalization (Zhang et al. 2018) removes depth ambiguity
-  - Optical axis GT from geometry (eyeball -> pupil), NOT head gaze
+Input: GazeGene full face crops (variable size, e.g. 448×448).
+Output: 224×224 normalized images via Zhang et al. 2018 perspective warp,
+        centered on one eye at canonical distance/focal length.
+
+Key design:
+  - Per-frame normalization (Zhang et al. 2018) warps face crop around
+    eyeball center to canonical distance, removing depth/pose ambiguity
+  - Optical axis GT from GazeGene gaze_label (optic_axis_L/R), NOT computed
   - Kappa roll zeroed out
   - Iris landmarks warped to normalized image space
   - 14 landmarks: 10 iris contour + 4 pupil boundary (subsampled from 100)
-  - Output size: 224x224 normalized eye crops
+  - GazeGene units: centimeters (all 3D coordinates)
 """
 
 import os
@@ -20,7 +25,7 @@ from collections import defaultdict
 import random
 
 from RayNet.normalization import normalize_sample, normalize_gaze, compute_normalization_matrix, warp_points_2d
-from RayNet.kappa import build_R_kappa, ground_truth_optical_axis
+from RayNet.kappa import build_R_kappa
 
 # Indices to subsample 100 iris points down to 10 evenly-spaced points
 IRIS_SUBSAMPLE_IDX = list(range(0, 100, 10))  # [0, 10, 20, ..., 90]
@@ -166,7 +171,7 @@ class GazeGeneDataset(Dataset):
                         'subject': subj_num,
                         'cam_id': cam_id,
                         'frame_idx': idx,
-                        # 3D data (camera coordinate system)
+                        # 3D data (camera coordinate system, units: cm)
                         'eyeball_center_3D': cl['eyeball_center_3D'][idx],  # [2, 3]
                         'pupil_center_3D': cl['pupil_center_3D'][idx],      # [2, 3]
                         'iris_mesh_3D': cl['iris_mesh_3D'][idx],            # [2, 100, 3]
@@ -178,6 +183,14 @@ class GazeGeneDataset(Dataset):
                         'head_t': gl['head_T_vec'][idx],  # [3]
                         # Camera intrinsics (cropped)
                         'K_cropped': cl['intrinsic_matrix_cropped'][idx],    # [3, 3]
+                        # --- Gaze labels from gaze_label (pre-computed by GazeGene) ---
+                        'optic_axis_L': gl['optic_axis_L'][idx],   # [3] unit vector, CCS
+                        'optic_axis_R': gl['optic_axis_R'][idx],   # [3] unit vector, CCS
+                        'visual_axis_L': gl['visual_axis_L'][idx], # [3] unit vector, CCS
+                        'visual_axis_R': gl['visual_axis_R'][idx], # [3] unit vector, CCS
+                        'gaze_C': gl['gaze_C'][idx],               # [3] unit head gaze, CCS
+                        'gaze_target': gl['gaze_target'][idx],     # [3] 3D target position, CCS
+                        'gaze_depth': gl['gaze_depth'][idx],       # scalar, vergence depth
                     }
 
                     self.samples.append(sample)
@@ -246,13 +259,22 @@ class GazeGeneDataset(Dataset):
             K, t_eye, d_norm=self.d_norm, f_norm=self.f_norm, size=self.img_size
         )
 
-        # --- Ground truth optical axis ---
-        eyeball_3d = np.array(s['eyeball_center_3D'][eye_idx], dtype=np.float64)
-        pupil_3d = np.array(s['pupil_center_3D'][eye_idx], dtype=np.float64)
-        optical_axis_ccs = ground_truth_optical_axis(eyeball_3d, pupil_3d)
+        # --- Ground truth optical axis (from GazeGene gaze_label, NOT computed) ---
+        # Use the pre-computed optic_axis_L/R directly from the dataset
+        # to stay faithful to GazeGene methodology
+        optic_key = f'optic_axis_{self.eye}'
+        optical_axis_ccs = np.array(s[optic_key], dtype=np.float64)
+        # Ensure unit vector
+        oa_norm = np.linalg.norm(optical_axis_ccs)
+        if oa_norm > 1e-8:
+            optical_axis_ccs = optical_axis_ccs / oa_norm
 
         # Transform optical axis to normalized space
         optical_axis_norm = normalize_gaze(optical_axis_ccs, R_norm)
+
+        # Also store gaze_target and gaze_depth for potential use
+        gaze_target = np.array(s['gaze_target'], dtype=np.float64)
+        gaze_depth = float(s['gaze_depth'])
 
         # --- Iris landmarks: subsample 100 -> 10 + 4 pupil points ---
         iris_2d = np.array(s['iris_mesh_2D'][eye_idx], dtype=np.float64)  # (100, 2)
@@ -309,23 +331,34 @@ class GazeGeneDataset(Dataset):
             'R_cam': torch.from_numpy(R_cam).float(),                     # (3, 3) extrinsic rotation
             'T_cam': torch.from_numpy(T_cam).float(),                     # (3,) extrinsic translation
             'M_norm_inv': torch.from_numpy(M_inv).float(),                # (3, 3) inverse warp
-            'eyeball_center_3d': torch.from_numpy(t_eye).float(),         # (3,) eye center in CCS
+            'eyeball_center_3d': torch.from_numpy(t_eye).float(),         # (3,) eye center in CCS (cm)
+            # GazeGene gaze labels
+            'gaze_target': torch.from_numpy(gaze_target).float(),         # (3,) 3D gaze target, CCS (cm)
+            'gaze_depth': torch.tensor(gaze_depth).float(),               # scalar, vergence depth (cm)
             'subject': subj_num,
             'cam_id': s['cam_id'],
             'frame_idx': s['frame_idx'],
         }
 
     def _augment(self, img_tensor):
-        """Lightweight augmentation: color jitter + random horizontal flip."""
-        # Random brightness/contrast
+        """
+        Data augmentation matching GazeGene paper methodology (Sec 4.1.3):
+        random translation + color jitter.
+        """
+        from torchvision import transforms as T
+
+        # Color jitter (matching paper's cross-domain protocol)
+        jitter = T.ColorJitter(brightness=0.4, contrast=0.4,
+                               saturation=0.2, hue=0.1)
+        img_tensor = jitter(img_tensor)
+
+        # Random translation (small shift, ~5% of image)
         if random.random() > 0.5:
-            brightness = 0.8 + random.random() * 0.4  # [0.8, 1.2]
-            img_tensor = img_tensor * brightness
-            img_tensor = img_tensor.clamp(0, 1)
-        # Random Gaussian noise
-        if random.random() > 0.5:
-            noise = torch.randn_like(img_tensor) * 0.02
-            img_tensor = (img_tensor + noise).clamp(0, 1)
+            max_shift = int(self.img_size * 0.05)  # ~11 pixels for 224
+            dx = random.randint(-max_shift, max_shift)
+            dy = random.randint(-max_shift, max_shift)
+            img_tensor = torch.roll(img_tensor, shifts=(dy, dx), dims=(1, 2))
+
         return img_tensor
 
 
@@ -379,7 +412,8 @@ def gazegene_collate_fn(batch):
     collated = {}
     tensor_keys = ['image', 'landmark_coords', 'landmark_coords_px',
                    'optical_axis', 'R_norm', 'R_kappa',
-                   'K', 'R_cam', 'T_cam', 'M_norm_inv', 'eyeball_center_3d']
+                   'K', 'R_cam', 'T_cam', 'M_norm_inv', 'eyeball_center_3d',
+                   'gaze_target', 'gaze_depth']
     scalar_keys = ['subject', 'cam_id', 'frame_idx']
 
     for key in tensor_keys:

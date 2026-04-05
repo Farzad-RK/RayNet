@@ -65,52 +65,47 @@ def gaussian_heatmaps(coords, H, W, sigma=2.0) -> Tensor
 
 def landmark_loss(pred_hm, pred_coords, gt_coords, feat_H, feat_W, sigma=2.0) -> Tensor
 
-def angular_loss(pred_gaze, gt_gaze) -> Tensor
-    # Both (B, 3) unit vectors -> scalar (mean angular error in radians)
+def gaze_loss(pred_gaze, gt_gaze) -> Tensor
+    # L1 loss on unit gaze vectors (following GazeGene paper Sec 4.1.1)
+    # Both (B, 3) unit vectors -> scalar
+
+def angular_error(pred_gaze, gt_gaze) -> Tensor
+    # atan2-based angular error for METRICS ONLY (not backpropagated)
+    # Numerically stable everywhere (no acos singularity)
+    # Both (B, 3) -> scalar (mean angular error in radians)
 
 def total_loss(pred_hm, pred_coords, pred_gaze, gt_coords, gt_gaze,
                feat_H, feat_W, lam_lm=1.0, lam_gaze=0.5, sigma=2.0
               ) -> tuple[Tensor, dict]
     # Returns: (total_loss, {'landmark_loss', 'angular_loss', 'angular_loss_deg', 'total_loss'})
+    # angular_loss/angular_loss_deg are detached metrics (not in loss computation graph)
 ```
 
-## `RayNet/multiview_loss.py` — Multi-View Losses
+## `RayNet/multiview_loss.py` — Multi-View Losses (Ray-Based)
+
+All operations use unit vectors in normalized space. No raw 3D coordinates, no matrix
+inversions, no SVD. Float16-safe under AMP.
 
 ```python
 def reshape_multiview(tensor, n_views=9) -> Tensor
     # (B*V, ...) -> (G, V, ...)
 
-def denormalize_landmarks_to_original_px(
-    pred_coords_feat,   # (G, V, N, 2)
-    M_norm_inv,         # (G, V, 3, 3)
-    img_size=224, feat_size=56
-) -> Tensor             # (G, V, N, 2)
+def gaze_ray_consistency_loss(pred_gaze, R_norm, n_pairs=3) -> Tensor
+    # pred_gaze: (G, V, 3) unit gaze vectors in normalized space
+    # R_norm: (G, V, 3, 3) normalization rotation matrices
+    # Transforms to world frame via R_norm^T, L1 loss vs group mean
 
-def unproject_2d_to_3d(pts_2d, K_inv, depth) -> Tensor
-def project_3d_to_2d(pts_3d, K) -> Tensor
-def transform_points(pts, R_src, T_src, R_dst, T_dst) -> Tensor
-
-def reprojection_consistency_loss(
-    pred_coords_feat,    # (G, V, N, 2)
-    M_norm_inv, K, R_cam, T_cam, eyeball_center_3d,
-    n_pairs=2, img_size=224, feat_size=56
-) -> Tensor
-
-def triangulate_dlt_batch(pts_a, pts_b, P_a, P_b) -> Tensor
-    # pts: (G, 2), P: (G, 3, 4) -> X_world: (G, 3) DETACHED
-
-def triangulation_masking_loss(
-    pred_coords_feat, M_norm_inv, K, R_cam, T_cam,
-    img_size=224, feat_size=56
-) -> Tensor
+def landmark_shape_consistency_loss(pred_coords, n_pairs=3) -> Tensor
+    # pred_coords: (G, V, N, 2) landmarks in feature-map space
+    # Translation/scale-invariant (Procrustes-style) shape comparison
 
 def multiview_consistency_loss(
-    pred_coords_feat,    # (B_total, N, 2)
-    batch_meta: dict,    # {K, R_cam, T_cam, M_norm_inv, eyeball_center_3d}
-    lam_reproj=0.2, lam_mask=0.1,
-    n_views=9, n_reproj_pairs=2, img_size=224, feat_size=56
+    pred_gaze,       # (B_total, 3) predicted gaze unit vectors
+    pred_coords,     # (B_total, N, 2) predicted landmark coords
+    R_norm,          # (B_total, 3, 3) normalization rotation matrices
+    lam_gaze_consist=1.0, lam_shape=0.5, n_views=9
 ) -> tuple[Tensor, dict]
-    # Returns: (total_mv_loss, {'reproj_loss', 'mask_loss'})
+    # Returns: (total_mv_loss, {'gaze_consist_loss', 'shape_loss'})
 
 def sanity_check_roundtrip(dataset, n_samples=50, threshold_px=2.0) -> tuple[float, bool]
 ```
@@ -304,7 +299,7 @@ def verify_minio_connection(endpoint='http://localhost:9000',
 ## `RayNet/train.py` — Training
 
 ```python
-HARDWARE_PROFILES: dict     # 'default', 'a100'
+HARDWARE_PROFILES: dict     # 'default', 't4', 'l4', 'a10g', 'v100', 'a100', 'h100'
 PHASE_CONFIG: dict          # phases 1, 2, 3
 
 def get_phase(epoch: int) -> int

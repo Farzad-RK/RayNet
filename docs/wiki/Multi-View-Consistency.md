@@ -1,164 +1,202 @@
 # Multi-View Consistency
 
-RayNet v2 exploits the 9 synchronized cameras in GazeGene to impose geometric constraints during training. This provides "free" supervision that resolves depth ambiguity and enforces anatomically consistent predictions across viewpoints.
+RayNet v2 exploits the 9 synchronized cameras in GazeGene to impose geometric constraints during training. This provides "free" supervision that enforces anatomically consistent predictions across viewpoints.
 
 **Source**: `RayNet/multiview_loss.py`
 
 ## Overview
 
-Two complementary losses are used:
+Two ray-based losses enforce multi-view consistency using unit vectors in normalized space:
 
 | Loss | Purpose | Weight | Active |
 |------|---------|--------|--------|
-| **Reprojection consistency** | Predictions from cam_i, reprojected to cam_j, should match cam_j's own predictions | 0.1 -> 0.2 | Phase 2+ |
-| **Triangulation masking** | Triangulate eye from two cameras, project into a third (masked) camera, compare | 0.05 -> 0.1 | Phase 2+ |
+| **Gaze ray consistency** | Gaze predictions from all views, transformed to world frame, should agree in direction | 0.1 -> 0.2 | Phase 2+ |
+| **Landmark shape consistency** | Relative landmark patterns should be anatomically consistent across views | 0.05 -> 0.1 | Phase 2+ |
 
-Both losses operate in **original camera pixel space**, not normalized space.
+All operations use **unit vectors and normalized coordinates** — never raw 3D camera-space coordinates. This ensures numerical stability under AMP float16.
+
+## Design Philosophy
+
+### Why Not Pixel-Space Reprojection?
+
+An earlier implementation used pixel-space geometric operations: unprojecting landmarks to 3D via camera intrinsics, transforming between camera frames, and reprojecting into target views. This approach was **numerically unstable** for several reasons:
+
+1. **Large coordinate values**: Camera intrinsics have focal lengths ~500-2000, eyeball depths ~5000mm. These magnitudes cause catastrophic precision loss in float16 (only ~3 decimal digits).
+2. **Matrix inversions**: `torch.linalg.inv(K)` on intrinsic matrices in float16 produces garbage.
+3. **SVD limitations**: `torch.linalg.svd` doesn't support float16 on CUDA (`svd_cuda_gesvdjBatched not implemented for 'Half'`).
+4. **Depth entanglement**: As noted in the GazeGene paper (Sec 4.2), without normalization, 3D coordinate regression is "ill-conditioned" — the network must simultaneously infer 3D position and gaze direction from a single 2D projection, with small depth errors causing massive downstream errors.
+
+### The Ray-Based Solution
+
+Following the GazeGene paper's methodology (Sec 4.1), all computations stay in **normalized space**:
+
+- Gaze vectors are unit vectors (bounded [-1, 1])
+- Landmark coordinates are in feature-map space (0-56)
+- Cross-view consistency is enforced through R_norm transformations, not 3D reprojection
+
+This eliminates all sources of numerical instability.
 
 ## Batch Structure
 
-Multi-view batches are structured as:
+### Phase 1: Independent Samples
+
+In Phase 1 (landmark warmup), multi-view is disabled. Each camera angle is treated as an **independent sample** — the standard dataloader draws randomly from all subjects, frames, and cameras with no view grouping:
 
 ```
-Standard batch: (B, ...)           e.g. B=512 random samples
-Multi-view:     (G*9, ...)         e.g. G=2 groups, 18 total samples
+Standard batch: (B, ...)    e.g. B=2048 random samples from any camera
+```
+
+This maximizes sample diversity for landmark training.
+
+### Phase 2+: Multi-View Groups
+
+When multi-view is activated, the dataloader ensures 9 consecutive samples form one (subject, frame) group:
+
+```
+Multi-view batch: (G*9, ...)    e.g. G=64 groups, 576 total samples
 ```
 
 The `reshape_multiview` utility converts `(G*9, ...)` -> `(G, 9, ...)` for cross-view operations.
 
-## Denormalization Pipeline
-
-Before any geometric operation, predictions must be converted from feature space to original camera pixels:
-
-```
-Feature coords (B, 14, 2) in [0, 56)
-        |
-    * 4.0 (stride)
-        |
-Normalized pixels (B, 14, 2) in [0, 224)
-        |
-    M_norm_inv (homography, per sample)
-        |
-Original camera pixels (B, 14, 2)
-```
-
-This is done by `denormalize_landmarks_to_original_px()` using batched homogeneous transforms.
+The multiview dataloader is created **lazily** — only when Phase 2 begins — to avoid downloading shards unnecessarily during Phase 1.
 
 ---
 
-## Reprojection Consistency Loss
+## Gaze Ray Consistency Loss
+
+**Source**: `RayNet/multiview_loss.py:gaze_ray_consistency_loss`
+
+### Principle
+
+For the same subject looking at the same target, all 9 camera views should predict gaze vectors that, when transformed to a common world frame, point in the same direction.
 
 ### Algorithm
 
-For each forward pass, sample `n_pairs=2` random camera pairs from the 9 available:
-
-**For pair (i, j):**
-
-1. **Denormalize** both cameras' predicted landmarks to original pixel space
-
-2. **Unproject** camera i's 2D landmarks to 3D:
+1. Each view `v` predicts gaze vector `g_v` in **normalized space** (unit vector)
+2. Transform to world frame using the normalization rotation:
    ```
-   ray = K_i_inv @ [u, v, 1]^T       # normalized ray direction
-   P_3d = ray * Z_i                   # scale by depth
+   g_world_v = R_norm_v^T @ g_v
    ```
-   Where `Z_i` = GT eyeball center Z-component in camera i coords (clamped >= 100mm)
-
-3. **Transform** from camera i frame to camera j frame:
+   (`R_norm` is orthogonal, so `R_norm^T = R_norm^{-1}`)
+3. Normalize the world-frame vectors
+4. Compute group mean: `g_mean = normalize(mean(g_world_v) over views)`
+5. L1 loss between each view's world gaze and the detached group mean:
    ```
-   R_rel = R_j @ R_i^T                # relative rotation
-   t_rel = T_j - R_rel @ T_i          # relative translation
-   P_j = R_rel @ P_i + t_rel
+   L = L1(g_world, detach(g_mean))
    ```
 
-4. **Project** into camera j's image:
-   ```
-   [u', v', z'] = K_j @ P_j
-   pixel_j = [u'/z', v'/z']
-   ```
+### Gradient Flow
 
-5. **L1 loss** between reprojected landmarks and camera j's own predictions
+```
+pred_gaze (normalized space)    <-- gradients flow here
+    |
+R_norm^T (fixed rotation)       <-- no learnable params
+    |
+g_world (world frame)
+    |
+    v
+g_mean (detached)               <-- no gradients through mean
+    |
+L1 Loss                         <-- loss signal
+```
 
-6. Repeat in reverse (j -> i) and average both directions
-
-**Final loss**: average over all sampled pairs.
-
-### Depth Strategy
-
-**Option A (current)**: Use GT eyeball center Z component from the dataset. This is the depth of the eyeball center in each camera's coordinate system. All 14 landmarks are assumed to lie approximately at this depth (valid because the iris is roughly planar and close to the eyeball center).
-
-**Option B (future)**: Use the model's geometric iris depth estimate from ellipse fitting (`geometry.py:metric_pupil_diameter`), making the loss fully self-supervised.
+Detaching `g_mean` ensures each view receives gradients to move toward the group consensus, without the mean itself being pulled by any single view.
 
 ---
 
-## Triangulation Masking Loss
+## Landmark Shape Consistency Loss
+
+**Source**: `RayNet/multiview_loss.py:landmark_shape_consistency_loss`
+
+### Principle
+
+The spatial arrangement of 14 eye landmarks (10 iris + 4 pupil) should be anatomically consistent regardless of which camera view captures them. While the absolute pixel positions differ due to different normalization warps, the **relative shape** should be preserved.
 
 ### Algorithm
 
-1. **Select 3 cameras** randomly: `mask_cam`, `tri_a`, `tri_b`
+For each sampled camera pair (i, j):
 
-2. **Compute centroids** of the 14 predicted landmarks in original pixel space for all 3 cameras. The centroid serves as an eye center proxy.
+1. Extract predicted landmarks in feature-map space (no denormalization needed)
+2. **Center**: subtract the centroid (mean of 14 points)
+3. **Scale-normalize**: divide by RMS distance from centroid
+4. **Smooth L1 loss** between normalized shapes
 
-3. **Build projection matrices** for the two triangulation cameras:
-   ```
-   P_a = K_a @ [R_a | T_a]    shape: (G, 3, 4)
-   P_b = K_b @ [R_b | T_b]    shape: (G, 3, 4)
-   ```
+```
+pts_c = pts - mean(pts, axis=landmarks)     # center
+scale = rms(||pts_c||)                       # scale factor
+pts_n = pts_c / scale                        # normalized shape
+L = SmoothL1(pts_n_i, pts_n_j)              # compare shapes
+```
 
-4. **Triangulate** via DLT (Direct Linear Transform):
-   - Build 4x4 system from the cross-product constraints:
-     ```
-     A[0] = x_a * P_a[2] - P_a[0]
-     A[1] = y_a * P_a[2] - P_a[1]
-     A[2] = x_b * P_b[2] - P_b[0]
-     A[3] = y_b * P_b[2] - P_b[1]
-     ```
-   - Solve `A @ X = 0` via SVD: solution is last column of V
-   - Dehomogenize to get 3D world point
-   - **Detach** the result (no gradients through SVD)
+### Why Procrustes-Style Normalization?
 
-5. **Project** triangulated point into masked camera:
-   ```
-   P_mask_cam = R_mask @ P_world + T_mask
-   pixel = K_mask @ P_mask_cam / z
-   ```
+Each camera view has a different Zhang normalization warp (M_norm), producing different absolute coordinates for the same anatomical landmarks. By removing translation (centering) and scale, we compare only the **intrinsic shape** — the relative positions of landmarks to each other. This is invariant to the per-view normalization warp.
 
-6. **L1 loss** between projected point and masked camera's predicted centroid
+### Why Smooth L1?
 
-### Why This Works
+`SmoothL1` (Huber loss) is less sensitive to outlier landmark pairs than raw L1, providing more stable gradients during early training when predictions may be noisy.
 
-This loss teaches the network that its predictions must be geometrically consistent across views. If camera A and B both predict eye landmarks that triangulate to a 3D point, that point should reproject correctly into camera C. This is supervision that comes "for free" from the multi-camera geometry.
+---
+
+## Combined Multi-View Loss
+
+**Source**: `RayNet/multiview_loss.py:multiview_consistency_loss`
+
+```python
+L_multiview = lam_gaze_consist * gaze_ray_consistency_loss(pred_gaze, R_norm)
+            + lam_shape * landmark_shape_consistency_loss(pred_coords)
+```
+
+### Inputs Required
+
+| Input | Shape | Source |
+|-------|-------|--------|
+| `pred_gaze` | (B, 3) | Model output (`gaze_vector`) |
+| `pred_coords` | (B, N, 2) | Model output (`landmark_coords`) |
+| `R_norm` | (B, 3, 3) | Dataset (`R_norm` field) |
+
+No camera intrinsics (K), extrinsics (R_cam, T_cam), inverse warps (M_norm_inv), or 3D coordinates (eyeball_center_3d) are needed.
+
+---
+
+## Weight Schedule
+
+| Phase | Epochs | lam_gaze_consist | lam_shape | Dataloader |
+|-------|--------|-------------------|-----------|------------|
+| 1 | 1-5 | 0.0 | 0.0 | Standard (random, independent views) |
+| 2 | 6-15 | 0.1 | 0.05 | Multi-view (9 cameras per group) |
+| 3 | 16-30 | 0.2 | 0.1 | Multi-view (9 cameras per group) |
 
 ---
 
 ## Implementation Details
 
-### Gradient Flow
+### AMP Compatibility
 
-```
-Model predictions          <-- gradients flow here
-    |
-Denormalization (M_inv)    <-- fixed (no learnable params)
-    |
-Unproject (K_inv, Z)       <-- fixed camera params
-    |
-Transform (R_rel, t_rel)   <-- fixed camera params
-    |
-Project (K)                <-- fixed camera params
-    |
-L1 Loss                    <-- loss signal
-```
+All multi-view loss operations are **float16-safe**:
+- L1 loss on unit vectors: bounded inputs, bounded gradients
+- R_norm matrix-vector multiply: orthogonal matrix, unit vector output
+- No matrix inversions, no SVD, no large-scale coordinates
 
-For the triangulation loss, the triangulated 3D point is **detached**, so gradients only flow through the masked camera's prediction branch.
-
-### Numerical Stability
-
-- Depth Z clamped to minimum 100mm (prevents division by tiny numbers)
-- Dehomogenization adds 1e-8 to denominator
-- Projection Z clamped to minimum 1.0 (prevents negative/zero depth)
+No `autocast(enabled=False)` wrapper is needed (unlike the previous pixel-space approach).
 
 ### Batch Requirements
 
 Multi-view losses require `batch_size % 9 == 0`. If the batch size is not divisible by 9 (e.g., last batch), the multi-view loss returns 0 gracefully.
+
+### `mv_groups` Parameter
+
+Controls the number of multi-view groups per batch. Actual batch size = `mv_groups * 9`.
+
+| Profile | mv_groups | Batch size | Batches/epoch (828K samples) |
+|---------|-----------|------------|------------------------------|
+| default | 2 | 18 | 46,000 |
+| t4 | 4 | 36 | 23,000 |
+| l4 | 8 | 72 | 11,500 |
+| a100 | 16 | 144 | 5,750 |
+| h100 | 32 | 288 | 2,875 |
+
+Can be overridden with `--mv_groups N` (e.g., `--mv_groups 64` for batch size 576 on A100).
 
 ---
 
@@ -173,14 +211,12 @@ Run `sanity_check_roundtrip(dataset, n_samples=50)` to verify:
 
 **Must be < 2px error**.
 
-### Synthetic Validation
+### Expected Training Behavior
 
-To validate the reprojection pipeline independently:
-1. Choose a known 3D point
-2. Project into camera i and camera j using known K, R, T
-3. Run through the reprojection loss pipeline
-4. Loss should be approximately zero
+| Metric | Phase 1 | Phase 2 (early) | Phase 2 (late) |
+|--------|---------|-----------------|----------------|
+| gaze_mv | 0.0 | ~0.19 | ~0.15 |
+| shape | 0.0 | ~0.05 | ~0.04 |
+| angular_deg | ~42° (random) | ~20° | ~10-12° |
 
-### Camera Pair Baseline
-
-If all cameras predict perfectly consistent landmarks, the reprojection loss should be near zero. In practice, early training will show high reprojection loss that decreases as predictions become geometrically consistent.
+Gaze ray consistency loss starts high because each view independently predicts somewhat random gaze directions. As the gaze head learns, cross-view predictions converge in world frame.

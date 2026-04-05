@@ -9,7 +9,8 @@ Backbone: RepNeXt-M3 (7.8M params)
 Neck:     PANet (YOLOv8-style multi-scale fusion)
 Attention: Coordinate Attention on P2 (landmarks) and P5 (gaze)
 
-Input:    Normalized eye crop (3 x 224 x 224) via Zhang et al. 2018
+Input:    (3 x 224 x 224) image normalized via Zhang et al. 2018
+          (perspective warp of GazeGene face crop, centered on eye)
 """
 
 import torch
