@@ -45,8 +45,8 @@ except ImportError:
 # All tensor fields produced by GazeGeneDataset.__getitem__
 TENSOR_FIELDS = [
     'landmark_coords', 'landmark_coords_px', 'optical_axis',
-    'R_norm', 'R_kappa', 'K', 'R_cam', 'T_cam',
-    'M_norm_inv', 'eyeball_center_3d',
+    'R_kappa', 'K', 'R_cam', 'T_cam',
+    'eyeball_center_3d', 'gaze_target', 'gaze_depth',
 ]
 
 METADATA_FIELDS = ['subject', 'cam_id', 'frame_idx']
@@ -244,8 +244,9 @@ def _streaming_collate_fn(batch):
 
     collated = {}
     tensor_keys = ['image', 'landmark_coords', 'landmark_coords_px',
-                   'optical_axis', 'R_norm', 'R_kappa',
-                   'K', 'R_cam', 'T_cam', 'M_norm_inv', 'eyeball_center_3d']
+                   'optical_axis', 'R_kappa',
+                   'K', 'R_cam', 'T_cam', 'eyeball_center_3d',
+                   'gaze_target', 'gaze_depth']
     scalar_keys = ['subject', 'cam_id', 'frame_idx']
 
     for key in tensor_keys:
@@ -357,11 +358,13 @@ class MultiViewStreamingDataset(IterableDataset):
         """Stack 9 samples into a multi-view group dict."""
         result = {}
         tensor_keys = ['image', 'landmark_coords', 'landmark_coords_px',
-                       'optical_axis', 'R_norm', 'R_kappa',
-                       'K', 'R_cam', 'T_cam', 'M_norm_inv', 'eyeball_center_3d']
+                       'optical_axis', 'R_kappa',
+                       'K', 'R_cam', 'T_cam', 'eyeball_center_3d',
+                       'gaze_target', 'gaze_depth']
 
         for key in tensor_keys:
-            result[key] = torch.stack([s[key] for s in samples])  # (9, ...)
+            if key in samples[0]:
+                result[key] = torch.stack([s[key] for s in samples])  # (9, ...)
 
         result['subject'] = samples[0]['subject']
         result['cam_id'] = [s['cam_id'] for s in samples]
@@ -382,13 +385,15 @@ def _multiview_collate_fn(groups):
 
     collated = {}
     tensor_keys = ['image', 'landmark_coords', 'landmark_coords_px',
-                   'optical_axis', 'R_norm', 'R_kappa',
-                   'K', 'R_cam', 'T_cam', 'M_norm_inv', 'eyeball_center_3d']
+                   'optical_axis', 'R_kappa',
+                   'K', 'R_cam', 'T_cam', 'eyeball_center_3d',
+                   'gaze_target', 'gaze_depth']
 
     for key in tensor_keys:
-        stacked = torch.stack([g[key] for g in groups])  # (G, 9, ...)
-        G, V = stacked.shape[:2]
-        collated[key] = stacked.reshape(G * V, *stacked.shape[2:])
+        if key in groups[0]:
+            stacked = torch.stack([g[key] for g in groups])  # (G, 9, ...)
+            G, V = stacked.shape[:2]
+            collated[key] = stacked.reshape(G * V, *stacked.shape[2:])
 
     collated['subject'] = []
     collated['cam_id'] = []

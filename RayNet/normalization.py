@@ -1,9 +1,21 @@
 """
-Image normalization for gaze estimation (Zhang et al. 2018).
+DEPRECATED — Image normalization for gaze estimation (Zhang et al. 2018).
 
-Constructs a virtual camera that views the eye center from a canonical
-distance and focal length, removing depth ambiguity from the learning task.
+This module is no longer used by RayNet v3. GazeGene provides 448×448
+face crops that are simply resized to 224×224 — no perspective warp is
+applied. See GazeGene paper Sec 4.2: "experiments in Sec. 4.2 do not
+implement the normalization technique from [51]".
+
+Kept for reference and backward compatibility with older pipelines.
 """
+
+import warnings
+warnings.warn(
+    "RayNet.normalization is deprecated since v3. "
+    "GazeGene face crops are resized directly (no Zhang warp).",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 import numpy as np
 import cv2

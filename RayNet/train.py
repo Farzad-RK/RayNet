@@ -1,10 +1,13 @@
 """
-RayNet v2 Training Script.
+RayNet v3 Training Script.
 
-Progressive 3-phase training schedule:
-  Phase 1 (epochs 1-5):   landmark head only         λ_lm=1.0, λ_gaze=0.0
-  Phase 2 (epochs 6-15):  introduce gaze gently      λ_lm=1.0, λ_gaze=0.3
-  Phase 3 (epochs 16-30): balance and fine-tune       λ_lm=0.5, λ_gaze=0.5
+Progressive 3-phase training schedule with multi-view from epoch 1:
+  Phase 1 (epochs 1-5):   landmark focus + gaze warmup   λ_lm=1.0, λ_gaze=0.1
+  Phase 2 (epochs 6-15):  balanced training               λ_lm=1.0, λ_gaze=0.3
+  Phase 3 (epochs 16-30): gaze-focused fine-tuning        λ_lm=0.5, λ_gaze=0.5
+
+Multi-view + CrossViewAttention active from Phase 1 so the transformer
+encoder learns cross-view consistency alongside gaze from the start.
 
 Supports hardware profiles (default, t4, l4, a10g, v100, a100, h100) with AMP,
 gradient accumulation, torch.compile, and MDS/WebDataset streaming.
@@ -13,14 +16,14 @@ Usage:
     # Local dataset, default hardware
     python -m RayNet.train --data_dir /path/to/gazegene --backbone repnext_m3
 
-    # MDS streaming from MinIO with checkpoints, on A100
+    # MDS streaming from MinIO with checkpoints, on A100 (v3 shards)
     python -m RayNet.train --profile a100 --mds_streaming \
-        --mds_train s3://gazegene/train --mds_val s3://gazegene/val \
+        --mds_train s3://gazegene-v3/train --mds_val s3://gazegene-v3/val \
         --ckpt_bucket raynet-checkpoints --minio_endpoint http://IP:9000
 
     # Resume interrupted run
     python -m RayNet.train --profile a100 --mds_streaming \
-        --mds_train s3://gazegene/train --mds_val s3://gazegene/val \
+        --mds_train s3://gazegene-v3/train --mds_val s3://gazegene-v3/val \
         --ckpt_bucket raynet-checkpoints --run_id run_20260405_003135 --resume
 """
 
@@ -38,7 +41,7 @@ from datetime import datetime
 from RayNet.raynet import create_raynet
 from RayNet.dataset import create_dataloaders, GazeGeneDataset
 from RayNet.losses import total_loss, gaze_loss, angular_error, landmark_loss
-from RayNet.multiview_loss import multiview_consistency_loss, sanity_check_roundtrip
+from RayNet.multiview_loss import multiview_consistency_loss
 
 log = logging.getLogger(__name__)
 
@@ -47,9 +50,11 @@ log = logging.getLogger(__name__)
 
 HARDWARE_PROFILES = {
     # ---- CPU / low-end GPU (testing, debugging) ----
+    # v3 note: 448×448 input → 4× larger feature maps than 224×224.
+    # Batch sizes tuned for 448×448 with CrossViewAttention (~1M params).
     'default': {
-        'batch_size': 512,
-        'mv_groups': 2,
+        'batch_size': 126,          # 14 mv_groups × 9 views
+        'mv_groups': 14,
         'num_workers': 4,
         'pin_memory': True,
         'amp': False,
@@ -62,31 +67,31 @@ HARDWARE_PROFILES = {
     },
     # ---- NVIDIA T4  (16 GB, Colab free / GCP n1-standard) ----
     # FP16 is critical — T4 has weak FP32 but decent FP16 (65 TFLOPS).
-    # 16 GB VRAM is tight: keep batch ≤ 512 to leave room for activations.
+    # 16 GB VRAM tight at 448×448: ~4 mv_groups (36 samples).
     't4': {
-        'batch_size': 512,
-        'mv_groups': 4,             # 36 samples per multi-view batch
+        'batch_size': 36,           # 4 mv_groups × 9 views
+        'mv_groups': 4,
         'num_workers': 2,
         'pin_memory': True,
         'amp': True,
         'amp_dtype': 'float16',
-        'grad_accum_steps': 2,      # effective batch = 1024
+        'grad_accum_steps': 8,      # effective batch = 288
         'compile_model': False,     # T4 doesn't benefit much from compile
         'tf32': False,              # T4 doesn't support TF32
         'prefetch_factor': 2,
         'persistent_workers': True,
     },
     # ---- NVIDIA L4  (24 GB, GCP g2-standard) ----
-    # Ada Lovelace arch: good FP16/BF16 (121 TFLOPS FP16),
-    # 24 GB allows larger batches than T4.
+    # Ada Lovelace arch: good FP16/BF16 (121 TFLOPS FP16).
+    # 24 GB allows ~8 mv_groups at 448×448.
     'l4': {
-        'batch_size': 1024,
-        'mv_groups': 8,             # 72 samples per multi-view batch
+        'batch_size': 72,           # 8 mv_groups × 9 views
+        'mv_groups': 8,
         'num_workers': 4,
         'pin_memory': True,
         'amp': True,
         'amp_dtype': 'float16',
-        'grad_accum_steps': 2,      # effective batch = 2048
+        'grad_accum_steps': 4,      # effective batch = 288
         'compile_model': True,      # Ada supports compile well
         'tf32': True,               # Ada supports TF32
         'prefetch_factor': 2,
@@ -94,15 +99,14 @@ HARDWARE_PROFILES = {
     },
     # ---- NVIDIA A10G  (24 GB, AWS g5) ----
     # Ampere arch, similar to L4 in VRAM but different compute profile.
-    # Slightly weaker FP16 than L4 (125 vs 121 TFLOPS) but same VRAM.
     'a10g': {
-        'batch_size': 1024,
-        'mv_groups': 8,             # 72 samples per multi-view batch
+        'batch_size': 72,           # 8 mv_groups × 9 views
+        'mv_groups': 8,
         'num_workers': 4,
         'pin_memory': True,
         'amp': True,
         'amp_dtype': 'float16',
-        'grad_accum_steps': 2,      # effective batch = 2048
+        'grad_accum_steps': 4,      # effective batch = 288
         'compile_model': True,
         'tf32': True,
         'prefetch_factor': 2,
@@ -111,13 +115,13 @@ HARDWARE_PROFILES = {
     # ---- NVIDIA V100  (16 GB / 32 GB, GCP / AWS p3) ----
     # Volta: no TF32, no torch.compile benefit. Good FP16 via Tensor Cores.
     'v100': {
-        'batch_size': 512,
-        'mv_groups': 4,             # 36 samples per multi-view batch
+        'batch_size': 36,           # 4 mv_groups × 9 views
+        'mv_groups': 4,
         'num_workers': 4,
         'pin_memory': True,
         'amp': True,
         'amp_dtype': 'float16',
-        'grad_accum_steps': 2,      # effective batch = 1024
+        'grad_accum_steps': 8,      # effective batch = 288
         'compile_model': False,     # Volta doesn't benefit from compile
         'tf32': False,              # Volta doesn't support TF32
         'prefetch_factor': 2,
@@ -125,14 +129,15 @@ HARDWARE_PROFILES = {
     },
     # ---- NVIDIA A100  (40 GB / 80 GB, GCP a2, Colab Pro+) ----
     # Ampere flagship: TF32, BF16, huge memory bandwidth (2 TB/s).
+    # At 448×448: ~68 GB estimated for 288 samples. Conservative start.
     'a100': {
-        'batch_size': 2048,
-        'mv_groups': 16,            # 144 samples per multi-view batch
+        'batch_size': 288,          # 32 mv_groups × 9 views
+        'mv_groups': 32,
         'num_workers': 8,
         'pin_memory': True,
         'amp': True,
         'amp_dtype': 'float16',
-        'grad_accum_steps': 2,      # effective batch = 4096
+        'grad_accum_steps': 4,      # effective batch = 1152
         'compile_model': True,
         'tf32': True,
         'prefetch_factor': 4,
@@ -142,13 +147,13 @@ HARDWARE_PROFILES = {
     # Hopper: FP8 support, Transformer Engine, 3.4 TB/s bandwidth.
     # BF16 preferred (less overflow risk than FP16 at similar speed).
     'h100': {
-        'batch_size': 4096,
-        'mv_groups': 32,            # 288 samples per multi-view batch
+        'batch_size': 576,          # 64 mv_groups × 9 views
+        'mv_groups': 64,
         'num_workers': 8,
         'pin_memory': True,
         'amp': True,
         'amp_dtype': 'bfloat16',
-        'grad_accum_steps': 2,      # effective batch = 8192
+        'grad_accum_steps': 2,      # effective batch = 1152
         'compile_model': True,
         'tf32': True,
         'prefetch_factor': 4,
@@ -163,13 +168,13 @@ PHASE_CONFIG = {
     1: {
         'epochs': (1, 5),
         'lam_lm': 1.0,
-        'lam_gaze': 0.0,
-        'lam_reproj': 0.0,
-        'lam_mask': 0.0,
+        'lam_gaze': 0.1,
+        'lam_reproj': 0.05,
+        'lam_mask': 0.02,
         'lr': 1e-3,
         'sigma': 2.0,
-        'multiview': False,
-        'description': 'Landmark warmup (gaze frozen)',
+        'multiview': True,
+        'description': 'Landmark focus + gaze/cross-view warmup',
     },
     2: {
         'epochs': (6, 15),
@@ -180,7 +185,7 @@ PHASE_CONFIG = {
         'lr': 5e-4,
         'sigma': 1.5,
         'multiview': True,
-        'description': 'Introduce gaze + multi-view consistency',
+        'description': 'Balanced landmark + gaze with multi-view',
     },
     3: {
         'epochs': (16, 30),
@@ -191,7 +196,7 @@ PHASE_CONFIG = {
         'lr': 1e-4,
         'sigma': 1.0,
         'multiview': True,
-        'description': 'Balanced fine-tuning with full multi-view',
+        'description': 'Gaze-focused fine-tuning with full multi-view',
     },
 }
 
@@ -255,10 +260,11 @@ def setup_hardware(hw, device):
 
 def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                     scaler=None, grad_accum_steps=1, amp_enabled=False,
-                    amp_dtype=torch.float16, batch_csv_writer=None):
+                    amp_dtype=torch.float16, batch_csv_writer=None,
+                    n_views=1):
     """Run one training epoch with AMP and gradient accumulation support."""
     model.train()
-    use_multiview = cfg.get('multiview', False) and cfg.get('lam_reproj', 0) > 0
+    use_multiview = cfg.get('multiview', False)
     if not amp_enabled:
         amp_dtype = torch.float32
 
@@ -277,7 +283,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
 
         # Forward pass with AMP autocast
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            predictions = model(images)
+            predictions = model(images, n_views=n_views)
 
             pred_hm = predictions['landmark_heatmaps']
             pred_coords = predictions['landmark_coords']
@@ -300,7 +306,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                 mv_loss, mv_components = multiview_consistency_loss(
                     pred_gaze,
                     pred_coords,
-                    batch['R_norm'].to(device, non_blocking=True),
+                    batch['R_cam'].to(device, non_blocking=True),
                     lam_gaze_consist=cfg['lam_reproj'],
                     lam_shape=cfg['lam_mask'],
                 )
@@ -376,7 +382,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
 
 @torch.no_grad()
 def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
-             amp_dtype=torch.float16):
+             amp_dtype=torch.float16, n_views=1):
     """Run validation."""
     model.eval()
     if not amp_enabled:
@@ -395,7 +401,7 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
         gt_landmarks_px = batch['landmark_coords_px'].to(device, non_blocking=True)
 
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            predictions = model(images)
+            predictions = model(images, n_views=n_views)
 
             pred_hm = predictions['landmark_heatmaps']
             pred_coords = predictions['landmark_coords']
@@ -514,21 +520,20 @@ def train(args):
     scaler = GradScaler('cuda', enabled=hw['amp']) if hw['amp'] else None
 
     # --- Data loading ---
+    # v3: multi-view is always active, so we create MV loader upfront.
     # Three modes: local disk, MDS streaming (MosaicML + MinIO), WebDataset streaming
     if args.mds_streaming:
-        train_loader_standard, val_loader = _create_mds_loaders(args, hw)
-        train_loader_mv = None  # created lazily in Phase 2
-        streaming_mode = False  # MDS loaders are persistent, not recreated per-phase
+        _, val_loader = _create_mds_loaders(args, hw)
+        train_loader_mv = _create_mds_mv_loader(args, hw)
+        streaming_mode = False
     elif args.streaming:
         _create_streaming_loaders(args, hw)
-        train_loader_standard = None
         train_loader_mv = None
         val_loader = None
         streaming_mode = True
     else:
         streaming_mode = False
-        train_loader_standard, train_loader_mv, val_loader = _create_local_loaders(
-            args, hw)
+        _, train_loader_mv, val_loader = _create_local_loaders(args, hw)
 
     # Record config in checkpoint metadata
     run_config = _build_run_config(args, hw)
@@ -622,22 +627,16 @@ def train(args):
                 T_max=phase_end - phase_start + 1,
             )
 
-        # Select dataloader based on phase
+        # Select dataloader — v3 always uses multi-view for training
         if streaming_mode:
             active_train_loader, active_val_loader = _get_streaming_loaders(
                 args, hw, cfg)
         else:
-            if cfg.get('multiview'):
-                # Lazy-create multi-view loader on first use (MDS or local)
-                if train_loader_mv is None and args.mds_streaming:
-                    train_loader_mv = _create_mds_mv_loader(args, hw)
-                if train_loader_mv is not None:
-                    active_train_loader = train_loader_mv
-                else:
-                    active_train_loader = train_loader_standard
-            else:
-                active_train_loader = train_loader_standard
+            active_train_loader = train_loader_mv
             active_val_loader = val_loader
+
+        # n_views for CrossViewAttention (9 for multi-view, 1 if ablation)
+        active_n_views = 1 if args.no_multiview else 9
 
         # Train
         train_losses = train_one_epoch(
@@ -647,14 +646,16 @@ def train(args):
             amp_enabled=hw['amp'],
             amp_dtype=amp_dtype,
             batch_csv_writer=batch_csv_writer,
+            n_views=active_n_views,
         )
         batch_csv_file.flush()
 
-        # Validate
+        # Validate (always single-view)
         val_losses = validate(
             model, active_val_loader, device, epoch, cfg,
             amp_enabled=hw['amp'],
             amp_dtype=amp_dtype,
+            n_views=1,
         )
 
         # Step scheduler
@@ -804,10 +805,6 @@ def _create_local_loaders(args, hw):
         **common_kwargs,
     )
 
-    # Sanity check
-    print("Running normalization roundtrip sanity check...")
-    sanity_check_roundtrip(train_loader_mv.dataset, n_samples=50)
-
     return train_loader_standard, train_loader_mv, val_loader
 
 
@@ -926,7 +923,7 @@ def _get_streaming_loaders(args, hw, cfg):
 # ============== CLI ==============
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='RayNet v2 Training')
+    parser = argparse.ArgumentParser(description='RayNet v3 Training')
 
     # Data
     parser.add_argument('--data_dir', type=str, default=None,
@@ -966,8 +963,8 @@ def parse_args():
     parser.add_argument('--no_compile', action='store_true',
                         help='Disable torch.compile even if profile enables it')
     parser.add_argument('--no_multiview', action='store_true',
-                        help='Disable multi-view losses in Phase 2/3 (use standard '
-                             'random batches throughout, for ablation)')
+                        help='Disable multi-view losses and CrossViewAttention '
+                             '(n_views=1 throughout, for ablation)')
     parser.add_argument('--gaze_only', action='store_true',
                         help='Disable landmark loss (lam_lm=0) for gaze-only '
                              'training, matching GazeGene paper baseline')

@@ -1,17 +1,17 @@
 """
-Multi-view consistency losses for RayNet.
+Multi-view consistency losses for RayNet v3.
 
-Ray-based approach: works with unit gaze vectors in normalized space,
-transformed to world frame via R_norm. All values are unit vectors
-(bounded [-1, 1]), ensuring numerical stability under AMP.
+Ray-based approach: works with unit gaze vectors in camera coordinate
+space (CCS), transformed to world frame via R_cam (camera extrinsics).
+All values are unit vectors (bounded [-1, 1]), ensuring numerical
+stability under AMP.
 
 Two losses:
   1. Gaze ray consistency: predicted gaze vectors from different camera
-     views of the same subject, transformed to world coordinates, should
-     agree in direction.
+     views of the same subject, transformed to world coordinates via
+     R_cam, should agree in direction.
   2. Landmark shape consistency: the spatial pattern (relative positions)
-     of predicted landmarks should be consistent across views, independent
-     of the normalization warp applied to each view.
+     of predicted landmarks should be consistent across views.
 """
 
 import torch
@@ -39,18 +39,21 @@ def _normalize_vec(v, dim=-1, eps=1e-8):
 # 1. Gaze Ray Consistency Loss
 # ---------------------------------------------------------------------------
 
-def gaze_ray_consistency_loss(pred_gaze, R_norm, n_pairs=3):
+def gaze_ray_consistency_loss(pred_gaze, R_cam, n_pairs=3):
     """
     Enforce that predicted gaze vectors from different camera views of the
     same subject point in the same world-frame direction.
 
-    Each view predicts a gaze vector g_v in normalized space. We transform
-    to world frame: g_world_v = R_norm_v^T @ g_v. All g_world_v for the
-    same group should be identical.
+    Each view predicts a gaze vector g_v in camera coordinate space (CCS).
+    We transform to world frame: g_world_v = R_cam_v^T @ g_v. All g_world_v
+    for the same group should be identical.
+
+    R_cam is static per camera (from camera_info.pkl extrinsics), providing
+    more stable consistency targets than the old per-frame R_norm.
 
     Args:
-        pred_gaze: (G, V, 3) predicted gaze unit vectors in normalized space
-        R_norm:    (G, V, 3, 3) normalization rotation matrices
+        pred_gaze: (G, V, 3) predicted gaze unit vectors in CCS
+        R_cam:     (G, V, 3, 3) camera extrinsic rotation matrices
         n_pairs:   number of random camera pairs to sample per group
 
     Returns:
@@ -62,9 +65,9 @@ def gaze_ray_consistency_loss(pred_gaze, R_norm, n_pairs=3):
     if V < 2:
         return torch.tensor(0.0, device=device)
 
-    # Transform predicted gaze to world frame: g_world = R_norm^T @ g_pred
-    # R_norm is orthogonal, so R_norm^T = R_norm^{-1}
-    g_world = torch.einsum('gvji,gvj->gvi', R_norm, pred_gaze)  # (G, V, 3)
+    # Transform predicted gaze to world frame: g_world = R_cam^T @ g_pred
+    # R_cam is orthogonal, so R_cam^T = R_cam^{-1}
+    g_world = torch.einsum('gvji,gvj->gvi', R_cam, pred_gaze)  # (G, V, 3)
     g_world = _normalize_vec(g_world, dim=-1)
 
     # Compute mean world gaze direction per group as reference
@@ -140,16 +143,16 @@ def landmark_shape_consistency_loss(pred_coords, n_pairs=3):
 # Combined Multi-View Consistency Loss
 # ---------------------------------------------------------------------------
 
-def multiview_consistency_loss(pred_gaze, pred_coords, R_norm,
+def multiview_consistency_loss(pred_gaze, pred_coords, R_cam,
                                lam_gaze_consist=1.0, lam_shape=0.5,
                                n_views=9):
     """
     Orchestrates ray-based multi-view consistency losses.
 
     Args:
-        pred_gaze:   (B_total, 3) predicted gaze unit vectors (normalized space)
+        pred_gaze:   (B_total, 3) predicted gaze unit vectors (CCS)
         pred_coords: (B_total, N, 2) predicted landmark coords (feature space)
-        R_norm:      (B_total, 3, 3) normalization rotation matrices
+        R_cam:       (B_total, 3, 3) camera extrinsic rotation matrices
         lam_gaze_consist: weight for gaze ray consistency loss
         lam_shape:        weight for landmark shape consistency loss
         n_views:     number of camera views per group (9)
@@ -169,10 +172,10 @@ def multiview_consistency_loss(pred_gaze, pred_coords, R_norm,
     # Reshape to multi-view groups: (G, V, ...)
     gaze_mv = reshape_multiview(pred_gaze, n_views)     # (G, V, 3)
     coords_mv = reshape_multiview(pred_coords, n_views)  # (G, V, N, 2)
-    R_norm_mv = reshape_multiview(R_norm, n_views)        # (G, V, 3, 3)
+    R_cam_mv = reshape_multiview(R_cam, n_views)            # (G, V, 3, 3)
 
     # Gaze ray consistency
-    gaze_consist = gaze_ray_consistency_loss(gaze_mv, R_norm_mv, n_pairs=3)
+    gaze_consist = gaze_ray_consistency_loss(gaze_mv, R_cam_mv, n_pairs=3)
 
     # Landmark shape consistency
     shape = landmark_shape_consistency_loss(coords_mv, n_pairs=3)
@@ -184,52 +187,3 @@ def multiview_consistency_loss(pred_gaze, pred_coords, R_norm,
         'shape_loss': shape.detach(),
     }
     return total, components
-
-
-# ---------------------------------------------------------------------------
-# Sanity Check
-# ---------------------------------------------------------------------------
-
-def sanity_check_roundtrip(dataset, n_samples=50, threshold_px=2.0):
-    """
-    Verify normalization invertibility: warp 2D landmarks with M then
-    unwarp with M_inv. Round-trip error should be < threshold_px.
-
-    Args:
-        dataset: GazeGeneDataset instance
-        n_samples: number of samples to test
-        threshold_px: maximum acceptable round-trip error in pixels
-
-    Returns:
-        max_error: maximum pixel error across all tested samples
-        passed: bool
-    """
-    import numpy as np
-    max_error = 0.0
-    indices = random.sample(range(len(dataset)), min(n_samples, len(dataset)))
-
-    for idx in indices:
-        sample = dataset[idx]
-        M_inv = sample['M_norm_inv'].numpy()  # (3, 3)
-        lm_px = sample['landmark_coords_px'].numpy()  # (14, 2) in normalized pixel space
-
-        # Forward: normalized px -> original px via M_inv
-        ones = np.ones((lm_px.shape[0], 1), dtype=lm_px.dtype)
-        pts_h = np.concatenate([lm_px, ones], axis=1)
-        warped_h = (M_inv @ pts_h.T).T
-        original_px = warped_h[:, :2] / (warped_h[:, 2:3] + 1e-8)
-
-        # Backward: original px -> normalized px via M (= inv(M_inv))
-        M = np.linalg.inv(M_inv)
-        ones2 = np.ones((original_px.shape[0], 1), dtype=original_px.dtype)
-        pts_h2 = np.concatenate([original_px, ones2], axis=1)
-        back_h = (M @ pts_h2.T).T
-        back_px = back_h[:, :2] / (back_h[:, 2:3] + 1e-8)
-
-        error = np.max(np.linalg.norm(back_px - lm_px, axis=1))
-        max_error = max(max_error, error)
-
-    passed = max_error < threshold_px
-    print(f"Roundtrip sanity check: max_error={max_error:.4f}px, "
-          f"threshold={threshold_px}px, {'PASSED' if passed else 'FAILED'}")
-    return max_error, passed

@@ -79,29 +79,35 @@ class OpticalAxisHead(nn.Module):
     Optical axis regression head.
 
     Predicts pitch and yaw angles, then converts to a unit 3D vector.
-    Attaches to P5 (stride=32, 14x14) via GAP.
+    Attaches to P5 (stride=32, 14x14 for 448 input) via GAP.
+
+    Split into pool_features() and predict_from_pooled() to allow
+    CrossViewAttention to be inserted between them.
     """
 
     def __init__(self, in_ch=256, hidden_dim=128):
         super().__init__()
-        self.head = nn.Sequential(
+        self.pool = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
+        )
+        self.fc = nn.Sequential(
             nn.Linear(in_ch, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 2),  # pitch, yaw
         )
 
-    def forward(self, feat):
-        """
-        Args:
-            feat: (B, C, H, W) feature map from PANet P5 + CoordAtt
+    def pool_features(self, feat):
+        """(B, C, H, W) -> (B, C) pooled feature vector."""
+        return self.pool(feat)
 
-        Returns:
-            gaze_vector: (B, 3) unit vector in normalized space
-            angles: (B, 2) predicted pitch and yaw in radians
+    def predict_from_pooled(self, pooled):
         """
-        angles = self.head(feat)  # (B, 2)
+        (B, C) -> (gaze_vector (B, 3), angles (B, 2))
+
+        Runs FC layers and converts pitch/yaw to unit 3D vector.
+        """
+        angles = self.fc(pooled)  # (B, 2)
         pitch = angles[:, 0]
         yaw = angles[:, 1]
 
@@ -115,3 +121,14 @@ class OpticalAxisHead(nn.Module):
         gaze_vector = F.normalize(gaze_vector, dim=-1)
 
         return gaze_vector, angles
+
+    def forward(self, feat):
+        """
+        Args:
+            feat: (B, C, H, W) feature map from PANet P5 + CoordAtt
+
+        Returns:
+            gaze_vector: (B, 3) unit vector in camera coordinate space
+            angles: (B, 2) predicted pitch and yaw in radians
+        """
+        return self.predict_from_pooled(self.pool_features(feat))

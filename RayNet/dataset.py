@@ -1,18 +1,20 @@
 """
-GazeGene dataset loader for RayNet v2.
+GazeGene dataset loader for RayNet v3.
 
-Input: GazeGene full face crops (variable size, e.g. 448×448).
-Output: 224×224 normalized images via Zhang et al. 2018 perspective warp,
-        centered on one eye at canonical distance/focal length.
+Input: GazeGene full face crops (448×448), used at native resolution.
+Output: 448×448 face image tensor (NO resize, NO Zhang normalization warp).
 
 Key design:
-  - Per-frame normalization (Zhang et al. 2018) warps face crop around
-    eyeball center to canonical distance, removing depth/pose ambiguity
-  - Optical axis GT from GazeGene gaze_label (optic_axis_L/R), NOT computed
-  - Kappa roll zeroed out
-  - Iris landmarks warped to normalized image space
+  - Native 448×448 resolution (no downscaling, preserves detail for landmarks)
+  - Matches GazeGene paper Sec 4.2 methodology (no normalization for 3D tasks)
+  - Optical axis GT from GazeGene gaze_label (optic_axis_L/R) in CCS
+  - R_cam (camera extrinsics) used for multi-view world-frame transform
   - 14 landmarks: 10 iris contour + 4 pupil boundary (subsampled from 100)
   - GazeGene units: centimeters (all 3D coordinates)
+
+Feature map sizes at 448 input (RepNeXt stride pattern):
+  P2 = 112×112 (stride 4), P3 = 56×56 (stride 8),
+  P4 = 28×28 (stride 16), P5 = 14×14 (stride 32)
 """
 
 import os
@@ -24,7 +26,6 @@ import cv2
 from collections import defaultdict
 import random
 
-from RayNet.normalization import normalize_sample, normalize_gaze, compute_normalization_matrix, warp_points_2d
 from RayNet.kappa import build_R_kappa
 
 # Indices to subsample 100 iris points down to 10 evenly-spaced points
@@ -33,12 +34,12 @@ IRIS_SUBSAMPLE_IDX = list(range(0, 100, 10))  # [0, 10, 20, ..., 90]
 
 class GazeGeneDataset(Dataset):
     """
-    GazeGene dataset with per-frame normalization for RayNet v2.
+    GazeGene dataset for RayNet v3.
 
-    Each sample yields a normalized eye crop (224x224) and targets:
-      - 14 landmarks in normalized pixel space (10 iris + 4 pupil)
-      - optical axis in normalized space (unit vector)
-      - R_norm for denormalization at inference
+    Each sample yields a native 448×448 face image and targets:
+      - 14 landmarks in feature map space (10 iris + 4 pupil)
+      - optical axis in CCS (unit vector, from gaze_label)
+      - R_cam for multi-view world-frame consistency
     """
 
     def __init__(
@@ -48,9 +49,7 @@ class GazeGeneDataset(Dataset):
             camera_ids=None,
             samples_per_subject=None,
             eye='L',
-            d_norm=600,
-            f_norm=960,
-            img_size=224,
+            img_size=448,
             augment=False,
             seed=42
     ):
@@ -61,9 +60,7 @@ class GazeGeneDataset(Dataset):
             camera_ids: list of int camera IDs (default: 0-8)
             samples_per_subject: max frames per subject (default: all)
             eye: which eye to use ('L' or 'R')
-            d_norm: normalization canonical distance (mm)
-            f_norm: normalization canonical focal length (px)
-            img_size: output crop size
+            img_size: output image size (default 448 = native GazeGene size)
             augment: whether to apply data augmentation
             seed: random seed
         """
@@ -73,8 +70,6 @@ class GazeGeneDataset(Dataset):
         self.camera_params = {}
 
         self.eye = eye
-        self.d_norm = d_norm
-        self.f_norm = f_norm
         self.img_size = img_size
         self.augment = augment
 
@@ -175,7 +170,7 @@ class GazeGeneDataset(Dataset):
                         'eyeball_center_3D': cl['eyeball_center_3D'][idx],  # [2, 3]
                         'pupil_center_3D': cl['pupil_center_3D'][idx],      # [2, 3]
                         'iris_mesh_3D': cl['iris_mesh_3D'][idx],            # [2, 100, 3]
-                        # 2D data (pixel space)
+                        # 2D data (pixel space, 448×448 face crop)
                         'iris_mesh_2D': cl['iris_mesh_2D'][idx],            # [2, 100, 2]
                         'pupil_center_2D': cl['pupil_center_2D'][idx],      # [2, 2]
                         # Head pose
@@ -204,13 +199,14 @@ class GazeGeneDataset(Dataset):
 
     def __getitem__(self, idx):
         """
-        Returns a normalized sample for training.
+        Returns a sample for training.
 
         Output dict:
-            image: (3, 224, 224) normalized eye crop
-            landmark_coords: (14, 2) landmark pixel coords in normalized image
-            optical_axis: (3,) GT optical axis unit vector in normalized space
-            R_norm: (3, 3) normalization rotation (for denormalization)
+            image: (3, img_size, img_size) face crop tensor
+            landmark_coords: (14, 2) landmark coords in feature map space
+            landmark_coords_px: (14, 2) landmark coords in pixel space
+            optical_axis: (3,) GT optical axis unit vector in CCS
+            R_cam: (3, 3) camera extrinsic rotation (for multi-view)
             R_kappa: (3, 3) kappa rotation matrix
             subject: int subject ID
             cam_id: int camera ID
@@ -219,15 +215,22 @@ class GazeGeneDataset(Dataset):
         subj_num = s['subject']
         eye_idx = 0 if self.eye == 'L' else 1
 
-        # Load image
+        # Load image (448×448 face crop)
         img = cv2.imread(s['img_path'])
         if img is None:
             raise FileNotFoundError(f"Image not found: {s['img_path']}")
 
-        # Get camera parameters
-        # Always use K_cropped for the warp — it matches the 448×448 face crop.
-        # camera_info.pkl has full-resolution intrinsics (e.g. f=21549, cx=1280)
-        # which do NOT match the cropped image coordinates.
+        # Get the original image size for landmark scaling
+        orig_h, orig_w = img.shape[:2]
+
+        # --- Use native resolution or resize if needed ---
+        if orig_h == self.img_size and orig_w == self.img_size:
+            img_resized = img  # already at target size (448×448)
+        else:
+            img_resized = cv2.resize(img, (self.img_size, self.img_size),
+                                     interpolation=cv2.INTER_LINEAR)
+
+        # Get camera extrinsics (for multi-view world-frame transform)
         K = np.array(s['K_cropped'], dtype=np.float64)
         cam_info = self.camera_params.get(subj_num, {}).get(s['cam_id'], None)
         if cam_info is not None:
@@ -240,39 +243,18 @@ class GazeGeneDataset(Dataset):
         # Subject attributes
         subject_attrs = self.attr_dict.get(subj_num, {})
 
-        # --- Eye center in camera coordinates ---
-        # Use per-frame eyeball_center_3D which is already in camera coords
-        # and consistent with the face crop.  The static subject_attrs
-        # eyecenter_L/R is in world coords; transforming it via R_cam/T_cam
-        # yields positions that project outside the 448×448 crop.
+        # Eye center in camera coordinates
         t_eye = np.array(s['eyeball_center_3D'][eye_idx], dtype=np.float64)
 
-        # --- Per-frame normalization ---
-        R_head = np.array(s['head_R'], dtype=np.float64)
-        img_norm, R_norm = normalize_sample(
-            img, K, R_head, t_eye,
-            d_norm=self.d_norm, f_norm=self.f_norm, size=self.img_size
-        )
-
-        # Compute the warp matrix for transforming 2D landmarks
-        M, _ = compute_normalization_matrix(
-            K, t_eye, d_norm=self.d_norm, f_norm=self.f_norm, size=self.img_size
-        )
-
-        # --- Ground truth optical axis (from GazeGene gaze_label, NOT computed) ---
-        # Use the pre-computed optic_axis_L/R directly from the dataset
-        # to stay faithful to GazeGene methodology
+        # --- Ground truth optical axis (from GazeGene gaze_label) ---
+        # Used directly in CCS — no normalization rotation
         optic_key = f'optic_axis_{self.eye}'
         optical_axis_ccs = np.array(s[optic_key], dtype=np.float64)
-        # Ensure unit vector
         oa_norm = np.linalg.norm(optical_axis_ccs)
         if oa_norm > 1e-8:
             optical_axis_ccs = optical_axis_ccs / oa_norm
 
-        # Transform optical axis to normalized space
-        optical_axis_norm = normalize_gaze(optical_axis_ccs, R_norm)
-
-        # Also store gaze_target and gaze_depth for potential use
+        # Gaze target and depth
         gaze_target = np.array(s['gaze_target'], dtype=np.float64)
         gaze_depth = float(s['gaze_depth'])
 
@@ -280,19 +262,22 @@ class GazeGeneDataset(Dataset):
         iris_2d = np.array(s['iris_mesh_2D'][eye_idx], dtype=np.float64)  # (100, 2)
         iris_10 = iris_2d[IRIS_SUBSAMPLE_IDX]  # (10, 2)
 
-        # Pupil boundary: approximate 4 cardinal points from pupil center
-        # Use iris mesh points closest to pupil center as pupil boundary
+        # Pupil boundary: 4 iris points closest to pupil center
         pupil_2d = np.array(s['pupil_center_2D'][eye_idx], dtype=np.float64)  # (2,)
-        # Take 4 iris points closest to pupil center as pupil boundary approximation
         dists = np.linalg.norm(iris_2d - pupil_2d[None, :], axis=1)
         pupil_boundary_idx = np.argsort(dists)[:4]
         pupil_4 = iris_2d[pupil_boundary_idx]  # (4, 2)
 
-        # Combine: 10 iris + 4 pupil = 14 landmarks
+        # Combine: 10 iris + 4 pupil = 14 landmarks in 448 pixel space
         landmarks_2d = np.concatenate([iris_10, pupil_4], axis=0)  # (14, 2)
 
-        # Warp landmarks to normalized image space
-        landmarks_norm = warp_points_2d(landmarks_2d, M)  # (14, 2)
+        # Scale landmarks from original image space to target pixel space
+        scale_x = self.img_size / orig_w
+        scale_y = self.img_size / orig_h
+        landmarks_px = landmarks_2d * np.array([scale_x, scale_y])  # (14, 2)
+
+        # Scale to feature map space (P2 stride=4, so 448/4=112)
+        landmarks_feat = landmarks_px / 4.0  # (14, 2) in [0, img_size/4) range
 
         # --- Kappa rotation matrix ---
         kappa_key = f'{self.eye}_kappa'
@@ -303,38 +288,27 @@ class GazeGeneDataset(Dataset):
             R_kappa = np.eye(3, dtype=np.float64)
 
         # --- Convert image to tensor ---
-        img_tensor = cv2.cvtColor(img_norm, cv2.COLOR_BGR2RGB)
+        img_tensor = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
         img_tensor = torch.from_numpy(img_tensor.transpose(2, 0, 1)).float() / 255.0
 
         # --- Data augmentation ---
         if self.augment:
             img_tensor = self._augment(img_tensor)
 
-        # Scale landmark coordinates to feature map space
-        # P2 has stride=4, so feature map is img_size/4
-        feat_scale = self.img_size / 4.0  # 224/4 = 56
-        pixel_to_feat = feat_scale / self.img_size  # 56/224 = 0.25
-        landmarks_feat = landmarks_norm * pixel_to_feat
-
-        # Inverse normalization warp for denormalizing predictions back to original pixel space
-        M_inv = np.linalg.inv(M)
-
         return {
-            'image': img_tensor,                                        # (3, 224, 224)
-            'landmark_coords': torch.from_numpy(landmarks_feat).float(),  # (14, 2)
-            'landmark_coords_px': torch.from_numpy(landmarks_norm).float(),  # (14, 2) pixel space
-            'optical_axis': torch.from_numpy(optical_axis_norm).float(),  # (3,)
-            'R_norm': torch.from_numpy(R_norm).float(),                   # (3, 3)
-            'R_kappa': torch.from_numpy(R_kappa).float(),                 # (3, 3)
+            'image': img_tensor,                                            # (3, img_size, img_size)
+            'landmark_coords': torch.from_numpy(landmarks_feat).float(),    # (14, 2) feature map
+            'landmark_coords_px': torch.from_numpy(landmarks_px).float(),   # (14, 2) pixel space
+            'optical_axis': torch.from_numpy(optical_axis_ccs).float(),     # (3,) CCS unit vector
+            'R_kappa': torch.from_numpy(R_kappa).float(),                   # (3, 3)
             # Camera parameters for multi-view consistency
-            'K': torch.from_numpy(K).float(),                             # (3, 3) intrinsics
-            'R_cam': torch.from_numpy(R_cam).float(),                     # (3, 3) extrinsic rotation
-            'T_cam': torch.from_numpy(T_cam).float(),                     # (3,) extrinsic translation
-            'M_norm_inv': torch.from_numpy(M_inv).float(),                # (3, 3) inverse warp
-            'eyeball_center_3d': torch.from_numpy(t_eye).float(),         # (3,) eye center in CCS (cm)
+            'K': torch.from_numpy(K).float(),                               # (3, 3) intrinsics
+            'R_cam': torch.from_numpy(R_cam).float(),                       # (3, 3) extrinsic rotation
+            'T_cam': torch.from_numpy(T_cam).float(),                       # (3,) extrinsic translation
+            'eyeball_center_3d': torch.from_numpy(t_eye).float(),           # (3,) eye center in CCS
             # GazeGene gaze labels
-            'gaze_target': torch.from_numpy(gaze_target).float(),         # (3,) 3D gaze target, CCS (cm)
-            'gaze_depth': torch.tensor(gaze_depth).float(),               # scalar, vergence depth (cm)
+            'gaze_target': torch.from_numpy(gaze_target).float(),           # (3,) 3D target, CCS
+            'gaze_depth': torch.tensor(gaze_depth).float(),                 # scalar, vergence depth
             'subject': subj_num,
             'cam_id': s['cam_id'],
             'frame_idx': s['frame_idx'],
@@ -354,7 +328,7 @@ class GazeGeneDataset(Dataset):
 
         # Random translation (small shift, ~5% of image)
         if random.random() > 0.5:
-            max_shift = int(self.img_size * 0.05)  # ~11 pixels for 224
+            max_shift = int(self.img_size * 0.05)  # ~22 pixels for 448
             dx = random.randint(-max_shift, max_shift)
             dy = random.randint(-max_shift, max_shift)
             img_tensor = torch.roll(img_tensor, shifts=(dy, dx), dims=(1, 2))
@@ -368,13 +342,6 @@ class MultiViewBatchSampler(Sampler):
     """
 
     def __init__(self, dataset, batch_size=1, shuffle=True, ensure_multiview=True):
-        """
-        Args:
-            dataset: GazeGeneDataset instance
-            batch_size: number of (subject, frame) groups per batch
-            shuffle: whether to shuffle
-            ensure_multiview: only include groups with all 9 cameras
-        """
         self.index_by_key = dataset.index_by_key
         self.keys = list(self.index_by_key.keys())
         self.shuffle = shuffle
@@ -402,17 +369,14 @@ class MultiViewBatchSampler(Sampler):
 
 
 def gazegene_collate_fn(batch):
-    """
-    Collate function for GazeGene normalized samples.
-    Stacks tensors and collects scalars into lists.
-    """
+    """Collate: stack tensors, collect scalars into lists."""
     if not batch:
         return {}
 
     collated = {}
     tensor_keys = ['image', 'landmark_coords', 'landmark_coords_px',
-                   'optical_axis', 'R_norm', 'R_kappa',
-                   'K', 'R_cam', 'T_cam', 'M_norm_inv', 'eyeball_center_3d',
+                   'optical_axis', 'R_kappa',
+                   'K', 'R_cam', 'T_cam', 'eyeball_center_3d',
                    'gaze_target', 'gaze_depth']
     scalar_keys = ['subject', 'cam_id', 'frame_idx']
 
@@ -431,22 +395,7 @@ def create_dataloaders(base_dir, train_subjects, val_subjects,
                        batch_size=4, num_workers=4,
                        samples_per_subject=None, eye='L',
                        ensure_multiview=False):
-    """
-    Create train and validation dataloaders.
-
-    Args:
-        base_dir: path to GazeGene dataset
-        train_subjects: list of subject IDs for training (e.g., range(1, 47))
-        val_subjects: list of subject IDs for validation (e.g., range(47, 57))
-        batch_size: batch size
-        num_workers: dataloader workers
-        samples_per_subject: max frames per subject
-        eye: which eye ('L' or 'R')
-        ensure_multiview: require all 9 cameras per group
-
-    Returns:
-        train_loader, val_loader
-    """
+    """Create train and validation dataloaders."""
     train_dataset = GazeGeneDataset(
         base_dir=base_dir,
         subject_ids=train_subjects,
