@@ -295,21 +295,23 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
             )
 
             # Multi-view consistency loss (Phase 2+)
+            # Geometric operations (matrix inv, SVD, projection) need float32.
             if use_multiview:
-                mv_loss, mv_components = multiview_consistency_loss(
-                    pred_coords,
-                    batch_meta={
-                        'K': batch['K'].to(device, non_blocking=True),
-                        'R_cam': batch['R_cam'].to(device, non_blocking=True),
-                        'T_cam': batch['T_cam'].to(device, non_blocking=True),
-                        'M_norm_inv': batch['M_norm_inv'].to(device, non_blocking=True),
-                        'eyeball_center_3d': batch['eyeball_center_3d'].to(device, non_blocking=True),
-                    },
-                    lam_reproj=cfg['lam_reproj'],
-                    lam_mask=cfg['lam_mask'],
-                    img_size=images.shape[-1],
-                    feat_size=feat_H,
-                )
+                with autocast(device_type=device.type, enabled=False):
+                    mv_loss, mv_components = multiview_consistency_loss(
+                        pred_coords.float(),
+                        batch_meta={
+                            'K': batch['K'].to(device, non_blocking=True).float(),
+                            'R_cam': batch['R_cam'].to(device, non_blocking=True).float(),
+                            'T_cam': batch['T_cam'].to(device, non_blocking=True).float(),
+                            'M_norm_inv': batch['M_norm_inv'].to(device, non_blocking=True).float(),
+                            'eyeball_center_3d': batch['eyeball_center_3d'].to(device, non_blocking=True).float(),
+                        },
+                        lam_reproj=cfg['lam_reproj'],
+                        lam_mask=cfg['lam_mask'],
+                        img_size=images.shape[-1],
+                        feat_size=feat_H,
+                    )
                 loss = loss + mv_loss
                 running_losses['reproj'] += mv_components['reproj_loss'].item()
                 running_losses['mask'] += mv_components['mask_loss'].item()
