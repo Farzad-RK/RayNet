@@ -309,9 +309,9 @@ class CheckpointManager:
         return self.load('best_model.pt', map_location=map_location)
 
     def resume_state(self, model, optimizer, scheduler=None, scaler=None,
-                     map_location='cpu'):
+                     map_location='cpu', filename=None):
         """
-        Convenience: load latest checkpoint and restore all state in-place.
+        Convenience: load a checkpoint and restore all state in-place.
 
         Args:
             model: Model to load weights into.
@@ -319,12 +319,18 @@ class CheckpointManager:
             scheduler: LR scheduler to restore (optional).
             scaler: GradScaler to restore (optional).
             map_location: Device mapping.
+            filename: Specific checkpoint file to load (e.g.
+                'checkpoint_epoch5.pt', 'best_model.pt'). Defaults to
+                'latest.pt'.
 
         Returns:
             (start_epoch, checkpoint_dict) — start_epoch is the next
             epoch to train (checkpoint epoch + 1).
         """
-        state = self.load_latest(map_location=map_location)
+        if filename:
+            state = self.load(filename, map_location=map_location)
+        else:
+            state = self.load_latest(map_location=map_location)
 
         # Handle torch.compile
         if hasattr(model, '_orig_mod'):

@@ -295,28 +295,19 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
             )
 
             # Multi-view consistency loss (Phase 2+)
-            # Geometric operations (matrix inv, SVD, projection) need float32.
+            # Ray-based: works with unit gaze vectors, numerically stable.
             if use_multiview:
-                with autocast(device_type=device.type, enabled=False):
-                    mv_loss, mv_components = multiview_consistency_loss(
-                        pred_coords.float(),
-                        batch_meta={
-                            'K': batch['K'].to(device, non_blocking=True).float(),
-                            'R_cam': batch['R_cam'].to(device, non_blocking=True).float(),
-                            'T_cam': batch['T_cam'].to(device, non_blocking=True).float(),
-                            'M_norm_inv': batch['M_norm_inv'].to(device, non_blocking=True).float(),
-                            'eyeball_center_3d': batch['eyeball_center_3d'].to(device, non_blocking=True).float(),
-                        },
-                        lam_reproj=cfg['lam_reproj'],
-                        lam_mask=cfg['lam_mask'],
-                        img_size=images.shape[-1],
-                        feat_size=feat_H,
-                    )
-                # Guard against inf/nan from geometric operations
+                mv_loss, mv_components = multiview_consistency_loss(
+                    pred_gaze,
+                    pred_coords,
+                    batch['R_norm'].to(device, non_blocking=True),
+                    lam_gaze_consist=cfg['lam_reproj'],
+                    lam_shape=cfg['lam_mask'],
+                )
                 if torch.isfinite(mv_loss):
                     loss = loss + mv_loss
-                running_losses['reproj'] += mv_components['reproj_loss'].item() if torch.isfinite(mv_components['reproj_loss']) else 0.0
-                running_losses['mask'] += mv_components['mask_loss'].item() if torch.isfinite(mv_components['mask_loss']) else 0.0
+                running_losses['reproj'] += mv_components['gaze_consist_loss'].item()
+                running_losses['mask'] += mv_components['shape_loss'].item()
 
             # Scale loss by accumulation steps
             loss = loss / grad_accum_steps
@@ -564,9 +555,10 @@ def train(args):
         phase_start, phase_end = resume_phase_cfg['epochs']
         scheduler = CosineAnnealingLR(optimizer, T_max=phase_end - phase_start + 1)
 
+        resume_file = getattr(args, 'resume_from', None)
         start_epoch, resume_ckpt = ckpt_mgr.resume_state(
             model, optimizer, scheduler=scheduler, scaler=scaler,
-            map_location=device,
+            map_location=device, filename=resume_file,
         )
         current_phase = get_phase(resume_ckpt['epoch'])
         best_val_loss = resume_ckpt.get('val_metrics', {}).get('total', best_val_loss)
@@ -585,8 +577,8 @@ def train(args):
             print(f"  lr={cfg['lr']}, lam_lm={cfg['lam_lm']}, "
                   f"lam_gaze={cfg['lam_gaze']}, sigma={cfg['sigma']}")
             if cfg.get('multiview'):
-                print(f"  Multi-view: lam_reproj={cfg['lam_reproj']}, "
-                      f"lam_mask={cfg['lam_mask']}")
+                print(f"  Multi-view: lam_gaze_consist={cfg['lam_reproj']}, "
+                      f"lam_shape={cfg['lam_mask']}")
             print(f"{'='*60}")
 
             optimizer = optim.AdamW(
@@ -641,8 +633,8 @@ def train(args):
         # Log
         mv_str = ""
         if cfg.get('multiview'):
-            mv_str = (f" reproj={train_losses['reproj']:.4f}"
-                      f" mask={train_losses['mask']:.4f}")
+            mv_str = (f" gaze_mv={train_losses['reproj']:.4f}"
+                      f" shape={train_losses['mask']:.4f}")
         print(f"Epoch {epoch:3d} | Phase {phase} | lr {current_lr:.2e} | "
               f"Train: loss={train_losses['total']:.4f} lm={train_losses['landmark']:.4f} "
               f"ang={train_losses['angular_deg']:.2f}deg{mv_str} | "
@@ -926,6 +918,9 @@ def parse_args():
                         help='Run ID for checkpoint grouping (auto-generated if omitted)')
     parser.add_argument('--resume', action='store_true',
                         help='Resume training from the latest checkpoint of --run_id')
+    parser.add_argument('--resume_from', type=str, default=None,
+                        help='Resume from a specific checkpoint file '
+                             '(e.g. checkpoint_epoch5.pt, best_model.pt)')
 
     args = parser.parse_args()
 
@@ -934,6 +929,10 @@ def parse_args():
 
     if args.mds_streaming and (not args.mds_train or not args.mds_val):
         parser.error("--mds_streaming requires both --mds_train and --mds_val")
+
+    # --resume_from implies --resume
+    if args.resume_from:
+        args.resume = True
 
     if args.resume and not args.run_id:
         parser.error("--resume requires --run_id to identify which run to resume")
