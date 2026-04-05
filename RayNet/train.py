@@ -765,31 +765,31 @@ def _create_mds_loaders(args, hw):
             os.environ.get('AWS_SECRET_ACCESS_KEY', 'minioadmin'),
         )
 
-    mds_kwargs = dict(
+    print(f"MDS streaming: train={args.mds_train}, val={args.mds_val}")
+
+    # Standard loader (Phase 1) — downloads shards on first use
+    train_loader_standard, val_loader = create_streaming_dataloaders(
+        remote_train=args.mds_train,
+        remote_val=args.mds_val,
+        local_cache=os.path.join(args.output_dir, 'mds_cache'),
+        batch_size=hw['batch_size'],
         num_workers=hw['num_workers'],
         pin_memory=hw['pin_memory'],
         prefetch_factor=hw['prefetch_factor'],
         persistent_workers=hw['persistent_workers'],
     )
 
-    print(f"MDS streaming: train={args.mds_train}, val={args.mds_val}")
-
-    # Standard loader (Phase 1)
-    train_loader_standard, val_loader = create_streaming_dataloaders(
-        remote_train=args.mds_train,
-        remote_val=args.mds_val,
-        local_cache=os.path.join(args.output_dir, 'mds_cache'),
-        batch_size=hw['batch_size'],
-        **mds_kwargs,
-    )
-
-    # Multi-view loader (Phase 2+)
+    # Multi-view loader (Phase 2+) — needs its own local cache dir
+    # because MDS locks the directory per-dataset instance.
     train_loader_mv, _ = create_multiview_streaming_dataloaders(
         remote_train=args.mds_train,
         remote_val=args.mds_val,
         local_cache=os.path.join(args.output_dir, 'mds_cache_mv'),
         mv_groups=hw['mv_groups'],
-        **mds_kwargs,
+        num_workers=hw['num_workers'],
+        pin_memory=hw['pin_memory'],
+        prefetch_factor=hw['prefetch_factor'],
+        persistent_workers=hw['persistent_workers'],
     )
 
     return train_loader_standard, train_loader_mv, val_loader

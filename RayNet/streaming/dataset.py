@@ -220,7 +220,9 @@ def create_multiview_streaming_dataloaders(
     mv_groups=2,
     num_workers=4,
     transform=None,
-
+    pin_memory=True,
+    prefetch_factor=2,
+    persistent_workers=False,
     **streaming_kwargs,
 ):
     """
@@ -238,7 +240,9 @@ def create_multiview_streaming_dataloaders(
         mv_groups: Number of multi-view groups per batch.
         num_workers: DataLoader workers.
         transform: Optional torchvision transform to apply to image tensors.
-
+        pin_memory: Pin memory for GPU transfer.
+        prefetch_factor: Prefetch factor per worker.
+        persistent_workers: Keep workers alive between epochs.
         **streaming_kwargs: Extra kwargs for StreamingDataset.
 
     Returns:
@@ -254,6 +258,9 @@ def create_multiview_streaming_dataloaders(
         num_workers=num_workers,
         transform=transform,
         shuffle_train=False,  # preserve multi-view grouping order
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers,
         **streaming_kwargs,
     )
 
