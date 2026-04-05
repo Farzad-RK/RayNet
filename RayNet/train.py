@@ -28,7 +28,7 @@ import logging
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 import numpy as np
 from datetime import datetime
 
@@ -155,7 +155,7 @@ def setup_hardware(hw, device):
 
     if device.type == 'cuda':
         gpu_name = torch.cuda.get_device_name(0)
-        gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1e9
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"  GPU: {gpu_name} ({gpu_mem:.1f} GB)")
 
 
@@ -398,7 +398,7 @@ def train(args):
         model = torch.compile(model)
 
     # AMP scaler
-    scaler = GradScaler(enabled=hw['amp']) if hw['amp'] else None
+    scaler = GradScaler('cuda', enabled=hw['amp']) if hw['amp'] else None
 
     # --- Data loading ---
     # Three modes: local disk, MDS streaming (MosaicML + MinIO), WebDataset streaming
