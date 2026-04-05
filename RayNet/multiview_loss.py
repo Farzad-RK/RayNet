@@ -249,7 +249,8 @@ def triangulate_dlt_batch(pts_a, pts_b, P_a, P_b):
     A[:, 3] = y_b * P_b[:, 2] - P_b[:, 1]
 
     # Solve via SVD: X is the last column of V (smallest singular value)
-    _, _, Vh = torch.linalg.svd(A)
+    # CUDA batched SVD does not support float16; cast to float32 under AMP.
+    _, _, Vh = torch.linalg.svd(A.float())
     X_h = Vh[:, -1, :]  # (G, 4) homogeneous
 
     # Dehomogenize
