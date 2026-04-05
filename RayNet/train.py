@@ -312,9 +312,11 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                         img_size=images.shape[-1],
                         feat_size=feat_H,
                     )
-                loss = loss + mv_loss
-                running_losses['reproj'] += mv_components['reproj_loss'].item()
-                running_losses['mask'] += mv_components['mask_loss'].item()
+                # Guard against inf/nan from geometric operations
+                if torch.isfinite(mv_loss):
+                    loss = loss + mv_loss
+                running_losses['reproj'] += mv_components['reproj_loss'].item() if torch.isfinite(mv_components['reproj_loss']) else 0.0
+                running_losses['mask'] += mv_components['mask_loss'].item() if torch.isfinite(mv_components['mask_loss']) else 0.0
 
             # Scale loss by accumulation steps
             loss = loss / grad_accum_steps

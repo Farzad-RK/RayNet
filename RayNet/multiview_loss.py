@@ -164,6 +164,9 @@ def reprojection_consistency_loss(pred_coords_feat, M_norm_inv, K, R_cam, T_cam,
     # Precompute inverse intrinsics
     K_inv = torch.linalg.inv(K)  # (G, V, 3, 3)
 
+    # Reasonable pixel range for clamping reprojected points
+    max_px = img_size * 4.0  # allow some margin beyond image bounds
+
     total_loss = torch.tensor(0.0, device=device)
     n_valid = 0
 
@@ -187,8 +190,9 @@ def reprojection_consistency_loss(pred_coords_feat, M_norm_inv, K, R_cam, T_cam,
             R_cam[:, j], T_cam[:, j])
 
         pts_i_proj_j = project_3d_to_2d(pts_i_in_j, K[:, j])  # (G, N, 2)
+        pts_i_proj_j = pts_i_proj_j.clamp(-max_px, max_px)
 
-        loss_ij = F.l1_loss(pts_i_proj_j, pts_orig[:, j])
+        loss_ij = F.smooth_l1_loss(pts_i_proj_j, pts_orig[:, j])
 
         # --- Direction j -> i ---
         pts_j_3d = unproject_2d_to_3d(
@@ -202,11 +206,14 @@ def reprojection_consistency_loss(pred_coords_feat, M_norm_inv, K, R_cam, T_cam,
             R_cam[:, i], T_cam[:, i])
 
         pts_j_proj_i = project_3d_to_2d(pts_j_in_i, K[:, i])  # (G, N, 2)
+        pts_j_proj_i = pts_j_proj_i.clamp(-max_px, max_px)
 
-        loss_ji = F.l1_loss(pts_j_proj_i, pts_orig[:, i])
+        loss_ji = F.smooth_l1_loss(pts_j_proj_i, pts_orig[:, i])
 
-        total_loss = total_loss + (loss_ij + loss_ji) * 0.5
-        n_valid += 1
+        pair_loss = (loss_ij + loss_ji) * 0.5
+        if torch.isfinite(pair_loss):
+            total_loss = total_loss + pair_loss
+            n_valid += 1
 
     return total_loss / max(n_valid, 1)
 
@@ -248,13 +255,19 @@ def triangulate_dlt_batch(pts_a, pts_b, P_a, P_b):
     A[:, 2] = x_b * P_b[:, 2] - P_b[:, 0]
     A[:, 3] = y_b * P_b[:, 2] - P_b[:, 1]
 
+    # Normalize rows of A for numerical stability (Hartley-style)
+    row_norms = A.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    A = A / row_norms
+
     # Solve via SVD: X is the last column of V (smallest singular value)
     # CUDA batched SVD does not support float16; cast to float32 under AMP.
     _, _, Vh = torch.linalg.svd(A.float())
     X_h = Vh[:, -1, :]  # (G, 4) homogeneous
 
-    # Dehomogenize
-    X_world = X_h[:, :3] / (X_h[:, 3:4] + 1e-8)
+    # Dehomogenize — clamp w away from zero to avoid explosion
+    w = X_h[:, 3:4]
+    w = torch.where(w.abs() < 1e-6, torch.ones_like(w), w)
+    X_world = X_h[:, :3] / w
 
     return X_world.detach()
 
@@ -328,7 +341,14 @@ def triangulation_masking_loss(pred_coords_feat, M_norm_inv, K, R_cam, T_cam,
     # Compare with masked camera's actual predicted centroid
     gt_centroid = centroids[:, mask_cam]  # (G, 2)
 
-    return F.l1_loss(proj_2d, gt_centroid)
+    # Filter out samples where triangulation produced outliers
+    error = (proj_2d - gt_centroid).abs()
+    max_px = img_size * 4.0
+    valid = (error < max_px).all(dim=-1)  # (G,)
+    if valid.sum() == 0:
+        return torch.tensor(0.0, device=proj_2d.device)
+
+    return F.smooth_l1_loss(proj_2d[valid], gt_centroid[valid])
 
 
 # ---------------------------------------------------------------------------
