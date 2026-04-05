@@ -6,19 +6,22 @@ Progressive 3-phase training schedule:
   Phase 2 (epochs 6-15):  introduce gaze gently      λ_lm=1.0, λ_gaze=0.3
   Phase 3 (epochs 16-30): balance and fine-tune       λ_lm=0.5, λ_gaze=0.5
 
-Supports hardware profiles (default, a100) with AMP, gradient accumulation,
-torch.compile, and WebDataset streaming.
+Supports hardware profiles (default, t4, l4, a10g, v100, a100, h100) with AMP,
+gradient accumulation, torch.compile, and MDS/WebDataset streaming.
 
 Usage:
     # Local dataset, default hardware
-    python train.py --data_dir /path/to/gazegene --backbone repnext_m3
+    python -m RayNet.train --data_dir /path/to/gazegene --backbone repnext_m3
 
-    # A100 optimized
-    python train.py --data_dir /path/to/gazegene --profile a100
+    # MDS streaming from MinIO with checkpoints, on A100
+    python -m RayNet.train --profile a100 --mds_streaming \
+        --mds_train s3://gazegene/train --mds_val s3://gazegene/val \
+        --ckpt_bucket raynet-checkpoints --minio_endpoint http://IP:9000
 
-    # Streaming from HF Hub on A100
-    python train.py --profile a100 --streaming \
-        --dataset_url "pipe:curl -sL https://huggingface.co/.../train/gazegene-train-{000000..000099}.tar"
+    # Resume interrupted run
+    python -m RayNet.train --profile a100 --mds_streaming \
+        --mds_train s3://gazegene/train --mds_val s3://gazegene/val \
+        --ckpt_bucket raynet-checkpoints --run_id run_20260405_003135 --resume
 """
 
 import argparse
@@ -43,6 +46,7 @@ log = logging.getLogger(__name__)
 # ============== Hardware Profiles ==============
 
 HARDWARE_PROFILES = {
+    # ---- CPU / low-end GPU (testing, debugging) ----
     'default': {
         'batch_size': 512,
         'mv_groups': 2,
@@ -56,6 +60,71 @@ HARDWARE_PROFILES = {
         'prefetch_factor': 2,
         'persistent_workers': False,
     },
+    # ---- NVIDIA T4  (16 GB, Colab free / GCP n1-standard) ----
+    # FP16 is critical — T4 has weak FP32 but decent FP16 (65 TFLOPS).
+    # 16 GB VRAM is tight: keep batch ≤ 512 to leave room for activations.
+    't4': {
+        'batch_size': 512,
+        'mv_groups': 4,             # 36 samples per multi-view batch
+        'num_workers': 2,
+        'pin_memory': True,
+        'amp': True,
+        'amp_dtype': 'float16',
+        'grad_accum_steps': 2,      # effective batch = 1024
+        'compile_model': False,     # T4 doesn't benefit much from compile
+        'tf32': False,              # T4 doesn't support TF32
+        'prefetch_factor': 2,
+        'persistent_workers': True,
+    },
+    # ---- NVIDIA L4  (24 GB, GCP g2-standard) ----
+    # Ada Lovelace arch: good FP16/BF16 (121 TFLOPS FP16),
+    # 24 GB allows larger batches than T4.
+    'l4': {
+        'batch_size': 1024,
+        'mv_groups': 8,             # 72 samples per multi-view batch
+        'num_workers': 4,
+        'pin_memory': True,
+        'amp': True,
+        'amp_dtype': 'float16',
+        'grad_accum_steps': 2,      # effective batch = 2048
+        'compile_model': True,      # Ada supports compile well
+        'tf32': True,               # Ada supports TF32
+        'prefetch_factor': 2,
+        'persistent_workers': True,
+    },
+    # ---- NVIDIA A10G  (24 GB, AWS g5) ----
+    # Ampere arch, similar to L4 in VRAM but different compute profile.
+    # Slightly weaker FP16 than L4 (125 vs 121 TFLOPS) but same VRAM.
+    'a10g': {
+        'batch_size': 1024,
+        'mv_groups': 8,             # 72 samples per multi-view batch
+        'num_workers': 4,
+        'pin_memory': True,
+        'amp': True,
+        'amp_dtype': 'float16',
+        'grad_accum_steps': 2,      # effective batch = 2048
+        'compile_model': True,
+        'tf32': True,
+        'prefetch_factor': 2,
+        'persistent_workers': True,
+    },
+    # ---- NVIDIA V100  (16 GB / 32 GB, GCP / AWS p3) ----
+    # Volta: no TF32, no torch.compile benefit. Good FP16 via Tensor Cores.
+    'v100': {
+        'batch_size': 512,
+        'mv_groups': 4,             # 36 samples per multi-view batch
+        'num_workers': 4,
+        'pin_memory': True,
+        'amp': True,
+        'amp_dtype': 'float16',
+        'grad_accum_steps': 2,      # effective batch = 1024
+        'compile_model': False,     # Volta doesn't benefit from compile
+        'tf32': False,              # Volta doesn't support TF32
+        'prefetch_factor': 2,
+        'persistent_workers': True,
+    },
+    # ---- NVIDIA A100  (40 GB / 80 GB, GCP a2, Colab Pro+) ----
+    # Ampere flagship: TF32, BF16, huge memory bandwidth (2 TB/s).
     'a100': {
         'batch_size': 2048,
         'mv_groups': 16,            # 144 samples per multi-view batch
@@ -64,6 +133,22 @@ HARDWARE_PROFILES = {
         'amp': True,
         'amp_dtype': 'float16',
         'grad_accum_steps': 2,      # effective batch = 4096
+        'compile_model': True,
+        'tf32': True,
+        'prefetch_factor': 4,
+        'persistent_workers': True,
+    },
+    # ---- NVIDIA H100  (80 GB, GCP a3, Lambda Labs) ----
+    # Hopper: FP8 support, Transformer Engine, 3.4 TB/s bandwidth.
+    # BF16 preferred (less overflow risk than FP16 at similar speed).
+    'h100': {
+        'batch_size': 4096,
+        'mv_groups': 32,            # 288 samples per multi-view batch
+        'num_workers': 8,
+        'pin_memory': True,
+        'amp': True,
+        'amp_dtype': 'bfloat16',
+        'grad_accum_steps': 2,      # effective batch = 8192
         'compile_model': True,
         'tf32': True,
         'prefetch_factor': 4,
@@ -126,6 +211,13 @@ def get_phase_config(epoch):
     return PHASE_CONFIG[phase]
 
 
+AMP_DTYPE_MAP = {
+    'float16': torch.float16,
+    'bfloat16': torch.bfloat16,
+    'float32': torch.float32,
+}
+
+
 def apply_hardware_profile(args):
     """Apply hardware profile settings, allowing CLI overrides."""
     hw = HARDWARE_PROFILES[args.profile].copy()
@@ -162,11 +254,13 @@ def setup_hardware(hw, device):
 # ============== Training Loop ==============
 
 def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
-                    scaler=None, grad_accum_steps=1, amp_enabled=False):
+                    scaler=None, grad_accum_steps=1, amp_enabled=False,
+                    amp_dtype=torch.float16):
     """Run one training epoch with AMP and gradient accumulation support."""
     model.train()
     use_multiview = cfg.get('multiview', False) and cfg.get('lam_reproj', 0) > 0
-    amp_dtype = torch.float16 if amp_enabled else torch.float32
+    if not amp_enabled:
+        amp_dtype = torch.float32
 
     running_losses = {
         'total': 0.0, 'landmark': 0.0, 'angular': 0.0, 'angular_deg': 0.0,
@@ -267,10 +361,12 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
 
 
 @torch.no_grad()
-def validate(model, val_loader, device, epoch, cfg, amp_enabled=False):
+def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
+             amp_dtype=torch.float16):
     """Run validation."""
     model.eval()
-    amp_dtype = torch.float16 if amp_enabled else torch.float32
+    if not amp_enabled:
+        amp_dtype = torch.float32
 
     running_losses = {
         'total': 0.0, 'landmark': 0.0, 'angular': 0.0, 'angular_deg': 0.0,
@@ -365,6 +461,9 @@ def train(args):
     # Apply hardware profile
     hw = apply_hardware_profile(args)
     setup_hardware(hw, device)
+
+    # Resolve AMP dtype from profile string
+    amp_dtype = AMP_DTYPE_MAP.get(hw['amp_dtype'], torch.float16)
 
     print(f"Profile: {args.profile}")
     print(f"  Batch size: {hw['batch_size']} (effective: "
@@ -508,12 +607,14 @@ def train(args):
             scaler=scaler,
             grad_accum_steps=hw['grad_accum_steps'],
             amp_enabled=hw['amp'],
+            amp_dtype=amp_dtype,
         )
 
         # Validate
         val_losses = validate(
             model, active_val_loader, device, epoch, cfg,
             amp_enabled=hw['amp'],
+            amp_dtype=amp_dtype,
         )
 
         # Step scheduler
@@ -773,7 +874,7 @@ def parse_args():
     # Hardware profile
     parser.add_argument('--profile', type=str, default='default',
                         choices=list(HARDWARE_PROFILES.keys()),
-                        help='Hardware profile (default, a100)')
+                        help=f'Hardware profile ({", ".join(HARDWARE_PROFILES.keys())})')
     parser.add_argument('--no_compile', action='store_true',
                         help='Disable torch.compile even if profile enables it')
 
