@@ -342,6 +342,13 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
         running_losses['angular_deg'] += components['angular_loss_deg'].item()
         n_batches += 1
 
+        # Progress logging
+        total_batches = len(train_loader)
+        if step == 0 or (step + 1) % max(1, total_batches // 10) == 0 or step + 1 == total_batches:
+            avg_loss = running_losses['total'] / n_batches
+            print(f"  [Epoch {epoch}] batch {step+1}/{total_batches} "
+                  f"loss={avg_loss:.4f}", flush=True)
+
     # Flush any remaining gradients from incomplete accumulation
     if n_batches % grad_accum_steps != 0:
         if scaler is not None:
