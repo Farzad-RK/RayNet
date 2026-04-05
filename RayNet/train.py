@@ -502,8 +502,8 @@ def train(args):
     # --- Data loading ---
     # Three modes: local disk, MDS streaming (MosaicML + MinIO), WebDataset streaming
     if args.mds_streaming:
-        train_loader_standard, train_loader_mv, val_loader = _create_mds_loaders(
-            args, hw)
+        train_loader_standard, val_loader = _create_mds_loaders(args, hw)
+        train_loader_mv = None  # created lazily in Phase 2
         streaming_mode = False  # MDS loaders are persistent, not recreated per-phase
     elif args.streaming:
         _create_streaming_loaders(args, hw)
@@ -595,8 +595,14 @@ def train(args):
             active_train_loader, active_val_loader = _get_streaming_loaders(
                 args, hw, cfg)
         else:
-            if cfg.get('multiview') and train_loader_mv is not None:
-                active_train_loader = train_loader_mv
+            if cfg.get('multiview'):
+                # Lazy-create multi-view loader on first use (MDS or local)
+                if train_loader_mv is None and args.mds_streaming:
+                    train_loader_mv = _create_mds_mv_loader(args, hw)
+                if train_loader_mv is not None:
+                    active_train_loader = train_loader_mv
+                else:
+                    active_train_loader = train_loader_standard
             else:
                 active_train_loader = train_loader_standard
             active_val_loader = val_loader
@@ -754,7 +760,6 @@ def _create_local_loaders(args, hw):
 def _create_mds_loaders(args, hw):
     """Create MosaicML MDS streaming dataloaders from MinIO / S3."""
     from RayNet.streaming import create_streaming_dataloaders
-    from RayNet.streaming.dataset import create_multiview_streaming_dataloaders
     from RayNet.streaming.minio_utils import configure_minio_env
 
     # Configure MinIO env vars if endpoint is provided
@@ -767,8 +772,7 @@ def _create_mds_loaders(args, hw):
 
     print(f"MDS streaming: train={args.mds_train}, val={args.mds_val}")
 
-    # Standard loader (Phase 1) — downloads shards on first use
-    train_loader_standard, val_loader = create_streaming_dataloaders(
+    train_loader, val_loader = create_streaming_dataloaders(
         remote_train=args.mds_train,
         remote_val=args.mds_val,
         local_cache=os.path.join(args.output_dir, 'mds_cache'),
@@ -777,10 +781,22 @@ def _create_mds_loaders(args, hw):
         pin_memory=hw['pin_memory'],
         prefetch_factor=hw['prefetch_factor'],
         persistent_workers=hw['persistent_workers'],
+        download_timeout=120,
     )
 
-    # Multi-view loader (Phase 2+) — needs its own local cache dir
-    # because MDS locks the directory per-dataset instance.
+    print(f"  Train dataset: {len(train_loader.dataset)} samples, "
+          f"{len(train_loader)} batches")
+    print(f"  Val dataset:   {len(val_loader.dataset)} samples, "
+          f"{len(val_loader)} batches")
+
+    return train_loader, val_loader
+
+
+def _create_mds_mv_loader(args, hw):
+    """Create multi-view MDS loader lazily (only called when Phase 2 starts)."""
+    from RayNet.streaming.dataset import create_multiview_streaming_dataloaders
+
+    print("Creating multi-view MDS streaming loader...")
     train_loader_mv, _ = create_multiview_streaming_dataloaders(
         remote_train=args.mds_train,
         remote_val=args.mds_val,
@@ -791,8 +807,7 @@ def _create_mds_loaders(args, hw):
         prefetch_factor=hw['prefetch_factor'],
         persistent_workers=hw['persistent_workers'],
     )
-
-    return train_loader_standard, train_loader_mv, val_loader
+    return train_loader_mv
 
 
 def _create_streaming_loaders(args, hw):
