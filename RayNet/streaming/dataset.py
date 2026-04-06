@@ -183,8 +183,8 @@ def create_streaming_dataloaders(
 
     train_dataset = StreamingGazeGeneDataset(
         transform=transform,
-        remote=remote_train,
-        local=train_local,
+        remote=None,
+        local=remote_train,
         split=None,
         shuffle=shuffle_train,
         batch_size=batch_size,
@@ -193,8 +193,8 @@ def create_streaming_dataloaders(
 
     val_dataset = StreamingGazeGeneDataset(
         transform=val_transform,
-        remote=remote_val,
-        local=val_local,
+        remote=None,
+        local=remote_val,
         split=None,
         shuffle=False,
         batch_size=batch_size,
