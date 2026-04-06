@@ -21,7 +21,6 @@ import os
 import logging
 import numpy as np
 import torch
-from PIL import Image
 from torch.utils.data import DataLoader
 
 try:
@@ -54,23 +53,11 @@ class StreamingGazeGeneDataset(_Base):
     def __getitem__(self, idx):
         raw = super().__getitem__(idx)
 
-        # Image: MDS 'jpeg' column -> PIL Image -> (3, 224, 224) float tensor
+        # Image: MDS 'ndarray' column -> (3, 224, 224) float tensor
         img = raw['image']
-        if isinstance(img, bytes):
-            # Some MDS versions return raw JPEG bytes instead of PIL
-            import io
-            img = Image.open(io.BytesIO(img))
-        if isinstance(img, Image.Image):
-            img = img.convert('RGB')
-            img_np = np.array(img, dtype=np.float32) / 255.0
-            img = torch.from_numpy(img_np.transpose(2, 0, 1))
-        elif isinstance(img, np.ndarray):
-            if img.dtype == np.uint8:
-                img = torch.from_numpy(
-                    img.astype(np.float32).transpose(2, 0, 1)) / 255.0
-            else:
-                img = torch.from_numpy(img.transpose(2, 0, 1))
-        # else: already a Tensor
+
+        # Fast path: uint8 ndarray (H, W, C)
+        img = torch.from_numpy(img).permute(2, 0, 1).contiguous()
 
         if self.transform is not None:
             img = self.transform(img)

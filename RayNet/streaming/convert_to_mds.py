@@ -26,7 +26,7 @@ except ImportError:
 
 # MDS column schema — maps field names to MDS types
 MDS_COLUMNS = {
-    'image': 'jpeg',
+    'image': 'ndarray',
     'landmark_coords': 'ndarray',
     'landmark_coords_px': 'ndarray',
     'optical_axis': 'ndarray',
@@ -43,11 +43,16 @@ MDS_COLUMNS = {
 }
 
 
-def _tensor_image_to_pil(img_tensor):
-    """Convert (3, H, W) float [0,1] tensor to PIL Image."""
-    from PIL import Image
+def _tensor_image_to_uint8(img_tensor):
+    """Convert (3, H, W) float [0,1] tensor to uint8 ndarray (224×224)."""
+    import cv2
+
     img_np = (img_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-    return Image.fromarray(img_np)
+
+    # resize once here (critical for performance)
+    img_np = cv2.resize(img_np, (224, 224), interpolation=cv2.INTER_LINEAR)
+
+    return img_np
 
 
 def convert_to_mds(dataset, output_dir, split='train',
@@ -92,7 +97,7 @@ def convert_to_mds(dataset, output_dir, split='train',
             sample = dataset[idx]
 
             mds_sample = {
-                'image': _tensor_image_to_pil(sample['image']),
+                'image': _tensor_image_to_uint8(sample['image']),
                 'landmark_coords': sample['landmark_coords'].numpy(),
                 'landmark_coords_px': sample['landmark_coords_px'].numpy(),
                 'optical_axis': sample['optical_axis'].numpy(),
@@ -199,7 +204,7 @@ def convert_to_mds_chunked(data_dir, output_dir, subject_ids,
                             desc=f'MDS {split} chunk {ci + 1}'):
                 sample = ds[idx]
                 mds_sample = {
-                    'image': _tensor_image_to_pil(sample['image']),
+                    'image': _tensor_image_to_uint8(sample['image']),
                     'landmark_coords':
                         sample['landmark_coords'].numpy(),
                     'landmark_coords_px':

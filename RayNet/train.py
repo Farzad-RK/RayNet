@@ -395,7 +395,7 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
     n_batches = 0
 
     for batch in val_loader:
-        images = batch['image'].to(device, non_blocking=True)
+        images = batch['image'].to(device, non_blocking=True).float().div_(255.0)
         gt_landmarks = batch['landmark_coords'].to(device, non_blocking=True)
         gt_optical_axis = batch['optical_axis'].to(device, non_blocking=True)
         gt_landmarks_px = batch['landmark_coords_px'].to(device, non_blocking=True)
