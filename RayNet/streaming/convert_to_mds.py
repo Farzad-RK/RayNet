@@ -89,9 +89,9 @@ def convert_to_mds(dataset, output_dir, split='train',
     with MDSWriter(
         out=output_dir,
         columns=MDS_COLUMNS,
-        compression='zstd',
+        compression=None,
         hashes=['sha1'],
-        size_limit=1 << 27,  # 128 MB per shard
+        size_limit=1 << 28,  # 256 mb
     ) as writer:
         for count, idx in enumerate(tqdm(indices, desc=f'MDS {split}')):
             sample = dataset[idx]
