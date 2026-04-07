@@ -17,7 +17,6 @@ import os
 import json
 import numpy as np
 from tqdm import tqdm
-from torch.utils.data import DataLoader
 
 try:
     from streaming import MDSWriter
@@ -180,9 +179,9 @@ def convert_to_mds_chunked(data_dir, output_dir, subject_ids,
     with MDSWriter(
         out=output_dir,
         columns=MDS_COLUMNS,
-        compression='zstd',
+        compression=None,
         hashes=['sha1'],
-        size_limit=1 << 27,  # 128 MB per shard
+        size_limit=1 << 28,  # 256 mb
     ) as writer:
         for ci, chunk_subjs in enumerate(chunks):
             print(f"\nChunk {ci + 1}/{len(chunks)}: "
@@ -201,35 +200,29 @@ def convert_to_mds_chunked(data_dir, output_dir, subject_ids,
             else:
                 indices = list(range(len(ds)))
 
-            loader = DataLoader(
-                ds,
-                batch_size=64,
-                num_workers=8,
-                shuffle=False,
-                collate_fn=lambda x: x,
-            )
-            for batch in tqdm(loader, desc=f'MDS {split} chunk {ci + 1}'):
-                for sample in batch:
-                    mds_sample = {
-                        'image': _tensor_image_to_uint8(sample['image']),
-                        'landmark_coords':
-                            sample['landmark_coords'].numpy(),
-                        'landmark_coords_px':
-                            sample['landmark_coords_px'].numpy(),
-                        'optical_axis': sample['optical_axis'].numpy(),
-                        'R_kappa': sample['R_kappa'].numpy(),
-                        'K': sample['K'].numpy(),
-                        'R_cam': sample['R_cam'].numpy(),
-                        'T_cam': sample['T_cam'].numpy(),
-                        'eyeball_center_3d':
-                            sample['eyeball_center_3d'].numpy(),
-                        'gaze_target': sample['gaze_target'].numpy(),
-                        'gaze_depth': float(sample['gaze_depth']),
-                        'subject': sample['subject'],
-                        'cam_id': sample['cam_id'],
-                        'frame_idx': sample['frame_idx'],
-                    }
-                    writer.write(mds_sample)
+            for idx in tqdm(indices,
+                            desc=f'MDS {split} chunk {ci + 1}'):
+                sample = ds[idx]
+                mds_sample = {
+                    'image': _tensor_image_to_uint8(sample['image']),
+                    'landmark_coords':
+                        sample['landmark_coords'].numpy(),
+                    'landmark_coords_px':
+                        sample['landmark_coords_px'].numpy(),
+                    'optical_axis': sample['optical_axis'].numpy(),
+                    'R_kappa': sample['R_kappa'].numpy(),
+                    'K': sample['K'].numpy(),
+                    'R_cam': sample['R_cam'].numpy(),
+                    'T_cam': sample['T_cam'].numpy(),
+                    'eyeball_center_3d':
+                        sample['eyeball_center_3d'].numpy(),
+                    'gaze_target': sample['gaze_target'].numpy(),
+                    'gaze_depth': float(sample['gaze_depth']),
+                    'subject': sample['subject'],
+                    'cam_id': sample['cam_id'],
+                    'frame_idx': sample['frame_idx'],
+                }
+                writer.write(mds_sample)
 
             total_written += len(indices)
 
