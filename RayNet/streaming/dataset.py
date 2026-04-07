@@ -22,6 +22,7 @@ import logging
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+import cv2
 
 try:
     from streaming import StreamingDataset
@@ -53,11 +54,19 @@ class StreamingGazeGeneDataset(_Base):
     def __getitem__(self, idx):
         raw = super().__getitem__(idx)
 
-        # Image: MDS 'ndarray' column -> (3, 224, 224) float tensor
-        img = raw['image']
+        # 1. Get the JPEG bytes from MDS
+        img_bytes = raw['image']
 
-        # Fast path: uint8 ndarray (H, W, C)
-        img = torch.from_numpy(img).permute(2, 0, 1).contiguous()
+        # 2. Decode bytes to numpy (BGR)
+        # np.frombuffer is O(1) memory view, very fast
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        img_np = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        # 3. Convert BGR to RGB
+        img_np = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
+
+        # 4. Convert to Torch Tensor (H, W, C) -> (C, H, W)
+        img = torch.from_numpy(img_np).permute(2, 0, 1).contiguous()
 
         if self.transform is not None:
             img = self.transform(img)

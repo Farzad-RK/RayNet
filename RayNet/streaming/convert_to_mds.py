@@ -17,6 +17,8 @@ import os
 import json
 import numpy as np
 from tqdm import tqdm
+import cv2
+
 
 try:
     from streaming import MDSWriter
@@ -26,7 +28,7 @@ except ImportError:
 
 # MDS column schema — maps field names to MDS types
 MDS_COLUMNS = {
-    'image': 'ndarray',
+    'image': 'bytes',
     'landmark_coords': 'ndarray',
     'landmark_coords_px': 'ndarray',
     'optical_axis': 'ndarray',
@@ -43,16 +45,14 @@ MDS_COLUMNS = {
 }
 
 
-def _tensor_image_to_uint8(img_tensor):
-    """Convert (3, H, W) float [0,1] tensor to uint8 ndarray (224×224)."""
-    import cv2
+def image_to_jpeg_bytes(img_tensor, quality=90):
+    img = (img_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+    img = cv2.resize(img, (224, 224), interpolation=cv2.INTER_LINEAR)
 
-    img_np = (img_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+    _, buf = cv2.imencode(".jpg", img, encode_param)
 
-    # resize once here (critical for performance)
-    img_np = cv2.resize(img_np, (224, 224), interpolation=cv2.INTER_LINEAR)
-
-    return img_np
+    return buf.tobytes()
 
 
 def convert_to_mds(dataset, output_dir, split='train',
@@ -97,7 +97,7 @@ def convert_to_mds(dataset, output_dir, split='train',
             sample = dataset[idx]
 
             mds_sample = {
-                'image': _tensor_image_to_uint8(sample['image']),
+                'image': image_to_jpeg_bytes(sample['image']),
                 'landmark_coords': sample['landmark_coords'].numpy(),
                 'landmark_coords_px': sample['landmark_coords_px'].numpy(),
                 'optical_axis': sample['optical_axis'].numpy(),
@@ -204,7 +204,7 @@ def convert_to_mds_chunked(data_dir, output_dir, subject_ids,
                             desc=f'MDS {split} chunk {ci + 1}'):
                 sample = ds[idx]
                 mds_sample = {
-                    'image': _tensor_image_to_uint8(sample['image']),
+                    'image': image_to_jpeg_bytes(sample['image']),
                     'landmark_coords':
                         sample['landmark_coords'].numpy(),
                     'landmark_coords_px':
