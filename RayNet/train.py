@@ -282,7 +282,8 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
         # To prevent accumulation on missing values we use this flag to not process the filtered samples
         has_accumulated = False
         if batch:
-            images = batch['image'].to(device, non_blocking=True)
+            # UINT 8 to tensor of floats normalized from 0.0 to 1.0
+            images = batch['image'].to(device, non_blocking=True).float().div_(255.0)
             gt_landmarks = batch['landmark_coords'].to(device, non_blocking=True)
             gt_optical_axis = batch['optical_axis'].to(device, non_blocking=True)
 
