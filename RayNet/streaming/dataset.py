@@ -195,7 +195,7 @@ def create_streaming_dataloaders(
         split=None,
         shuffle=shuffle_train,
         batch_size=batch_size,
-        samples_per_subject=samples_per_subject
+        samples_per_subject=samples_per_subject,
         **streaming_kwargs,
     )
 
@@ -206,7 +206,7 @@ def create_streaming_dataloaders(
         split=None,
         shuffle=False,
         batch_size=batch_size,
-        samples_per_subject=samples_per_subject
+        samples_per_subject=samples_per_subject,
         **streaming_kwargs,
     )
 
