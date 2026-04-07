@@ -277,55 +277,106 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
     optimizer.zero_grad()
 
     for step, batch in enumerate(train_loader):
-        images = batch['image'].to(device, non_blocking=True)
-        gt_landmarks = batch['landmark_coords'].to(device, non_blocking=True)
-        gt_optical_axis = batch['optical_axis'].to(device, non_blocking=True)
+        # We don't process the samples that are sipped when samples_per_subject is used
 
-        # Forward pass with AMP autocast
-        with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            predictions = model(images, n_views=n_views)
+        # To prevent accumulation on missing values we use this flag to not process the filtered samples
+        has_accumulated = False
+        if batch:
+            images = batch['image'].to(device, non_blocking=True)
+            gt_landmarks = batch['landmark_coords'].to(device, non_blocking=True)
+            gt_optical_axis = batch['optical_axis'].to(device, non_blocking=True)
 
-            pred_hm = predictions['landmark_heatmaps']
-            pred_coords = predictions['landmark_coords']
-            pred_gaze = predictions['gaze_vector']
+            # Forward pass with AMP autocast
+            with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                predictions = model(images, n_views=n_views)
 
-            feat_H, feat_W = pred_hm.shape[2], pred_hm.shape[3]
+                pred_hm = predictions['landmark_heatmaps']
+                pred_coords = predictions['landmark_coords']
+                pred_gaze = predictions['gaze_vector']
 
-            loss, components = total_loss(
-                pred_hm, pred_coords, pred_gaze,
-                gt_landmarks, gt_optical_axis,
-                feat_H, feat_W,
-                lam_lm=cfg['lam_lm'],
-                lam_gaze=cfg['lam_gaze'],
-                sigma=cfg['sigma'],
-            )
+                feat_H, feat_W = pred_hm.shape[2], pred_hm.shape[3]
 
-            # Multi-view consistency loss (Phase 2+)
-            # Ray-based: works with unit gaze vectors, numerically stable.
-            if use_multiview:
-                mv_loss, mv_components = multiview_consistency_loss(
-                    pred_gaze,
-                    pred_coords,
-                    batch['R_cam'].to(device, non_blocking=True),
-                    lam_gaze_consist=cfg['lam_reproj'],
-                    lam_shape=cfg['lam_mask'],
+                loss, components = total_loss(
+                    pred_hm, pred_coords, pred_gaze,
+                    gt_landmarks, gt_optical_axis,
+                    feat_H, feat_W,
+                    lam_lm=cfg['lam_lm'],
+                    lam_gaze=cfg['lam_gaze'],
+                    sigma=cfg['sigma'],
                 )
-                if torch.isfinite(mv_loss):
-                    loss = loss + mv_loss
-                running_losses['reproj'] += mv_components['gaze_consist_loss'].item()
-                running_losses['mask'] += mv_components['shape_loss'].item()
 
-            # Scale loss by accumulation steps
-            loss = loss / grad_accum_steps
+                # Multi-view consistency loss (Phase 2+)
+                # Ray-based: works with unit gaze vectors, numerically stable.
+                if use_multiview:
+                    mv_loss, mv_components = multiview_consistency_loss(
+                        pred_gaze,
+                        pred_coords,
+                        batch['R_cam'].to(device, non_blocking=True),
+                        lam_gaze_consist=cfg['lam_reproj'],
+                        lam_shape=cfg['lam_mask'],
+                    )
+                    if torch.isfinite(mv_loss):
+                        loss = loss + mv_loss
+                    running_losses['reproj'] += mv_components['gaze_consist_loss'].item()
+                    running_losses['mask'] += mv_components['shape_loss'].item()
 
-        # Backward pass with gradient scaling
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
+                # Scale loss by accumulation steps
+                loss = loss / grad_accum_steps
 
-        # Optimizer step at accumulation boundary
-        if (step + 1) % grad_accum_steps == 0:
+            # Backward pass with gradient scaling
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            # using this flag only when a batch is valid to process
+            has_accumulated = True
+
+            # Optimizer step at accumulation boundary
+            if (step + 1) % grad_accum_steps == 0:
+                if has_accumulated:
+                    if scaler is not None:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        optimizer.step()
+                    optimizer.zero_grad()
+                    has_accumulated = False
+                else:
+                    optimizer.zero_grad()
+
+            # Accumulate metrics (use unscaled loss)
+            running_losses['total'] += components['total_loss'].item()
+            running_losses['landmark'] += components['landmark_loss'].item()
+            running_losses['angular'] += components['angular_loss'].item()
+            running_losses['angular_deg'] += components['angular_loss_deg'].item()
+            n_batches += 1
+
+            # Per-batch CSV logging (high granularity)
+            if batch_csv_writer is not None:
+                batch_csv_writer.writerow([
+                    epoch, step + 1,
+                    f"{components['total_loss'].item():.6f}",
+                    f"{components['landmark_loss'].item():.6f}",
+                    f"{components['angular_loss_deg'].item():.4f}",
+                    f"{running_losses['reproj'] / n_batches:.6f}",
+                    f"{running_losses['mask'] / n_batches:.6f}",
+                    f"{optimizer.param_groups[0]['lr']:.8f}",
+                ])
+
+            # Progress logging
+            total_batches = len(train_loader)
+            if step == 0 or (step + 1) % max(1, total_batches // 10) == 0 or step + 1 == total_batches:
+                avg_loss = running_losses['total'] / n_batches
+                print(f"  [Epoch {epoch}] batch {step+1}/{total_batches} "
+                      f"loss={avg_loss:.4f}", flush=True)
+
+    # Flush any remaining gradients from incomplete accumulation
+    if n_batches % grad_accum_steps != 0:
+        if has_accumulated:
             if scaler is not None:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -335,44 +386,6 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
             optimizer.zero_grad()
-
-        # Accumulate metrics (use unscaled loss)
-        running_losses['total'] += components['total_loss'].item()
-        running_losses['landmark'] += components['landmark_loss'].item()
-        running_losses['angular'] += components['angular_loss'].item()
-        running_losses['angular_deg'] += components['angular_loss_deg'].item()
-        n_batches += 1
-
-        # Per-batch CSV logging (high granularity)
-        if batch_csv_writer is not None:
-            batch_csv_writer.writerow([
-                epoch, step + 1,
-                f"{components['total_loss'].item():.6f}",
-                f"{components['landmark_loss'].item():.6f}",
-                f"{components['angular_loss_deg'].item():.4f}",
-                f"{running_losses['reproj'] / n_batches:.6f}",
-                f"{running_losses['mask'] / n_batches:.6f}",
-                f"{optimizer.param_groups[0]['lr']:.8f}",
-            ])
-
-        # Progress logging
-        total_batches = len(train_loader)
-        if step == 0 or (step + 1) % max(1, total_batches // 10) == 0 or step + 1 == total_batches:
-            avg_loss = running_losses['total'] / n_batches
-            print(f"  [Epoch {epoch}] batch {step+1}/{total_batches} "
-                  f"loss={avg_loss:.4f}", flush=True)
-
-    # Flush any remaining gradients from incomplete accumulation
-    if n_batches % grad_accum_steps != 0:
-        if scaler is not None:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-        optimizer.zero_grad()
 
     for k in running_losses:
         running_losses[k] /= max(n_batches, 1)
@@ -395,6 +408,11 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
     n_batches = 0
 
     for batch in val_loader:
+
+        #When using samples_per_subject in MDS shard loading we'll skip empty batches
+        if not batch:
+            continue
+
         images = batch['image'].to(device, non_blocking=True).float().div_(255.0)
         gt_landmarks = batch['landmark_coords'].to(device, non_blocking=True)
         gt_optical_axis = batch['optical_axis'].to(device, non_blocking=True)
@@ -843,8 +861,10 @@ def _create_mds_loaders(args, hw):
         prefetch_factor=hw['prefetch_factor'],
         persistent_workers=hw['persistent_workers'],
         download_timeout=120,
+        samples_per_subject=args.samples_per_subject
     )
 
+    print(f"  Samples per subject: {args.samples_per_subject} samples")
     print(f"  Train dataset: {len(train_loader.dataset)} samples, "
           f"{len(train_loader)} batches")
     print(f"  Val dataset:   {len(val_loader.dataset)} samples, "
@@ -876,6 +896,7 @@ def _create_mds_mv_loader(args, hw):
         pin_memory=hw['pin_memory'],
         prefetch_factor=hw['prefetch_factor'],
         persistent_workers=hw['persistent_workers'],
+        samples_per_subject=args.samples_per_subject,
     )
     return train_loader_mv
 

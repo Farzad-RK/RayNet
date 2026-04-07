@@ -47,12 +47,18 @@ class StreamingGazeGeneDataset(_Base):
     via mosaicml-streaming.
     """
 
-    def __init__(self, transform=None, **kwargs):
+    def __init__(self, transform=None,samples_per_subject=None  , **kwargs):
         super().__init__(**kwargs)
         self.transform = transform
+        self.samples_per_subject = samples_per_subject
 
     def __getitem__(self, idx):
         raw = super().__getitem__(idx)
+
+        # Stateless and deterministic subsetting using frame_idx.
+        if self.samples_per_subject is not None:
+            if int(raw['frame_idx']) >= self.samples_per_subject:
+                return None
 
         # 1. Get the JPEG bytes from MDS
         img_bytes = raw['image']
@@ -103,6 +109,10 @@ class StreamingGazeGeneDataset(_Base):
 
 def _collate_fn(batch):
     """Collate matching gazegene_collate_fn format."""
+
+    # This for the implementation of samples_per_subject
+    # Filter out skipped samples (None)
+    batch = [b for b in batch if b is not None]
     if not batch:
         return {}
 
@@ -138,6 +148,7 @@ def create_streaming_dataloaders(
     pin_memory=True,
     prefetch_factor=2,
     persistent_workers=False,
+    samples_per_subject=None,
     **streaming_kwargs,
 ):
     """
@@ -184,6 +195,7 @@ def create_streaming_dataloaders(
         split=None,
         shuffle=shuffle_train,
         batch_size=batch_size,
+        samples_per_subject=samples_per_subject
         **streaming_kwargs,
     )
 
@@ -194,6 +206,7 @@ def create_streaming_dataloaders(
         split=None,
         shuffle=False,
         batch_size=batch_size,
+        samples_per_subject=samples_per_subject
         **streaming_kwargs,
     )
 
@@ -223,6 +236,7 @@ def create_multiview_streaming_dataloaders(
     pin_memory=True,
     prefetch_factor=2,
     persistent_workers=False,
+    samples_per_subject=None,
     **streaming_kwargs,
 ):
     """
@@ -261,6 +275,7 @@ def create_multiview_streaming_dataloaders(
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
         persistent_workers=persistent_workers,
+        samples_per_subject=samples_per_subject,
         **streaming_kwargs,
     )
 
