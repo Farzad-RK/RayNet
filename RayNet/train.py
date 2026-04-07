@@ -140,7 +140,7 @@ HARDWARE_PROFILES = {
         'grad_accum_steps': 4,      # effective batch = 1152
         'compile_model': True,
         'tf32': True,
-        'prefetch_factor': 4,
+        'prefetch_factor': 10,
         'persistent_workers': True,
     },
     # ---- NVIDIA H100  (80 GB, GCP a3, Lambda Labs) ----
