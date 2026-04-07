@@ -1,5 +1,5 @@
 """
-RayNet v3 — Two-task gaze estimation and landmark detection.
+RayNet v4 — Two-task gaze estimation and landmark detection.
 
   Task A: Iris + pupil landmark heatmaps (14 points via soft-argmax on P2)
   Task B: Optical axis regression (pitch/yaw on P5) with Cross-View Attention
@@ -7,9 +7,10 @@ RayNet v3 — Two-task gaze estimation and landmark detection.
 Backbone: RepNeXt-M3 (7.8M params)
 Neck:     PANet (YOLOv8-style multi-scale fusion)
 Attention: Coordinate Attention on P2 (landmarks) and P5 (gaze)
-Cross-View: Pre-norm Transformer Encoder on pooled P5 (multi-view fusion)
+Cross-View: Geometry-conditioned Transformer Encoder on pooled P5 (multi-view fusion)
+Bridge:   LandmarkGazeBridge cross-attention (P5 attends to P2)
 
-Input:    (3 x 448 x 448) native GazeGene face crop (no Zhang warp, no resize)
+Input:    (3 x 224 x 224) GazeGene face crop
 """
 
 import torch
@@ -64,17 +65,22 @@ class CrossViewAttention(nn.Module):
         self.encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=n_layers)
 
-    def forward(self, x, n_views):
+    def forward(self, x, n_views, cam_embed=None):
         """
         Args:
             x: (B, d_model) pooled gaze features
             n_views: number of camera views per group
+            cam_embed: (B, d_model) camera geometry embedding, or None
 
         Returns:
             (B, d_model) cross-view enhanced features
         """
         if n_views <= 1:
             return x  # single-view bypass
+
+        # Inject camera pose into feature space (additive fusion)
+        if cam_embed is not None:
+            x = x + cam_embed
 
         B, D = x.shape
         G = B // n_views
@@ -83,14 +89,95 @@ class CrossViewAttention(nn.Module):
         return x.view(G * n_views, D)   # (B, D)
 
 
+class CameraEmbedding(nn.Module):
+    """
+    Encode camera extrinsics (R_cam, T_cam) into a d_model-dim vector.
+
+    Flattens R_cam (3×3=9) and T_cam (3) into a 12-dim input,
+    projects through a small MLP to d_model. Used to inject geometric
+    awareness into CrossViewAttention.
+
+    ~0.02M params with d_model=256.
+    """
+
+    def __init__(self, d_model=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(12, 64),
+            nn.ReLU(),
+            nn.Linear(64, d_model),
+        )
+
+    def forward(self, R_cam, T_cam):
+        """
+        Args:
+            R_cam: (B, 3, 3) camera extrinsic rotation
+            T_cam: (B, 3) camera extrinsic translation
+
+        Returns:
+            (B, d_model) camera embedding
+        """
+        x = torch.cat([R_cam.flatten(1), T_cam], dim=-1)  # (B, 12)
+        return self.mlp(x)
+
+
+class LandmarkGazeBridge(nn.Module):
+    """
+    Cross-attention bridge: P5 gaze features (query) attend to P2
+    landmark features (key/value).
+
+    Ties the landmark and gaze tasks in a shared latent space so the
+    gaze head can leverage spatial landmark geometry.
+
+    P2 is spatially large (56×56 at 224 input), so it is downsampled
+    to 7×7 before attention to keep compute manageable.
+
+    ~0.4M params with d_model=256, 4 heads.
+    """
+
+    def __init__(self, d_model=256, n_heads=4):
+        super().__init__()
+        self.downsample = nn.AdaptiveAvgPool2d(7)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=n_heads, batch_first=True,
+        )
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
+
+    def forward(self, p5_pooled, p2_feat):
+        """
+        Args:
+            p5_pooled: (B, D) pooled gaze features
+            p2_feat: (B, D, H, W) landmark feature map (CoordAtt-enhanced P2)
+
+        Returns:
+            (B, D) gaze features enriched with landmark spatial context
+        """
+        # Downsample P2 and reshape to sequence
+        p2_down = self.downsample(p2_feat)            # (B, D, 7, 7)
+        B, D, H, W = p2_down.shape
+        kv = p2_down.flatten(2).permute(0, 2, 1)     # (B, 49, D)
+
+        # Query: pooled gaze feature as single-token sequence
+        q = p5_pooled.unsqueeze(1)                    # (B, 1, D)
+
+        # Pre-norm cross-attention with residual
+        q_norm = self.norm_q(q)
+        kv_norm = self.norm_kv(kv)
+        out, _ = self.cross_attn(q_norm, kv_norm, kv_norm)  # (B, 1, D)
+
+        return p5_pooled + out.squeeze(1)             # (B, D)
+
+
 class RayNet(nn.Module):
     """
-    RayNet v3: Two-task gaze estimation and landmark detection
-    with Cross-View Attention for multi-view consistency.
+    RayNet v4: Two-task gaze estimation and landmark detection
+    with geometry-conditioned Cross-View Attention and Landmark-Gaze Bridge.
 
     Architecture:
         RepNeXt -> PANet -> {CoordAtt(P2) -> LandmarkHead,
-                             CoordAtt(P5) -> Pool -> CrossViewAttn -> GazeFC}
+                             CoordAtt(P5) -> Pool -> LmGazeBridge(P2) ->
+                             CamEmbed + CrossViewAttn -> GazeFC}
     """
 
     def __init__(self, backbone, in_channels_list, panet_out_channels=256,
@@ -105,6 +192,13 @@ class RayNet(nn.Module):
         self.coord_att_p2 = CoordinateAttention(panet_out_channels)
         self.coord_att_p5 = CoordinateAttention(panet_out_channels)
 
+        # v4: Landmark-Gaze bridge (P5 attends to P2)
+        self.landmark_gaze_bridge = LandmarkGazeBridge(
+            d_model=panet_out_channels)
+
+        # v4: Camera geometry embedding for cross-view attention
+        self.camera_embedding = CameraEmbedding(d_model=panet_out_channels)
+
         # Cross-View Attention on pooled P5 features
         cv_cfg = cross_view_cfg or {}
         cv_cfg.setdefault('d_model', panet_out_channels)
@@ -116,11 +210,13 @@ class RayNet(nn.Module):
         self.gaze_head = OpticalAxisHead(
             in_ch=panet_out_channels, hidden_dim=128)
 
-    def forward(self, x, n_views=1):
+    def forward(self, x, n_views=1, R_cam=None, T_cam=None):
         """
         Args:
-            x: (B, 3, 448, 448) face crop (or any resolution; feature maps scale accordingly)
+            x: (B, 3, 224, 224) face crop (or any resolution; feature maps scale accordingly)
             n_views: number of camera views per group (1=single-view, 9=multi-view)
+            R_cam: (B, 3, 3) camera extrinsic rotation matrices, or None
+            T_cam: (B, 3) camera extrinsic translation vectors, or None
 
         Returns:
             dict with:
@@ -140,8 +236,8 @@ class RayNet(nn.Module):
 
         # PANet multi-scale fusion
         panet_out = self.panet(features)  # [P2, P3, P4, P5]
-        p2 = panet_out[0]   # (B, 256, 112, 112) stride=4 for 448 input
-        p5 = panet_out[-1]  # (B, 256, 14, 14)  stride=32
+        p2 = panet_out[0]   # (B, 256, 56, 56) stride=4 for 224 input
+        p5 = panet_out[-1]  # (B, 256, 7, 7)  stride=32
 
         # Task A: Landmark detection on P2 (no cross-view)
         p2_att = self.coord_att_p2(p2)
@@ -150,7 +246,16 @@ class RayNet(nn.Module):
         # Task B: Optical axis regression on P5 with cross-view attention
         p5_att = self.coord_att_p5(p5)
         pooled = self.gaze_head.pool_features(p5_att)          # (B, 256)
-        pooled = self.cross_view_attn(pooled, n_views)          # cross-view enhanced
+
+        # v4: Landmark-Gaze bridge — gaze attends to landmark features
+        pooled = self.landmark_gaze_bridge(pooled, p2_att)     # (B, 256)
+
+        # v4: Camera geometry embedding for cross-view attention
+        cam_embed = None
+        if R_cam is not None and T_cam is not None:
+            cam_embed = self.camera_embedding(R_cam, T_cam)    # (B, 256)
+
+        pooled = self.cross_view_attn(pooled, n_views, cam_embed)
         gaze_vector, gaze_angles = self.gaze_head.predict_from_pooled(pooled)
 
         return {
@@ -164,7 +269,7 @@ class RayNet(nn.Module):
 def create_raynet(backbone_name="repnext_m3", weight_path=None, n_landmarks=14,
                   cross_view_cfg=None):
     """
-    Factory function to create RayNet v3.
+    Factory function to create RayNet v4.
 
     Args:
         backbone_name: RepNeXt variant name
@@ -193,11 +298,15 @@ def create_raynet(backbone_name="repnext_m3", weight_path=None, n_landmarks=14,
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
 
     cv_params = sum(p.numel() for p in model.cross_view_attn.parameters()) / 1e6
+    bridge_params = sum(p.numel() for p in model.landmark_gaze_bridge.parameters()) / 1e6
+    cam_params = sum(p.numel() for p in model.camera_embedding.parameters()) / 1e6
 
-    print(f"RayNet v3 created:")
+    print(f"RayNet v4 created:")
     print(f"  Backbone: {backbone_name} ({BACKBONE_CHANNELS[backbone_name]})")
     print(f"  Landmarks: {n_landmarks}")
     print(f"  CrossViewAttention: {cv_params:.2f}M params")
+    print(f"  LandmarkGazeBridge: {bridge_params:.2f}M params")
+    print(f"  CameraEmbedding: {cam_params:.2f}M params")
     print(f"  Total params: {total_params:.1f}M")
     print(f"  Trainable params: {trainable_params:.1f}M")
     print(f"  Device: {device}")

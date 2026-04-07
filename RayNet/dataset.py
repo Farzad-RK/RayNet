@@ -1,20 +1,19 @@
 """
-GazeGene dataset loader for RayNet v3.
+GazeGene dataset loader for RayNet v4.
 
-Input: GazeGene full face crops (448×448), used at native resolution.
-Output: 448×448 face image tensor (NO resize, NO Zhang normalization warp).
+Input: GazeGene face crops resized to 224×224.
+Output: 224×224 face image tensor (NO Zhang normalization warp).
 
 Key design:
-  - Native 448×448 resolution (no downscaling, preserves detail for landmarks)
-  - Matches GazeGene paper Sec 4.2 methodology (no normalization for 3D tasks)
+  - 224×224 resolution (matches MDS shard storage, reduces memory 4× vs 448)
   - Optical axis GT from GazeGene gaze_label (optic_axis_L/R) in CCS
   - R_cam (camera extrinsics) used for multi-view world-frame transform
   - 14 landmarks: 10 iris contour + 4 pupil boundary (subsampled from 100)
   - GazeGene units: centimeters (all 3D coordinates)
 
-Feature map sizes at 448 input (RepNeXt stride pattern):
-  P2 = 112×112 (stride 4), P3 = 56×56 (stride 8),
-  P4 = 28×28 (stride 16), P5 = 14×14 (stride 32)
+Feature map sizes at 224 input (RepNeXt stride pattern):
+  P2 = 56×56 (stride 4), P3 = 28×28 (stride 8),
+  P4 = 14×14 (stride 16), P5 = 7×7 (stride 32)
 """
 
 import os
@@ -34,9 +33,9 @@ IRIS_SUBSAMPLE_IDX = list(range(0, 100, 10))  # [0, 10, 20, ..., 90]
 
 class GazeGeneDataset(Dataset):
     """
-    GazeGene dataset for RayNet v3.
+    GazeGene dataset for RayNet v4.
 
-    Each sample yields a native 448×448 face image and targets:
+    Each sample yields a 224×224 face image and targets:
       - 14 landmarks in feature map space (10 iris + 4 pupil)
       - optical axis in CCS (unit vector, from gaze_label)
       - R_cam for multi-view world-frame consistency
@@ -49,7 +48,7 @@ class GazeGeneDataset(Dataset):
             camera_ids=None,
             samples_per_subject=None,
             eye='L',
-            img_size=448,
+            img_size=224,
             augment=False,
             seed=42
     ):
@@ -60,7 +59,7 @@ class GazeGeneDataset(Dataset):
             camera_ids: list of int camera IDs (default: 0-8)
             samples_per_subject: max frames per subject (default: all)
             eye: which eye to use ('L' or 'R')
-            img_size: output image size (default 448 = native GazeGene size)
+            img_size: output image size (default 224, matching MDS shards)
             augment: whether to apply data augmentation
             seed: random seed
         """
@@ -170,7 +169,7 @@ class GazeGeneDataset(Dataset):
                         'eyeball_center_3D': cl['eyeball_center_3D'][idx],  # [2, 3]
                         'pupil_center_3D': cl['pupil_center_3D'][idx],      # [2, 3]
                         'iris_mesh_3D': cl['iris_mesh_3D'][idx],            # [2, 100, 3]
-                        # 2D data (pixel space, 448×448 face crop)
+                        # 2D data (pixel space, face crop)
                         'iris_mesh_2D': cl['iris_mesh_2D'][idx],            # [2, 100, 2]
                         'pupil_center_2D': cl['pupil_center_2D'][idx],      # [2, 2]
                         # Head pose
@@ -215,7 +214,7 @@ class GazeGeneDataset(Dataset):
         subj_num = s['subject']
         eye_idx = 0 if self.eye == 'L' else 1
 
-        # Load image (448×448 face crop)
+        # Load image (face crop, resized to img_size)
         img = cv2.imread(s['img_path'])
         if img is None:
             raise FileNotFoundError(f"Image not found: {s['img_path']}")
@@ -225,7 +224,7 @@ class GazeGeneDataset(Dataset):
 
         # --- Use native resolution or resize if needed ---
         if orig_h == self.img_size and orig_w == self.img_size:
-            img_resized = img  # already at target size (448×448)
+            img_resized = img  # already at target size
         else:
             img_resized = cv2.resize(img, (self.img_size, self.img_size),
                                      interpolation=cv2.INTER_LINEAR)
@@ -276,7 +275,7 @@ class GazeGeneDataset(Dataset):
         scale_y = self.img_size / orig_h
         landmarks_px = landmarks_2d * np.array([scale_x, scale_y])  # (14, 2)
 
-        # Scale to feature map space (P2 stride=4, so 448/4=112)
+        # Scale to feature map space (P2 stride=4, so 224/4=56)
         landmarks_feat = landmarks_px / 4.0  # (14, 2) in [0, img_size/4) range
 
         # --- Kappa rotation matrix ---
@@ -328,7 +327,7 @@ class GazeGeneDataset(Dataset):
 
         # Random translation (small shift, ~5% of image)
         if random.random() > 0.5:
-            max_shift = int(self.img_size * 0.05)  # ~22 pixels for 448
+            max_shift = int(self.img_size * 0.05)  # ~11 pixels for 224
             dx = random.randint(-max_shift, max_shift)
             dy = random.randint(-max_shift, max_shift)
             img_tensor = torch.roll(img_tensor, shifts=(dy, dx), dims=(1, 2))

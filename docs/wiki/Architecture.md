@@ -1,6 +1,6 @@
 # Architecture
 
-RayNet v2 is a two-task convolutional architecture: it predicts 14 eye landmarks and the optical axis direction from a 224x224 normalized eye crop.
+RayNet v4 is a two-task convolutional architecture with geometry-conditioned multi-view fusion: it predicts 14 eye landmarks and the optical axis direction from a 224×224 face crop.
 
 ## Pipeline Overview
 
@@ -22,12 +22,30 @@ Input Image (B, 3, 224, 224)
 CoordAtt  CoordAtt
   (P2)      (P5)
    |         |
+   |    AdaptiveAvgPool
+   |         |
+   |   LandmarkGazeBridge ← cross-attend(P5_pooled, P2)
+   |         |
+   |   CameraEmbedding(R_cam, T_cam)
+   |         |
+   |   CrossViewAttention (geometry-conditioned)
+   |         |
 Landmark   Optical
   Head     Axis Head
    |         |
 (B,14,2)  (B,3) unit vec
 coords    gaze direction
 ```
+
+## v3 → v4 Changes
+
+| Component | v3 | v4 |
+|-----------|----|----|
+| Input size | 448×448 | **224×224** |
+| CrossViewAttention | Blind (no camera info) | **Geometry-conditioned** (CameraEmbedding) |
+| Landmark-Gaze coupling | Decoupled (P2 and P5 independent) | **Cross-attention bridge** (LandmarkGazeBridge) |
+| Ray constraint | None | **Ray-to-target loss** (origin + depth × direction = target) |
+| Normalization | None (raw crops) | **Easy-Norm** available (MAGE-style, bounding-box only) |
 
 ## Backbone: RepNeXt
 
@@ -46,7 +64,7 @@ RepNeXt is a family of lightweight CNNs using reparameterized depthwise convolut
 
 ### Output Feature Maps
 
-For a 224x224 input with RepNeXt-M3:
+For a 224×224 input with RepNeXt-M3:
 
 | Stage | Output Shape | Stride |
 |-------|-------------|--------|
@@ -71,7 +89,7 @@ model = create_raynet(
 
 YOLOv8-style multi-scale fusion with SiLU activations. Projects all backbone stages to 256 channels, then fuses top-down and bottom-up.
 
-**Lateral projections** (1x1 conv):
+**Lateral projections** (1×1 conv):
 ```
 C1 (64ch)  -> P2 (256ch, 56x56)
 C2 (128ch) -> P3 (256ch, 28x28)
@@ -98,6 +116,51 @@ Source: `RayNet/panet.py`
 Applied to **P2** (landmarks) and **P5** (gaze). Encodes spatial position information via directional pooling along x and y axes, then recalibrates channel responses. Preferred over SE-Net for spatial landmark localization.
 
 Source: `RayNet/coordatt.py` (Hou et al., 2021)
+
+## LandmarkGazeBridge (v4)
+
+Cross-attention module that ties the landmark and gaze tasks in a shared latent space. P5 gaze features (query) attend to P2 landmark features (key/value).
+
+```
+P2_att (B, 256, 56, 56) → AdaptiveAvgPool2d(7) → (B, 256, 7, 7) → flatten → (B, 49, 256) [key/value]
+P5_pooled (B, 256) → unsqueeze → (B, 1, 256) [query]
+    → MultiheadAttention (4 heads, pre-norm)
+    → residual connection
+    → (B, 256) gaze features enriched with landmark context
+```
+
+~0.4M params. Source: `RayNet/raynet.py:LandmarkGazeBridge`
+
+## CameraEmbedding (v4)
+
+Encodes camera extrinsics into a d_model-dim vector for geometry-conditioned cross-view attention.
+
+```
+R_cam (B, 3, 3) → flatten → (B, 9)
+T_cam (B, 3)
+    → concat → (B, 12)
+    → Linear(12, 64) + ReLU + Linear(64, 256)
+    → (B, 256) camera embedding
+```
+
+Added to pooled features before CrossViewAttention (additive fusion).
+
+~0.02M params. Source: `RayNet/raynet.py:CameraEmbedding`
+
+## CrossViewAttention (v4: geometry-conditioned)
+
+Pre-norm Transformer Encoder for cross-view gaze feature fusion. Now receives camera embedding for geometric grounding.
+
+```
+pooled (B, 256) + cam_embed (B, 256)  [additive fusion]
+    → reshape to (G, V, 256)
+    → TransformerEncoder (2 layers, 4 heads, GELU)
+    → reshape to (B, 256)
+```
+
+Single-view (n_views=1) bypasses the encoder. ~1.05M params.
+
+Source: `RayNet/raynet.py:CrossViewAttention`
 
 ## Task Head A: Iris/Pupil Landmark Detection
 
@@ -128,13 +191,6 @@ Conv(128, 14)   Conv(128, 28)
     (B, 14, 2)  <-- landmark coordinates in feature space
 ```
 
-### Soft-Argmax with Offset Refinement
-
-1. Apply sigmoid to heatmap logits
-2. Compute soft-argmax (expected spatial position weighted by heatmap)
-3. Add learned sub-pixel offset from offset branch
-4. Output: `(B, 14, 2)` coordinates in feature-map space (0 to 56)
-
 ### 14 Landmarks
 
 | Index | Type | Source |
@@ -157,6 +213,10 @@ AdaptiveAvgPool2d(1)
     |
  (B, 256, 1, 1) -> flatten -> (B, 256)
     |
+LandmarkGazeBridge(P2_att)   [v4: cross-attend to landmarks]
+    |
+CameraEmbedding + CrossViewAttention  [v4: geometry-conditioned]
+    |
 Linear(256, 128) + ReLU
     |
 Linear(128, 2)  -> (B, 2)  pitch, yaw in radians
@@ -164,17 +224,6 @@ Linear(128, 2)  -> (B, 2)  pitch, yaw in radians
 Spherical -> Cartesian conversion
     |
  (B, 3)  unit vector (gaze direction)
-```
-
-### Angle-to-Vector Conversion
-
-```python
-pitch, yaw = angles[:, 0], angles[:, 1]
-gaze_x = -torch.cos(pitch) * torch.sin(yaw)
-gaze_y = -torch.sin(pitch)
-gaze_z = -torch.cos(pitch) * torch.cos(yaw)
-gaze_vector = stack([gaze_x, gaze_y, gaze_z])  # (B, 3)
-gaze_vector = F.normalize(gaze_vector, dim=-1)
 ```
 
 Source: `RayNet/heads.py:OpticalAxisHead`
@@ -201,6 +250,10 @@ Landmark heatmaps:                  (B,  14,  56, 56)
 Landmark offsets:                   (B,  28,  56, 56)
 Landmark coords (feature space):   (B,  14,   2)
 
+LandmarkGazeBridge:                 (B, 256) [cross-attended]
+CameraEmbedding:                    (B, 256) [additive]
+CrossViewAttention:                 (B, 256) [multi-view fused]
+
 Gaze angles:                        (B,   2)
 Gaze vector:                        (B,   3)
 ```
@@ -208,12 +261,12 @@ Gaze vector:                        (B,   3)
 ## Model Output Dictionary
 
 ```python
-predictions = model(images)  # images: (B, 3, 224, 224)
+predictions = model(images, n_views=9, R_cam=R_cam, T_cam=T_cam)
 
 predictions = {
     'landmark_coords':    (B, 14, 2),    # feature-map space [0, 56)
     'landmark_heatmaps':  (B, 14, 56, 56),  # raw logits (before sigmoid)
-    'gaze_vector':        (B, 3),        # unit vector in normalized space
+    'gaze_vector':        (B, 3),        # unit vector in camera coordinate space
     'gaze_angles':        (B, 2),        # pitch, yaw in radians
 }
 ```
@@ -221,9 +274,9 @@ predictions = {
 ### Coordinate Space Conversions
 
 ```
-Feature space (0-56)  * 4.0  =  Normalized pixel space (0-224)
+Feature space (0-56)  * 4.0  =  Pixel space (0-224)
                                         |
-                                   M_norm_inv (homography)
+                                   M_norm_inv (Easy-Norm homography)
                                         |
                                 Original camera pixel space
 ```

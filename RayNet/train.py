@@ -1,10 +1,10 @@
 """
-RayNet v3 Training Script.
+RayNet v4 Training Script.
 
 Progressive 3-phase training schedule with multi-view from epoch 1:
   Phase 1 (epochs 1-5):   landmark focus + gaze warmup   λ_lm=1.0, λ_gaze=0.1
-  Phase 2 (epochs 6-15):  balanced training               λ_lm=1.0, λ_gaze=0.3
-  Phase 3 (epochs 16-30): gaze-focused fine-tuning        λ_lm=0.5, λ_gaze=0.5
+  Phase 2 (epochs 6-15):  balanced training + ray loss    λ_lm=1.0, λ_gaze=0.3, λ_ray=0.1
+  Phase 3 (epochs 16-30): gaze-focused fine-tuning        λ_lm=0.5, λ_gaze=0.5, λ_ray=0.3
 
 Multi-view + CrossViewAttention active from Phase 1 so the transformer
 encoder learns cross-view consistency alongside gaze from the start.
@@ -50,11 +50,10 @@ log = logging.getLogger(__name__)
 
 HARDWARE_PROFILES = {
     # ---- CPU / low-end GPU (testing, debugging) ----
-    # v3 note: 448×448 input → 4× larger feature maps than 224×224.
-    # Batch sizes tuned for 448×448 with CrossViewAttention (~1M params).
+    # v4: 224×224 input. Batch sizes ~4× larger than v3 (448×448).
     'default': {
-        'batch_size': 126,          # 14 mv_groups × 9 views
-        'mv_groups': 14,
+        'batch_size': 504,          # 56 mv_groups × 9 views
+        'mv_groups': 56,
         'num_workers': 4,
         'pin_memory': True,
         'amp': False,
@@ -67,15 +66,15 @@ HARDWARE_PROFILES = {
     },
     # ---- NVIDIA T4  (16 GB, Colab free / GCP n1-standard) ----
     # FP16 is critical — T4 has weak FP32 but decent FP16 (65 TFLOPS).
-    # 16 GB VRAM tight at 448×448: ~4 mv_groups (36 samples).
+    # 16 GB VRAM comfortable at 224×224: ~16 mv_groups (144 samples).
     't4': {
-        'batch_size': 36,           # 4 mv_groups × 9 views
-        'mv_groups': 4,
+        'batch_size': 144,          # 16 mv_groups × 9 views
+        'mv_groups': 16,
         'num_workers': 2,
         'pin_memory': True,
         'amp': True,
         'amp_dtype': 'float16',
-        'grad_accum_steps': 8,      # effective batch = 288
+        'grad_accum_steps': 2,      # effective batch = 288
         'compile_model': False,     # T4 doesn't benefit much from compile
         'tf32': False,              # T4 doesn't support TF32
         'prefetch_factor': 2,
@@ -83,15 +82,15 @@ HARDWARE_PROFILES = {
     },
     # ---- NVIDIA L4  (24 GB, GCP g2-standard) ----
     # Ada Lovelace arch: good FP16/BF16 (121 TFLOPS FP16).
-    # 24 GB allows ~8 mv_groups at 448×448.
+    # 24 GB comfortable at 224×224: ~32 mv_groups.
     'l4': {
-        'batch_size': 72,           # 8 mv_groups × 9 views
-        'mv_groups': 8,
+        'batch_size': 288,          # 32 mv_groups × 9 views
+        'mv_groups': 32,
         'num_workers': 4,
         'pin_memory': True,
         'amp': True,
         'amp_dtype': 'float16',
-        'grad_accum_steps': 4,      # effective batch = 288
+        'grad_accum_steps': 1,      # effective batch = 288
         'compile_model': True,      # Ada supports compile well
         'tf32': True,               # Ada supports TF32
         'prefetch_factor': 2,
@@ -100,13 +99,13 @@ HARDWARE_PROFILES = {
     # ---- NVIDIA A10G  (24 GB, AWS g5) ----
     # Ampere arch, similar to L4 in VRAM but different compute profile.
     'a10g': {
-        'batch_size': 72,           # 8 mv_groups × 9 views
-        'mv_groups': 8,
+        'batch_size': 288,          # 32 mv_groups × 9 views
+        'mv_groups': 32,
         'num_workers': 4,
         'pin_memory': True,
         'amp': True,
         'amp_dtype': 'float16',
-        'grad_accum_steps': 4,      # effective batch = 288
+        'grad_accum_steps': 1,      # effective batch = 288
         'compile_model': True,
         'tf32': True,
         'prefetch_factor': 2,
@@ -115,13 +114,13 @@ HARDWARE_PROFILES = {
     # ---- NVIDIA V100  (16 GB / 32 GB, GCP / AWS p3) ----
     # Volta: no TF32, no torch.compile benefit. Good FP16 via Tensor Cores.
     'v100': {
-        'batch_size': 36,           # 4 mv_groups × 9 views
-        'mv_groups': 4,
+        'batch_size': 144,          # 16 mv_groups × 9 views
+        'mv_groups': 16,
         'num_workers': 4,
         'pin_memory': True,
         'amp': True,
         'amp_dtype': 'float16',
-        'grad_accum_steps': 8,      # effective batch = 288
+        'grad_accum_steps': 2,      # effective batch = 288
         'compile_model': False,     # Volta doesn't benefit from compile
         'tf32': False,              # Volta doesn't support TF32
         'prefetch_factor': 2,
@@ -129,15 +128,15 @@ HARDWARE_PROFILES = {
     },
     # ---- NVIDIA A100  (40 GB / 80 GB, GCP a2, Colab Pro+) ----
     # Ampere flagship: TF32, BF16, huge memory bandwidth (2 TB/s).
-    # At 448×448: ~68 GB estimated for 288 samples. Conservative start.
+    # At 224×224: fits large batches comfortably.
     'a100': {
-        'batch_size': 288,          # 32 mv_groups × 9 views
-        'mv_groups': 32,
+        'batch_size': 1152,         # 128 mv_groups × 9 views
+        'mv_groups': 128,
         'num_workers': 8,
         'pin_memory': True,
         'amp': True,
         'amp_dtype': 'float16',
-        'grad_accum_steps': 4,      # effective batch = 1152
+        'grad_accum_steps': 1,      # effective batch = 1152
         'compile_model': True,
         'tf32': True,
         'prefetch_factor': 10,
@@ -147,13 +146,13 @@ HARDWARE_PROFILES = {
     # Hopper: FP8 support, Transformer Engine, 3.4 TB/s bandwidth.
     # BF16 preferred (less overflow risk than FP16 at similar speed).
     'h100': {
-        'batch_size': 576,          # 64 mv_groups × 9 views
-        'mv_groups': 64,
+        'batch_size': 2304,         # 256 mv_groups × 9 views
+        'mv_groups': 256,
         'num_workers': 8,
         'pin_memory': True,
         'amp': True,
         'amp_dtype': 'bfloat16',
-        'grad_accum_steps': 2,      # effective batch = 1152
+        'grad_accum_steps': 1,      # effective batch = 2304
         'compile_model': True,
         'tf32': True,
         'prefetch_factor': 4,
@@ -171,6 +170,7 @@ PHASE_CONFIG = {
         'lam_gaze': 0.1,
         'lam_reproj': 0.05,
         'lam_mask': 0.02,
+        'lam_ray': 0.0,
         'lr': 1e-3,
         'sigma': 2.0,
         'multiview': True,
@@ -182,10 +182,11 @@ PHASE_CONFIG = {
         'lam_gaze': 0.3,
         'lam_reproj': 0.1,
         'lam_mask': 0.05,
+        'lam_ray': 0.1,
         'lr': 5e-4,
         'sigma': 1.5,
         'multiview': True,
-        'description': 'Balanced landmark + gaze with multi-view',
+        'description': 'Balanced landmark + gaze with multi-view + ray',
     },
     3: {
         'epochs': (16, 30),
@@ -193,10 +194,11 @@ PHASE_CONFIG = {
         'lam_gaze': 0.5,
         'lam_reproj': 0.2,
         'lam_mask': 0.1,
+        'lam_ray': 0.3,
         'lr': 1e-4,
         'sigma': 1.0,
         'multiview': True,
-        'description': 'Gaze-focused fine-tuning with full multi-view',
+        'description': 'Gaze-focused fine-tuning with full multi-view + ray',
     },
 }
 
@@ -270,7 +272,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
 
     running_losses = {
         'total': 0.0, 'landmark': 0.0, 'angular': 0.0, 'angular_deg': 0.0,
-        'reproj': 0.0, 'mask': 0.0,
+        'reproj': 0.0, 'mask': 0.0, 'ray_target': 0.0,
     }
     n_batches = 0
 
@@ -287,9 +289,14 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
             gt_landmarks = batch['landmark_coords'].to(device, non_blocking=True)
             gt_optical_axis = batch['optical_axis'].to(device, non_blocking=True)
 
+            # Camera extrinsics for geometry-conditioned attention
+            R_cam = batch['R_cam'].to(device, non_blocking=True)
+            T_cam = batch['T_cam'].to(device, non_blocking=True)
+
             # Forward pass with AMP autocast
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                predictions = model(images, n_views=n_views)
+                predictions = model(images, n_views=n_views,
+                                    R_cam=R_cam, T_cam=T_cam)
 
                 pred_hm = predictions['landmark_heatmaps']
                 pred_coords = predictions['landmark_coords']
@@ -304,6 +311,13 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                     lam_lm=cfg['lam_lm'],
                     lam_gaze=cfg['lam_gaze'],
                     sigma=cfg['sigma'],
+                    lam_ray=cfg.get('lam_ray', 0.0),
+                    eyeball_center=batch['eyeball_center_3d'].to(
+                        device, non_blocking=True),
+                    gaze_target=batch['gaze_target'].to(
+                        device, non_blocking=True),
+                    gaze_depth=batch['gaze_depth'].to(
+                        device, non_blocking=True),
                 )
 
                 # Multi-view consistency loss (Phase 2+)
@@ -312,7 +326,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                     mv_loss, mv_components = multiview_consistency_loss(
                         pred_gaze,
                         pred_coords,
-                        batch['R_cam'].to(device, non_blocking=True),
+                        R_cam,
                         lam_gaze_consist=cfg['lam_reproj'],
                         lam_shape=cfg['lam_mask'],
                     )
@@ -320,6 +334,10 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                         loss = loss + mv_loss
                     running_losses['reproj'] += mv_components['gaze_consist_loss'].item()
                     running_losses['mask'] += mv_components['shape_loss'].item()
+
+                # Track ray-to-target loss
+                if 'ray_target_loss' in components:
+                    running_losses['ray_target'] += components['ray_target_loss'].item()
 
                 # Scale loss by accumulation steps
                 loss = loss / grad_accum_steps
@@ -358,6 +376,8 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
 
             # Per-batch CSV logging (high granularity)
             if batch_csv_writer is not None:
+                ray_val = components.get('ray_target_loss',
+                                         torch.tensor(0.0)).item()
                 batch_csv_writer.writerow([
                     epoch, step + 1,
                     f"{components['total_loss'].item():.6f}",
@@ -365,6 +385,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                     f"{components['angular_loss_deg'].item():.4f}",
                     f"{running_losses['reproj'] / n_batches:.6f}",
                     f"{running_losses['mask'] / n_batches:.6f}",
+                    f"{ray_val:.6f}",
                     f"{optimizer.param_groups[0]['lr']:.8f}",
                 ])
 
@@ -419,8 +440,12 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
         gt_optical_axis = batch['optical_axis'].to(device, non_blocking=True)
         gt_landmarks_px = batch['landmark_coords_px'].to(device, non_blocking=True)
 
+        R_cam = batch['R_cam'].to(device, non_blocking=True)
+        T_cam = batch['T_cam'].to(device, non_blocking=True)
+
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            predictions = model(images, n_views=n_views)
+            predictions = model(images, n_views=n_views,
+                                R_cam=R_cam, T_cam=T_cam)
 
             pred_hm = predictions['landmark_heatmaps']
             pred_coords = predictions['landmark_coords']
@@ -435,6 +460,13 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
                 lam_lm=cfg['lam_lm'],
                 lam_gaze=cfg['lam_gaze'],
                 sigma=cfg['sigma'],
+                lam_ray=cfg.get('lam_ray', 0.0),
+                eyeball_center=batch['eyeball_center_3d'].to(
+                    device, non_blocking=True),
+                gaze_target=batch['gaze_target'].to(
+                    device, non_blocking=True),
+                gaze_depth=batch['gaze_depth'].to(
+                    device, non_blocking=True),
             )
 
         img_size = images.shape[-1]
@@ -566,7 +598,7 @@ def train(args):
     csv_writer.writerow([
         'epoch', 'phase', 'lr',
         'train_total', 'train_landmark', 'train_angular_deg',
-        'train_reproj', 'train_mask',
+        'train_reproj', 'train_mask', 'train_ray_target',
         'val_total', 'val_landmark', 'val_angular_deg', 'val_landmark_px',
     ])
 
@@ -576,7 +608,7 @@ def train(args):
     batch_csv_writer = csv.writer(batch_csv_file)
     batch_csv_writer.writerow([
         'epoch', 'batch', 'loss', 'landmark', 'angular_deg',
-        'gaze_consist', 'shape', 'lr',
+        'gaze_consist', 'shape', 'ray_target', 'lr',
     ])
 
     # Training loop with phase transitions
@@ -628,7 +660,8 @@ def train(args):
             print(f"\n{'='*60}")
             print(f"Phase {phase}: {cfg['description']}")
             print(f"  lr={cfg['lr']}, lam_lm={cfg['lam_lm']}, "
-                  f"lam_gaze={cfg['lam_gaze']}, sigma={cfg['sigma']}")
+                  f"lam_gaze={cfg['lam_gaze']}, lam_ray={cfg.get('lam_ray', 0)}, "
+                  f"sigma={cfg['sigma']}")
             if cfg.get('multiview'):
                 print(f"  Multi-view: lam_gaze_consist={cfg['lam_reproj']}, "
                       f"lam_shape={cfg['lam_mask']}")
@@ -686,6 +719,8 @@ def train(args):
         if cfg.get('multiview'):
             mv_str = (f" gaze_mv={train_losses['reproj']:.4f}"
                       f" shape={train_losses['mask']:.4f}")
+        if train_losses.get('ray_target', 0) > 0:
+            mv_str += f" ray={train_losses['ray_target']:.4f}"
         print(f"Epoch {epoch:3d} | Phase {phase} | lr {current_lr:.2e} | "
               f"Train: loss={train_losses['total']:.4f} lm={train_losses['landmark']:.4f} "
               f"ang={train_losses['angular_deg']:.2f}deg{mv_str} | "
@@ -703,6 +738,7 @@ def train(args):
             f"{train_losses['angular_deg']:.4f}",
             f"{train_losses.get('reproj', 0):.6f}",
             f"{train_losses.get('mask', 0):.6f}",
+            f"{train_losses.get('ray_target', 0):.6f}",
             f"{val_losses['total']:.6f}",
             f"{val_losses['landmark']:.6f}",
             f"{val_losses['angular_deg']:.4f}",

@@ -83,6 +83,29 @@ def gaze_loss(pred_gaze, gt_gaze):
     return F.l1_loss(pred_gaze, gt_gaze)
 
 
+def ray_target_loss(pred_gaze, eyeball_center, gaze_target, gaze_depth):
+    """
+    Ray-to-target constraint: origin + depth * direction ≈ target.
+
+    Uses ground-truth depth to reconstruct the 3D gaze target from
+    the predicted gaze direction and known eye center. Provides an
+    explicit geometric constraint that ties gaze direction to a
+    physical target location.
+
+    Args:
+        pred_gaze: (B, 3) predicted gaze direction (unit vector)
+        eyeball_center: (B, 3) eyeball center in CCS (ray origin)
+        gaze_target: (B, 3) ground-truth 3D gaze target in CCS
+        gaze_depth: (B,) ground-truth depth along gaze ray
+
+    Returns:
+        loss: scalar ray-target consistency loss
+    """
+    # Reconstruct target: target_hat = origin + depth * direction
+    target_hat = eyeball_center + gaze_depth.unsqueeze(-1) * pred_gaze  # (B, 3)
+    return F.l1_loss(target_hat, gaze_target)
+
+
 def angular_error(pred_gaze, gt_gaze):
     """
     Angular error in radians between predicted and GT gaze vectors.
@@ -107,9 +130,11 @@ def angular_error(pred_gaze, gt_gaze):
 def total_loss(pred_hm, pred_coords, pred_gaze,
                gt_coords, gt_gaze,
                feat_H, feat_W,
-               lam_lm=1.0, lam_gaze=0.5, sigma=2.0):
+               lam_lm=1.0, lam_gaze=0.5, sigma=2.0,
+               lam_ray=0.0,
+               eyeball_center=None, gaze_target=None, gaze_depth=None):
     """
-    Total training loss combining landmarks and gaze.
+    Total training loss combining landmarks, gaze, and ray-to-target constraint.
 
     Args:
         pred_hm: (B, N, H, W) predicted logit heatmaps
@@ -121,6 +146,10 @@ def total_loss(pred_hm, pred_coords, pred_gaze,
         lam_lm: landmark loss weight
         lam_gaze: gaze loss weight
         sigma: heatmap Gaussian sigma
+        lam_ray: ray-to-target loss weight (0 = disabled)
+        eyeball_center: (B, 3) eyeball center in CCS (for ray loss)
+        gaze_target: (B, 3) GT 3D gaze target in CCS (for ray loss)
+        gaze_depth: (B,) GT depth along gaze ray (for ray loss)
 
     Returns:
         total: scalar loss
@@ -140,4 +169,12 @@ def total_loss(pred_hm, pred_coords, pred_gaze,
         'angular_loss_deg': torch.rad2deg(ang_err),
         'total_loss': total.detach(),
     }
+
+    # Ray-to-target constraint (v4)
+    if lam_ray > 0 and eyeball_center is not None and gaze_target is not None:
+        ray = ray_target_loss(pred_gaze, eyeball_center, gaze_target, gaze_depth)
+        total = total + lam_ray * ray
+        components['ray_target_loss'] = ray.detach()
+        components['total_loss'] = total.detach()
+
     return total, components
