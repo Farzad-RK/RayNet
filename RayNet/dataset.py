@@ -286,13 +286,17 @@ class GazeGeneDataset(Dataset):
         else:
             R_kappa = np.eye(3, dtype=np.float64)
 
-        # --- Convert image to tensor ---
-        img_tensor = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
-        img_tensor = torch.from_numpy(img_tensor.transpose(2, 0, 1)).float() / 255.0
+        # --- Convert image to tensor (uint8, normalized in train.py) ---
+        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+        img_tensor = torch.from_numpy(img_rgb.transpose(2, 0, 1)).contiguous()
+        # NOTE: kept as uint8 [0,255] — train.py does .float().div_(255.0)
+        # This matches StreamingGazeGeneDataset which also returns uint8.
 
         # --- Data augmentation ---
         if self.augment:
-            img_tensor = self._augment(img_tensor)
+            img_tensor = self._augment(img_tensor.float() / 255.0)
+            # Augmentation operates on [0,1] floats, convert back to uint8
+            img_tensor = (img_tensor * 255.0).clamp(0, 255).byte()
 
         return {
             'image': img_tensor,                                            # (3, img_size, img_size)

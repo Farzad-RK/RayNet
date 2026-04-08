@@ -2,8 +2,7 @@
 Easy-Norm: MAGE-style image normalization for gaze estimation.
 
 Simplified normalization that requires only a face center (from bounding box
-or landmarks) — no head pose needed. Robust to GazeGene's random crop
-augmentation which breaks traditional Zhang normalization.
+or landmarks) — no head pose needed.
 
 Reference: Bao et al., "MAGE: Multi-task Architecture for Gaze Estimation",
            CVPR 2025.
@@ -12,6 +11,19 @@ Split pipeline support:
   - normalize_for_gaze():      Full normalization (rotation + scaling)
   - normalize_for_landmarks():  Partial normalization (scaling only, no roll)
   - 3D geometry:                No normalization (stay in original CCS)
+
+NOTE on GazeGene dataset:
+  Easy-Norm CANNOT be applied to GazeGene training data because the dataset
+  applies random translation and scaling during face cropping, which breaks
+  the camera intrinsic → pixel coordinate mapping. The K_cropped intrinsics
+  no longer correspond to the actual pixel positions after augmentation.
+  For GazeGene, images go through as-is and the model learns to handle
+  augmented crops directly.
+
+  Easy-Norm IS intended for:
+  - Inference on live camera feeds with known intrinsics
+  - Other datasets with valid (un-augmented) intrinsics
+  - Future datasets where normalization is applied BEFORE augmentation
 """
 
 import numpy as np
