@@ -245,6 +245,9 @@ class GazeGeneDataset(Dataset):
         # Eye center in camera coordinates
         t_eye = np.array(s['eyeball_center_3D'][eye_idx], dtype=np.float64)
 
+        # Head pose rotation (per-frame, varies across samples)
+        head_R = np.array(s['head_R'], dtype=np.float64)  # (3, 3)
+
         # --- Ground truth optical axis (from GazeGene gaze_label) ---
         # Used directly in CCS — no normalization rotation
         optic_key = f'optic_axis_{self.eye}'
@@ -308,6 +311,7 @@ class GazeGeneDataset(Dataset):
             'K': torch.from_numpy(K).float(),                               # (3, 3) intrinsics
             'R_cam': torch.from_numpy(R_cam).float(),                       # (3, 3) extrinsic rotation
             'T_cam': torch.from_numpy(T_cam).float(),                       # (3,) extrinsic translation
+            'head_R': torch.from_numpy(head_R).float(),                     # (3, 3) head pose rotation
             'eyeball_center_3d': torch.from_numpy(t_eye).float(),           # (3,) eye center in CCS
             # GazeGene gaze labels
             'gaze_target': torch.from_numpy(gaze_target).float(),           # (3,) 3D target, CCS
@@ -379,7 +383,7 @@ def gazegene_collate_fn(batch):
     collated = {}
     tensor_keys = ['image', 'landmark_coords', 'landmark_coords_px',
                    'optical_axis', 'R_kappa',
-                   'K', 'R_cam', 'T_cam', 'eyeball_center_3d',
+                   'K', 'R_cam', 'T_cam', 'head_R', 'eyeball_center_3d',
                    'gaze_target', 'gaze_depth']
     scalar_keys = ['subject', 'cam_id', 'frame_idx']
 

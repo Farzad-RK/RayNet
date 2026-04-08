@@ -83,6 +83,24 @@ def gaze_loss(pred_gaze, gt_gaze):
     return F.l1_loss(pred_gaze, gt_gaze)
 
 
+def pose_prediction_loss(pred_head_R, gt_head_R):
+    """
+    Auxiliary pose prediction loss (MAGE-style).
+
+    Supervises the PoseEncoder by comparing predicted head rotation
+    to GT head rotation matrix. This forces the pose branch to learn
+    head-pose-relevant features without requiring head_R at inference.
+
+    Args:
+        pred_head_R: (B, 9) predicted flattened rotation matrix
+        gt_head_R: (B, 3, 3) ground-truth head rotation matrix
+
+    Returns:
+        loss: scalar L1 loss on rotation matrix elements
+    """
+    return F.l1_loss(pred_head_R, gt_head_R.flatten(1))
+
+
 def ray_target_loss(pred_gaze, eyeball_center, gaze_target, gaze_depth):
     """
     Ray-to-target constraint: origin + depth * direction ≈ target.
@@ -132,9 +150,11 @@ def total_loss(pred_hm, pred_coords, pred_gaze,
                feat_H, feat_W,
                lam_lm=1.0, lam_gaze=0.5, sigma=2.0,
                lam_ray=0.0,
-               eyeball_center=None, gaze_target=None, gaze_depth=None):
+               eyeball_center=None, gaze_target=None, gaze_depth=None,
+               lam_pose=0.0,
+               pred_head_R=None, gt_head_R=None):
     """
-    Total training loss combining landmarks, gaze, and ray-to-target constraint.
+    Total training loss combining landmarks, gaze, ray-to-target, and pose.
 
     Args:
         pred_hm: (B, N, H, W) predicted logit heatmaps
@@ -150,6 +170,9 @@ def total_loss(pred_hm, pred_coords, pred_gaze,
         eyeball_center: (B, 3) eyeball center in CCS (for ray loss)
         gaze_target: (B, 3) GT 3D gaze target in CCS (for ray loss)
         gaze_depth: (B,) GT depth along gaze ray (for ray loss)
+        lam_pose: pose prediction auxiliary loss weight (0 = disabled)
+        pred_head_R: (B, 9) predicted head rotation from PoseEncoder
+        gt_head_R: (B, 3, 3) GT head rotation matrix
 
     Returns:
         total: scalar loss
@@ -175,6 +198,13 @@ def total_loss(pred_hm, pred_coords, pred_gaze,
         ray = ray_target_loss(pred_gaze, eyeball_center, gaze_target, gaze_depth)
         total = total + lam_ray * ray
         components['ray_target_loss'] = ray.detach()
-        components['total_loss'] = total.detach()
+
+    # Auxiliary pose prediction loss (v4.1, MAGE-style)
+    if lam_pose > 0 and pred_head_R is not None and gt_head_R is not None:
+        pose = pose_prediction_loss(pred_head_R, gt_head_R)
+        total = total + lam_pose * pose
+        components['pose_loss'] = pose.detach()
+
+    components['total_loss'] = total.detach()
 
     return total, components

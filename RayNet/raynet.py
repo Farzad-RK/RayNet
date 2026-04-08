@@ -1,14 +1,19 @@
 """
-RayNet v4 — Two-task gaze estimation and landmark detection.
+RayNet v4.1 — Multi-task gaze estimation, landmark detection, and pose.
 
   Task A: Iris + pupil landmark heatmaps (14 points via soft-argmax on P2)
   Task B: Optical axis regression (pitch/yaw on P5) with Cross-View Attention
+  Aux:    Implicit head pose prediction (MAGE-style, separate backbone)
 
-Backbone: RepNeXt-M3 (7.8M params)
-Neck:     PANet (YOLOv8-style multi-scale fusion)
-Attention: Coordinate Attention on P2 (landmarks) and P5 (gaze)
-Cross-View: Geometry-conditioned Transformer Encoder on pooled P5 (multi-view fusion)
-Bridge:   LandmarkGazeBridge cross-attention (P5 attends to P2)
+Main backbone:  RepNeXt-M3 (7.8M params) — landmarks + gaze
+Pose backbone:  RepNeXt-M1 (4.8M params) — implicit head pose (gradient-isolated)
+Neck:           PANet (YOLOv8-style multi-scale fusion, main backbone only)
+Attention:      Coordinate Attention on P2 (landmarks) and P5 (gaze)
+Cross-View:     Geometry-conditioned Transformer Encoder on pooled P5
+Bridge:         LandmarkGazeBridge cross-attention (P5 attends to P2)
+Pose:           PoseEncoder — separate RepNeXt-M1 backbone learns implicit head
+                pose from the image. Supervised by auxiliary L1 loss on GT head_R.
+                No explicit head pose input needed at inference.
 
 Input:    (3 x 224 x 224) GazeGene face crop
 """
@@ -91,11 +96,13 @@ class CrossViewAttention(nn.Module):
 
 class CameraEmbedding(nn.Module):
     """
-    Encode camera extrinsics (R_cam, T_cam) into a d_model-dim vector.
+    Encode camera extrinsics into a d_model-dim vector.
 
-    Flattens R_cam (3×3=9) and T_cam (3) into a 12-dim input,
-    projects through a small MLP to d_model. Used to inject geometric
-    awareness into CrossViewAttention.
+    Input: R_cam (3×3=9) + T_cam (3) = 12 dims.
+
+    Camera extrinsics tell the transformer WHERE the camera is.
+    Head pose information is learned implicitly by PoseEncoder
+    (MAGE-style), avoiding the need for explicit head pose at inference.
 
     ~0.02M params with d_model=256.
     """
@@ -119,6 +126,70 @@ class CameraEmbedding(nn.Module):
         """
         x = torch.cat([R_cam.flatten(1), T_cam], dim=-1)  # (B, 12)
         return self.mlp(x)
+
+
+class PoseEncoder(nn.Module):
+    """
+    Implicit head pose encoder with separate backbone (MAGE-inspired).
+
+    Uses an independent lightweight RepNeXt backbone to extract head pose
+    features directly from the input image. Gradient-isolated from the
+    main backbone — pose gradients don't interfere with landmark/gaze
+    feature learning, avoiding the adversarial optimization seen when
+    all tasks share one backbone.
+
+    During training, an auxiliary head predicts GT head_R (L1 loss).
+    At inference, the learned features capture head pose without any
+    explicit input — no external head pose estimator needed.
+
+    Architecture:
+        Image → RepNeXt-M1 backbone → GlobalAvgPool → Linear(384→d_model)
+                                                     → pose_head(d_model→9)
+
+    ~4.8M + 0.1M params (backbone + projection + aux head).
+    """
+
+    def __init__(self, pose_backbone, pose_feat_dim, d_model=256):
+        """
+        Args:
+            pose_backbone: RepNeXt model (e.g., M1) used as pose feature extractor
+            pose_feat_dim: output channel dim of the backbone's last stage
+            d_model: output dimension, must match PANet out_channels
+        """
+        super().__init__()
+        self.backbone = pose_backbone
+        # CoordinateAttention on last stage: captures directional spatial
+        # cues (face asymmetry → yaw, vertical tilt → pitch)
+        self.coord_att = CoordinateAttention(pose_feat_dim)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.proj = nn.Linear(pose_feat_dim, d_model)
+        # Auxiliary head: predict head rotation matrix for supervision
+        self.pose_head = nn.Linear(d_model, 9)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, 3, 224, 224) input image (same image as main backbone)
+
+        Returns:
+            pose_feat: (B, d_model) implicit head pose embedding
+            pred_head_R: (B, 9) predicted head rotation (for aux loss)
+        """
+        # Run through pose backbone with gradient checkpointing
+        c0 = checkpoint(self.backbone.stem, x, use_reentrant=False)
+        c1 = checkpoint(self.backbone.stages[0], c0, use_reentrant=False)
+        c2 = checkpoint(self.backbone.stages[1], c1, use_reentrant=False)
+        c3 = checkpoint(self.backbone.stages[2], c2, use_reentrant=False)
+        c4 = checkpoint(self.backbone.stages[3], c3, use_reentrant=False)
+
+        # Coordinate Attention → directional spatial weighting for pose
+        c4 = self.coord_att(c4)                      # (B, pose_feat_dim, 7, 7)
+
+        # Global average pool → project to d_model
+        pooled = self.pool(c4).flatten(1)            # (B, pose_feat_dim)
+        pose_feat = self.proj(pooled)                # (B, d_model)
+        pred_head_R = self.pose_head(pose_feat)      # (B, 9)
+        return pose_feat, pred_head_R
 
 
 class LandmarkGazeBridge(nn.Module):
@@ -171,17 +242,21 @@ class LandmarkGazeBridge(nn.Module):
 
 class RayNet(nn.Module):
     """
-    RayNet v4: Two-task gaze estimation and landmark detection
-    with geometry-conditioned Cross-View Attention and Landmark-Gaze Bridge.
+    RayNet v4.1: Multi-task gaze estimation, landmark detection, and pose.
 
-    Architecture:
-        RepNeXt -> PANet -> {CoordAtt(P2) -> LandmarkHead,
-                             CoordAtt(P5) -> Pool -> LmGazeBridge(P2) ->
-                             CamEmbed + CrossViewAttn -> GazeFC}
+    Architecture (two independent backbones):
+        Image → RepNeXt-M3 → PANet → {CoordAtt(P2) → LandmarkHead,
+                                       CoordAtt(P5) → Pool → LmGazeBridge(P2) →
+                                       CamEmbed + PoseFeat + CrossViewAttn → GazeFC}
+        Image → RepNeXt-M1 → GlobalPool → PoseEncoder → pose_feat + pred_head_R
+
+    The pose backbone is gradient-isolated from the main backbone to prevent
+    adversarial optimization between landmark, gaze, and pose objectives.
     """
 
     def __init__(self, backbone, in_channels_list, panet_out_channels=256,
-                 n_landmarks=14, cross_view_cfg=None):
+                 n_landmarks=14, cross_view_cfg=None,
+                 pose_backbone=None, pose_backbone_channels=None):
         super().__init__()
 
         self.backbone = backbone
@@ -196,8 +271,17 @@ class RayNet(nn.Module):
         self.landmark_gaze_bridge = LandmarkGazeBridge(
             d_model=panet_out_channels)
 
-        # v4: Camera geometry embedding for cross-view attention
+        # v4: Camera extrinsics embedding for cross-view attention
         self.camera_embedding = CameraEmbedding(d_model=panet_out_channels)
+
+        # v4.1: Separate pose backbone (MAGE-style, gradient-isolated)
+        # Uses lightweight RepNeXt to learn implicit head pose from image
+        if pose_backbone is not None:
+            pose_feat_dim = pose_backbone_channels[-1]  # last stage channels
+            self.pose_encoder = PoseEncoder(
+                pose_backbone, pose_feat_dim, d_model=panet_out_channels)
+        else:
+            self.pose_encoder = None
 
         # Cross-View Attention on pooled P5 features
         cv_cfg = cross_view_cfg or {}
@@ -224,6 +308,7 @@ class RayNet(nn.Module):
                 'landmark_heatmaps': (B, 14, H, W) raw logit heatmaps
                 'gaze_vector': (B, 3) optical axis unit vector (CCS)
                 'gaze_angles': (B, 2) pitch/yaw in radians
+                'pred_head_R': (B, 9) predicted head rotation (for aux loss)
         """
         # Backbone: 4-stage feature extraction
         c0 = checkpoint(self.backbone.stem, x, use_reentrant=False)
@@ -250,10 +335,18 @@ class RayNet(nn.Module):
         # v4: Landmark-Gaze bridge — gaze attends to landmark features
         pooled = self.landmark_gaze_bridge(pooled, p2_att)     # (B, 256)
 
-        # v4: Camera geometry embedding for cross-view attention
+        # v4.1: Implicit pose from separate backbone (gradient-isolated)
+        pred_head_R = None
+        pose_feat = None
+        if self.pose_encoder is not None:
+            pose_feat, pred_head_R = self.pose_encoder(x)      # (B, 256), (B, 9)
+
+        # v4: Camera extrinsics embedding for cross-view attention
         cam_embed = None
         if R_cam is not None and T_cam is not None:
             cam_embed = self.camera_embedding(R_cam, T_cam)    # (B, 256)
+            if pose_feat is not None:
+                cam_embed = cam_embed + pose_feat  # fuse camera + implicit pose
 
         pooled = self.cross_view_attn(pooled, n_views, cam_embed)
         gaze_vector, gaze_angles = self.gaze_head.predict_from_pooled(pooled)
@@ -263,35 +356,50 @@ class RayNet(nn.Module):
             'landmark_heatmaps': landmark_heatmaps,
             'gaze_vector': gaze_vector,
             'gaze_angles': gaze_angles,
+            'pred_head_R': pred_head_R,
         }
 
 
 def create_raynet(backbone_name="repnext_m3", weight_path=None, n_landmarks=14,
-                  cross_view_cfg=None):
+                  cross_view_cfg=None, pose_backbone_name="repnext_m1"):
     """
-    Factory function to create RayNet v4.
+    Factory function to create RayNet v4.1.
 
     Args:
-        backbone_name: RepNeXt variant name
-        weight_path: path to pretrained backbone weights (JIT format)
+        backbone_name: RepNeXt variant for main backbone (landmarks + gaze)
+        weight_path: path to pretrained main backbone weights (JIT format)
         n_landmarks: number of landmarks (default 14: 10 iris + 4 pupil)
         cross_view_cfg: dict of kwargs for CrossViewAttention
             (d_model, n_heads, d_ff, dropout, n_layers). None = defaults.
+        pose_backbone_name: RepNeXt variant for pose encoder backbone.
+            Lightweight variant recommended (M0/M1/M2). None = no pose encoder.
 
     Returns:
         RayNet model on device
     """
+    from backbone.repnext import create_repnext
+
+    # Main backbone
     if weight_path is not None:
         backbone = load_pretrained_repnext(backbone_name, weight_path)
     else:
-        from backbone.repnext import create_repnext
         backbone = create_repnext(model_name=backbone_name, pretrained=False)
-
     backbone = backbone.to(device)
     in_channels_list = BACKBONE_CHANNELS[backbone_name]
 
+    # Pose backbone (separate, gradient-isolated)
+    pose_backbone = None
+    pose_channels = None
+    if pose_backbone_name is not None:
+        pose_backbone = create_repnext(
+            model_name=pose_backbone_name, pretrained=False)
+        pose_backbone = pose_backbone.to(device)
+        pose_channels = BACKBONE_CHANNELS[pose_backbone_name]
+
     model = RayNet(backbone, in_channels_list, n_landmarks=n_landmarks,
-                   cross_view_cfg=cross_view_cfg)
+                   cross_view_cfg=cross_view_cfg,
+                   pose_backbone=pose_backbone,
+                   pose_backbone_channels=pose_channels)
     model = model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters()) / 1e6
@@ -301,12 +409,15 @@ def create_raynet(backbone_name="repnext_m3", weight_path=None, n_landmarks=14,
     bridge_params = sum(p.numel() for p in model.landmark_gaze_bridge.parameters()) / 1e6
     cam_params = sum(p.numel() for p in model.camera_embedding.parameters()) / 1e6
 
-    print(f"RayNet v4 created:")
-    print(f"  Backbone: {backbone_name} ({BACKBONE_CHANNELS[backbone_name]})")
+    print(f"RayNet v4.1 created:")
+    print(f"  Main backbone: {backbone_name} ({BACKBONE_CHANNELS[backbone_name]})")
     print(f"  Landmarks: {n_landmarks}")
     print(f"  CrossViewAttention: {cv_params:.2f}M params")
     print(f"  LandmarkGazeBridge: {bridge_params:.2f}M params")
     print(f"  CameraEmbedding: {cam_params:.2f}M params")
+    if model.pose_encoder is not None:
+        pose_params = sum(p.numel() for p in model.pose_encoder.parameters()) / 1e6
+        print(f"  PoseEncoder: {pose_backbone_name} → {pose_params:.2f}M params")
     print(f"  Total params: {total_params:.1f}M")
     print(f"  Trainable params: {trainable_params:.1f}M")
     print(f"  Device: {device}")

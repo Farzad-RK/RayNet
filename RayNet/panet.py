@@ -11,7 +11,12 @@ class ConvBNReLU(nn.Module):
         self.act = nn.SiLU()  # YOLOv8 uses SiLU by default
 
     def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
+        # Force BN to float32 for numerical stability under FP16 AMP.
+        # Older PyTorch versions don't auto-upcast BN, causing NaN when
+        # input variance is small (sqrt(var + eps) underflows in FP16).
+        out = self.conv(x)
+        out = self.bn(out.float()).to(x.dtype)
+        return self.act(out)
 
 
 class PANet(nn.Module):

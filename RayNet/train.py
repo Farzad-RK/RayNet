@@ -1,5 +1,5 @@
 """
-RayNet v4 Training Script.
+RayNet v4.1 Training Script.
 
 Progressive 3-phase training schedule with multi-view from epoch 1:
   Phase 1 (epochs 1-5):   landmark focus + gaze warmup   λ_lm=1.0, λ_gaze=0.1
@@ -171,10 +171,11 @@ PHASE_CONFIG = {
         'lam_reproj': 0.05,
         'lam_mask': 0.02,
         'lam_ray': 0.0,
+        'lam_pose': 0.5,
         'lr': 1e-3,
         'sigma': 2.0,
         'multiview': True,
-        'description': 'Landmark focus + gaze/cross-view warmup',
+        'description': 'Landmark focus + gaze/cross-view warmup + pose aux',
     },
     2: {
         'epochs': (6, 15),
@@ -183,10 +184,11 @@ PHASE_CONFIG = {
         'lam_reproj': 0.1,
         'lam_mask': 0.05,
         'lam_ray': 0.1,
+        'lam_pose': 0.5,
         'lr': 5e-4,
         'sigma': 1.5,
         'multiview': True,
-        'description': 'Balanced landmark + gaze with multi-view + ray',
+        'description': 'Balanced landmark + gaze with multi-view + ray + pose',
     },
     3: {
         'epochs': (16, 30),
@@ -195,6 +197,7 @@ PHASE_CONFIG = {
         'lam_reproj': 0.2,
         'lam_mask': 0.1,
         'lam_ray': 0.3,
+        'lam_pose': 0.5,
         'lr': 1e-4,
         'sigma': 1.0,
         'multiview': True,
@@ -272,7 +275,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
 
     running_losses = {
         'total': 0.0, 'landmark': 0.0, 'angular': 0.0, 'angular_deg': 0.0,
-        'reproj': 0.0, 'mask': 0.0, 'ray_target': 0.0,
+        'reproj': 0.0, 'mask': 0.0, 'ray_target': 0.0, 'pose': 0.0,
     }
     n_batches = 0
 
@@ -292,6 +295,11 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
             # Camera extrinsics for geometry-conditioned attention
             R_cam = batch['R_cam'].to(device, non_blocking=True)
             T_cam = batch['T_cam'].to(device, non_blocking=True)
+
+            # GT head pose for auxiliary pose loss (not passed to model)
+            gt_head_R = batch.get('head_R')
+            if gt_head_R is not None:
+                gt_head_R = gt_head_R.to(device, non_blocking=True)
 
             # Forward pass with AMP autocast
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
@@ -318,6 +326,9 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                         device, non_blocking=True),
                     gaze_depth=batch['gaze_depth'].to(
                         device, non_blocking=True),
+                    lam_pose=cfg.get('lam_pose', 0.0),
+                    pred_head_R=predictions.get('pred_head_R'),
+                    gt_head_R=gt_head_R,
                 )
 
                 # Multi-view consistency loss (Phase 2+)
@@ -335,9 +346,11 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                     running_losses['reproj'] += mv_components['gaze_consist_loss'].item()
                     running_losses['mask'] += mv_components['shape_loss'].item()
 
-                # Track ray-to-target loss
+                # Track ray-to-target loss and pose loss
                 if 'ray_target_loss' in components:
                     running_losses['ray_target'] += components['ray_target_loss'].item()
+                if 'pose_loss' in components:
+                    running_losses['pose'] += components['pose_loss'].item()
 
                 # Scale loss by accumulation steps
                 loss = loss / grad_accum_steps
@@ -378,6 +391,8 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
             if batch_csv_writer is not None:
                 ray_val = components.get('ray_target_loss',
                                          torch.tensor(0.0)).item()
+                pose_val = components.get('pose_loss',
+                                          torch.tensor(0.0)).item()
                 batch_csv_writer.writerow([
                     epoch, step + 1,
                     f"{components['total_loss'].item():.6f}",
@@ -386,6 +401,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                     f"{running_losses['reproj'] / n_batches:.6f}",
                     f"{running_losses['mask'] / n_batches:.6f}",
                     f"{ray_val:.6f}",
+                    f"{pose_val:.6f}",
                     f"{optimizer.param_groups[0]['lr']:.8f}",
                 ])
 
@@ -460,13 +476,6 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
                 lam_lm=cfg['lam_lm'],
                 lam_gaze=cfg['lam_gaze'],
                 sigma=cfg['sigma'],
-                lam_ray=cfg.get('lam_ray', 0.0),
-                eyeball_center=batch['eyeball_center_3d'].to(
-                    device, non_blocking=True),
-                gaze_target=batch['gaze_target'].to(
-                    device, non_blocking=True),
-                gaze_depth=batch['gaze_depth'].to(
-                    device, non_blocking=True),
             )
 
         img_size = images.shape[-1]
@@ -494,6 +503,7 @@ def _build_run_config(args, hw):
     return {
         'profile': args.profile,
         'backbone': args.backbone,
+        'pose_backbone': args.pose_backbone,
         'epochs': args.epochs,
         'eye': args.eye,
         'hardware': hw,
@@ -557,10 +567,12 @@ def train(args):
     os.makedirs(output_dir, exist_ok=True)
 
     # Create model
+    pose_bb = args.pose_backbone if args.pose_backbone != 'none' else None
     model = create_raynet(
         backbone_name=args.backbone,
         weight_path=args.weight_path,
         n_landmarks=14,
+        pose_backbone_name=pose_bb,
     )
 
     if hw['compile_model'] and hasattr(torch, 'compile'):
@@ -598,7 +610,7 @@ def train(args):
     csv_writer.writerow([
         'epoch', 'phase', 'lr',
         'train_total', 'train_landmark', 'train_angular_deg',
-        'train_reproj', 'train_mask', 'train_ray_target',
+        'train_reproj', 'train_mask', 'train_ray_target', 'train_pose',
         'val_total', 'val_landmark', 'val_angular_deg', 'val_landmark_px',
     ])
 
@@ -608,7 +620,7 @@ def train(args):
     batch_csv_writer = csv.writer(batch_csv_file)
     batch_csv_writer.writerow([
         'epoch', 'batch', 'loss', 'landmark', 'angular_deg',
-        'gaze_consist', 'shape', 'ray_target', 'lr',
+        'gaze_consist', 'shape', 'ray_target', 'pose', 'lr',
     ])
 
     # Training loop with phase transitions
@@ -661,7 +673,7 @@ def train(args):
             print(f"Phase {phase}: {cfg['description']}")
             print(f"  lr={cfg['lr']}, lam_lm={cfg['lam_lm']}, "
                   f"lam_gaze={cfg['lam_gaze']}, lam_ray={cfg.get('lam_ray', 0)}, "
-                  f"sigma={cfg['sigma']}")
+                  f"lam_pose={cfg.get('lam_pose', 0)}, sigma={cfg['sigma']}")
             if cfg.get('multiview'):
                 print(f"  Multi-view: lam_gaze_consist={cfg['lam_reproj']}, "
                       f"lam_shape={cfg['lam_mask']}")
@@ -721,6 +733,8 @@ def train(args):
                       f" shape={train_losses['mask']:.4f}")
         if train_losses.get('ray_target', 0) > 0:
             mv_str += f" ray={train_losses['ray_target']:.4f}"
+        if train_losses.get('pose', 0) > 0:
+            mv_str += f" pose={train_losses['pose']:.4f}"
         print(f"Epoch {epoch:3d} | Phase {phase} | lr {current_lr:.2e} | "
               f"Train: loss={train_losses['total']:.4f} lm={train_losses['landmark']:.4f} "
               f"ang={train_losses['angular_deg']:.2f}deg{mv_str} | "
@@ -739,6 +753,7 @@ def train(args):
             f"{train_losses.get('reproj', 0):.6f}",
             f"{train_losses.get('mask', 0):.6f}",
             f"{train_losses.get('ray_target', 0):.6f}",
+            f"{train_losses.get('pose', 0):.6f}",
             f"{val_losses['total']:.6f}",
             f"{val_losses['landmark']:.6f}",
             f"{val_losses['angular_deg']:.4f}",
@@ -1011,6 +1026,11 @@ def parse_args():
     parser.add_argument('--backbone', type=str, default='repnext_m3',
                         choices=['repnext_m0', 'repnext_m1', 'repnext_m2',
                                  'repnext_m3', 'repnext_m4', 'repnext_m5'])
+    parser.add_argument('--pose_backbone', type=str, default='repnext_m1',
+                        choices=['repnext_m0', 'repnext_m1', 'repnext_m2',
+                                 'none'],
+                        help='Pose encoder backbone (separate from main). '
+                             '"none" disables pose encoder.')
     parser.add_argument('--weight_path', type=str, default=None,
                         help='Path to pretrained backbone weights')
 
