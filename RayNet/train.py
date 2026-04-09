@@ -570,7 +570,7 @@ def train(args):
     # Create model
     pose_bb = args.pose_backbone if args.pose_backbone != 'none' else None
     model = create_raynet(
-        backbone_name=args.core_backbone,
+        core_backbone_name=args.core_backbone,
         core_backbone_weight_path=args.core_backbone_weight_path,
         pose_backbone_name=args.pose_backbone,
         pose_backbone_weight_path=args.pose_backbone_weight_path,
