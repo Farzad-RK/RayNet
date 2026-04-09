@@ -379,7 +379,7 @@ def create_raynet(core_backbone_name="repnext_m3", core_backbone_weight_path=Non
     """
 
     # Core backbone: RepNeXt-M3 distilled not fused (training mode) repnext_m3_distill_300e.pth
-    # backbone = create_repnext(model_name=backbone_name, pretrained=True,weight_path=core_backbone_weight_path)
+    # cor backbone = create_repnext(model_name=backbone_name, pretrained=True,weight_path=core_backbone_weight_path)
     core_backbone = load_pretrained_repnext(core_backbone_name,core_backbone_weight_path)
     core_backbone = core_backbone.to(device)
     in_channels_list = BACKBONE_CHANNELS[core_backbone_name]

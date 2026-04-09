@@ -502,7 +502,7 @@ def _build_run_config(args, hw):
     """Collect all training configuration into a single dict for metadata."""
     return {
         'profile': args.profile,
-        'backbone': args.backbone,
+        'core_backbone': args.core_backbone,
         'pose_backbone': args.pose_backbone,
         'epochs': args.epochs,
         'eye': args.eye,
@@ -514,7 +514,8 @@ def _build_run_config(args, hw):
         'streaming': args.streaming,
         'dataset_url': getattr(args, 'dataset_url', None),
         'data_dir': getattr(args, 'data_dir', None),
-        'weight_path': args.weight_path,
+        'core_backbone_weight_path': args.core_backbone_weight_path,
+        'pose_backbone_weight_path': args.pose_backbone_weight_path,
         'started_at': datetime.now().isoformat(),
     }
 

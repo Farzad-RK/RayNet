@@ -29,14 +29,27 @@ def replace_batchnorm(net):
             # Recursively look for fuse-able submodules
             replace_batchnorm(child)
 
+
 def load_pretrained_repnext(backbone_name, weight_path):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Set pretrained=False to manually load checkpoint weights
     model = create_repnext(
         backbone_name,
-        pretrained=True,
+        pretrained=False,
         deploy=False
     )
-    model = model.cuda(0)
-    jit_model = torch.jit.load(weight_path, map_location=f"cuda:{0}")
-    state_dict = jit_model.state_dict()
-    model.backbone.load_state_dict(state_dict, strict=False)
+    checkpoint = torch.load(weight_path, map_location=device)
+
+    if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    else:
+        state_dict = checkpoint
+
+    if hasattr(model, 'backbone'):
+        model.backbone.load_state_dict(state_dict, strict=False)
+    else:
+        model.load_state_dict(state_dict, strict=False)
+
+    model.to(device)
     return model
