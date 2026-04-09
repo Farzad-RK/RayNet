@@ -95,6 +95,9 @@ class StreamingGazeGeneDataset(_Base):
                 raw['T_cam'].astype(np.float32)),
             'eyeball_center_3d': torch.from_numpy(
                 raw['eyeball_center_3d'].astype(np.float32)),
+            'head_R': torch.from_numpy(
+                raw['head_R'].astype(np.float32))
+                if 'head_R' in raw else torch.eye(3),
             'gaze_target': torch.from_numpy(
                 raw['gaze_target'].astype(np.float32))
                 if 'gaze_target' in raw else torch.zeros(3),
@@ -120,7 +123,7 @@ def _collate_fn(batch):
     tensor_keys = [
         'image', 'landmark_coords', 'landmark_coords_px',
         'optical_axis', 'R_kappa',
-        'K', 'R_cam', 'T_cam', 'eyeball_center_3d',
+        'K', 'R_cam', 'T_cam', 'eyeball_center_3d', 'head_R',
         'gaze_target', 'gaze_depth',
     ]
     scalar_keys = ['subject', 'cam_id', 'frame_idx']
