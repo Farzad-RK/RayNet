@@ -360,7 +360,7 @@ class RayNet(nn.Module):
         }
 
 
-def create_raynet(backbone_name="repnext_m3", core_backbone_weight_path=None,pose_backbone=None, n_landmarks=14,
+def create_raynet(backbone_name="repnext_m3", core_backbone_weight_path=None,pose_backbone_weight_path=None, n_landmarks=14,
                   cross_view_cfg=None, pose_backbone_name="repnext_m1"):
     """
     Factory function to create RayNet v4.1.
@@ -384,7 +384,7 @@ def create_raynet(backbone_name="repnext_m3", core_backbone_weight_path=None,pos
     in_channels_list = BACKBONE_CHANNELS[backbone_name]
 
     # Head Pose backbone RepNeXt-M1 distilled and not fused (training mode) repnext_m1_distill_300e.pth
-    pose_backbone = create_repnext(model_name=pose_backbone_name, pretrained=True,weight_path=pose_backbone)
+    pose_backbone = create_repnext(model_name=pose_backbone_name, pretrained=True,weight_path=pose_backbone_weight_path)
     pose_backbone = pose_backbone.to(device)
     pose_channels = BACKBONE_CHANNELS[pose_backbone_name]
 

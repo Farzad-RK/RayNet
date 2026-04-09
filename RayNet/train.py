@@ -569,10 +569,11 @@ def train(args):
     # Create model
     pose_bb = args.pose_backbone if args.pose_backbone != 'none' else None
     model = create_raynet(
-        backbone_name=args.backbone,
-        weight_path=args.weight_path,
+        backbone_name=args.core_backbone,
+        core_backbone_weight_path=args.core_backbone_weight_path,
+        pose_backbone_name=args.pose_backbone,
+        pose_backbone_weight_path=args.pose_backbone_weight_path,
         n_landmarks=14,
-        pose_backbone_name=pose_bb,
     )
 
     if hw['compile_model'] and hasattr(torch, 'compile'):
@@ -1023,7 +1024,7 @@ def parse_args():
                         help='WebDataset shard URL pattern for validation')
 
     # Model
-    parser.add_argument('--backbone', type=str, default='repnext_m3',
+    parser.add_argument('--core_backbone', type=str, default='repnext_m3',
                         choices=['repnext_m0', 'repnext_m1', 'repnext_m2',
                                  'repnext_m3', 'repnext_m4', 'repnext_m5'])
     parser.add_argument('--pose_backbone', type=str, default='repnext_m1',
@@ -1031,8 +1032,10 @@ def parse_args():
                                  'none'],
                         help='Pose encoder backbone (separate from main). '
                              '"none" disables pose encoder.')
-    parser.add_argument('--weight_path', type=str, default=None,
-                        help='Path to pretrained backbone weights')
+    parser.add_argument('--core_backbone_weight_path', type=str, default=None,
+                        help='Path to pretrained core backbone  weights(not fused)')
+    parser.add_argument('--pose_backbone_weight_path', type=str, default=None,
+                        help='Path to pretrained head pose  weights(not fused)')
 
     # Hardware profile
     parser.add_argument('--profile', type=str, default='default',
