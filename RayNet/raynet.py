@@ -138,15 +138,20 @@ class PoseEncoder(nn.Module):
     feature learning, avoiding the adversarial optimization seen when
     all tasks share one backbone.
 
-    During training, an auxiliary head predicts GT head_R (L1 loss).
+    During training, an auxiliary head predicts GT head_R via 6D rotation
+    representation (Zhou et al. CVPR 2019) with geodesic loss on SO(3).
     At inference, the learned features capture head pose without any
     explicit input — no external head pose estimator needed.
 
     Architecture:
-        Image → RepNeXt-M1 backbone → GlobalAvgPool → Linear(384→d_model)
-                                                     → pose_head(d_model→9)
+        Image → RepNeXt-M1 → CoordAtt → GlobalAvgPool → Linear(384→d_model)
+                                                        → pose_head(d_model→6)
 
-    ~4.8M + 0.1M params (backbone + projection + aux head).
+    6D output: first two columns of rotation matrix, reconstructed via
+    Gram-Schmidt in the loss function. This is the optimal continuous
+    representation of SO(3) for neural networks.
+
+    ~4.8M + 0.1M params (backbone + CoordAtt + projection + aux head).
     """
 
     def __init__(self, pose_backbone, pose_feat_dim, d_model=256):
@@ -163,8 +168,8 @@ class PoseEncoder(nn.Module):
         self.coord_att = CoordinateAttention(pose_feat_dim)
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.proj = nn.Linear(pose_feat_dim, d_model)
-        # Auxiliary head: predict head rotation matrix for supervision
-        self.pose_head = nn.Linear(d_model, 9)
+        # Auxiliary head: predict 6D rotation (Gram-Schmidt reconstruction)
+        self.pose_head = nn.Linear(d_model, 6)
 
     def forward(self, x):
         """
@@ -173,7 +178,7 @@ class PoseEncoder(nn.Module):
 
         Returns:
             pose_feat: (B, d_model) implicit head pose embedding
-            pred_head_R: (B, 9) predicted head rotation (for aux loss)
+            pred_pose_6d: (B, 6) predicted 6D rotation (for aux geodesic loss)
         """
         # Run through pose backbone with gradient checkpointing
         c0 = checkpoint(self.backbone.stem, x, use_reentrant=False)
@@ -188,8 +193,8 @@ class PoseEncoder(nn.Module):
         # Global average pool → project to d_model
         pooled = self.pool(c4).flatten(1)            # (B, pose_feat_dim)
         pose_feat = self.proj(pooled)                # (B, d_model)
-        pred_head_R = self.pose_head(pose_feat)      # (B, 9)
-        return pose_feat, pred_head_R
+        pred_pose_6d = self.pose_head(pose_feat)     # (B, 6)
+        return pose_feat, pred_pose_6d
 
 
 class LandmarkGazeBridge(nn.Module):
@@ -294,13 +299,14 @@ class RayNet(nn.Module):
         self.gaze_head = OpticalAxisHead(
             in_ch=panet_out_channels, hidden_dim=128)
 
-    def forward(self, x, n_views=1, R_cam=None, T_cam=None):
+    def forward(self, x, n_views=1, R_cam=None, T_cam=None, use_bridge=True):
         """
         Args:
             x: (B, 3, 224, 224) face crop (or any resolution; feature maps scale accordingly)
             n_views: number of camera views per group (1=single-view, 9=multi-view)
             R_cam: (B, 3, 3) camera extrinsic rotation matrices, or None
             T_cam: (B, 3) camera extrinsic translation vectors, or None
+            use_bridge: whether to use LandmarkGazeBridge (False for Stage 1/2)
 
         Returns:
             dict with:
@@ -308,7 +314,7 @@ class RayNet(nn.Module):
                 'landmark_heatmaps': (B, 14, H, W) raw logit heatmaps
                 'gaze_vector': (B, 3) optical axis unit vector (CCS)
                 'gaze_angles': (B, 2) pitch/yaw in radians
-                'pred_head_R': (B, 9) predicted head rotation (for aux loss)
+                'pred_pose_6d': (B, 6) predicted 6D rotation (for aux geodesic loss)
         """
         # Backbone: 4-stage feature extraction
         c0 = checkpoint(self.backbone.stem, x, use_reentrant=False)
@@ -333,13 +339,15 @@ class RayNet(nn.Module):
         pooled = self.gaze_head.pool_features(p5_att)          # (B, 256)
 
         # v4: Landmark-Gaze bridge — gaze attends to landmark features
-        pooled = self.landmark_gaze_bridge(pooled, p2_att)     # (B, 256)
+        # Disabled in Stage 1/2 to isolate crop-augmentation effects
+        if use_bridge:
+            pooled = self.landmark_gaze_bridge(pooled, p2_att)     # (B, 256)
 
         # v4.1: Implicit pose from separate backbone (gradient-isolated)
-        pred_head_R = None
+        pred_pose_6d = None
         pose_feat = None
         if self.pose_encoder is not None:
-            pose_feat, pred_head_R = self.pose_encoder(x)      # (B, 256), (B, 9)
+            pose_feat, pred_pose_6d = self.pose_encoder(x)     # (B, 256), (B, 6)
 
         # v4: Camera extrinsics embedding for cross-view attention
         cam_embed = None
@@ -356,7 +364,7 @@ class RayNet(nn.Module):
             'landmark_heatmaps': landmark_heatmaps,
             'gaze_vector': gaze_vector,
             'gaze_angles': gaze_angles,
-            'pred_head_R': pred_head_R,
+            'pred_pose_6d': pred_pose_6d,
         }
 
 

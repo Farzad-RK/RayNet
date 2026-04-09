@@ -1,15 +1,17 @@
 """
-Loss functions for RayNet.
+Loss functions for RayNet v4.1.
 
-Two core losses:
+Core losses:
   1. Landmark loss: heatmap MSE + coordinate L1
   2. Gaze loss: L1 on unit gaze vectors (following GazeGene paper Sec 4.1.1)
+  3. Pose loss: geodesic loss on SO(3) with 6D rotation representation
 
 Angular error is computed for metrics only (not backpropagated).
 """
 
 import torch
 import torch.nn.functional as F
+import math
 
 
 def gaussian_heatmaps(coords, H, W, sigma=2.0):
@@ -83,22 +85,98 @@ def gaze_loss(pred_gaze, gt_gaze):
     return F.l1_loss(pred_gaze, gt_gaze)
 
 
-def pose_prediction_loss(pred_head_R, gt_head_R):
+def rotation_6d_to_matrix(r6d):
     """
-    Auxiliary pose prediction loss (MAGE-style).
+    Convert 6D rotation representation to 3×3 rotation matrix.
 
-    Supervises the PoseEncoder by comparing predicted head rotation
-    to GT head rotation matrix. This forces the pose branch to learn
-    head-pose-relevant features without requiring head_R at inference.
+    Uses Gram-Schmidt orthogonalization (Zhou et al., "On the Continuity
+    of Rotation Representations in Neural Networks", CVPR 2019).
+
+    The 6D representation is the optimal continuous representation of SO(3)
+    for neural networks — unlike quaternions, Euler angles, or axis-angle,
+    it has no discontinuities or singularities.
 
     Args:
-        pred_head_R: (B, 9) predicted flattened rotation matrix
+        r6d: (B, 6) — first two columns of the rotation matrix
+
+    Returns:
+        R: (B, 3, 3) proper rotation matrix (orthogonal, det=+1)
+    """
+    a1 = r6d[:, 0:3]  # first column
+    a2 = r6d[:, 3:6]  # second column
+
+    # Gram-Schmidt: orthogonalize and normalize
+    b1 = F.normalize(a1, dim=-1)
+    b2 = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
+    b2 = F.normalize(b2, dim=-1)
+    b3 = torch.cross(b1, b2, dim=-1)
+
+    return torch.stack([b1, b2, b3], dim=-1)  # (B, 3, 3)
+
+
+def matrix_to_rotation_6d(R):
+    """
+    Convert 3×3 rotation matrix to 6D representation.
+
+    Args:
+        R: (B, 3, 3) rotation matrix
+
+    Returns:
+        r6d: (B, 6) first two columns of R, flattened
+    """
+    return R[:, :, :2].reshape(-1, 6)
+
+
+def geodesic_loss(pred_R, gt_R):
+    """
+    Geodesic loss on SO(3): angular distance between two rotations.
+
+    L = arccos( (trace(R_pred^T @ R_gt) - 1) / 2 )
+
+    This measures the actual angle of the rotation needed to go from
+    pred_R to gt_R, respecting the SO(3) manifold geometry. Unlike L1/L2
+    on matrix elements, geodesic loss treats all rotation axes equally.
+
+    Numerically stabilized with clamp to avoid NaN from arccos at ±1.
+
+    Args:
+        pred_R: (B, 3, 3) predicted rotation matrix
+        gt_R: (B, 3, 3) ground-truth rotation matrix
+
+    Returns:
+        loss: scalar mean geodesic distance in radians
+    """
+    # R_diff = R_pred^T @ R_gt
+    R_diff = torch.bmm(pred_R.transpose(1, 2), gt_R)
+    trace = R_diff[:, 0, 0] + R_diff[:, 1, 1] + R_diff[:, 2, 2]
+
+    # arccos((trace - 1) / 2), clamped for numerical stability
+    cos_angle = (trace - 1.0) / 2.0
+    cos_angle = cos_angle.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+    angle = torch.acos(cos_angle)
+
+    return angle.mean()
+
+
+def pose_prediction_loss(pred_6d, gt_head_R):
+    """
+    Auxiliary pose prediction loss with 6D representation + geodesic loss.
+
+    The PoseEncoder predicts 6D rotation (first two columns of R),
+    which is reconstructed to a proper rotation matrix via Gram-Schmidt,
+    then compared to GT using geodesic distance on SO(3).
+
+    This is the same approach as SixDRepNet (Hempel et al., 2022).
+
+    Args:
+        pred_6d: (B, 6) predicted 6D rotation representation
         gt_head_R: (B, 3, 3) ground-truth head rotation matrix
 
     Returns:
-        loss: scalar L1 loss on rotation matrix elements
+        loss: scalar geodesic loss in radians
     """
-    return F.l1_loss(pred_head_R, gt_head_R.flatten(1))
+    pred_R = rotation_6d_to_matrix(pred_6d)  # (B, 3, 3)
+    return geodesic_loss(pred_R, gt_head_R)
 
 
 def ray_target_loss(pred_gaze, eyeball_center, gaze_target, gaze_depth):
@@ -152,7 +230,7 @@ def total_loss(pred_hm, pred_coords, pred_gaze,
                lam_ray=0.0,
                eyeball_center=None, gaze_target=None, gaze_depth=None,
                lam_pose=0.0,
-               pred_head_R=None, gt_head_R=None):
+               pred_pose_6d=None, gt_head_R=None):
     """
     Total training loss combining landmarks, gaze, ray-to-target, and pose.
 
@@ -171,7 +249,7 @@ def total_loss(pred_hm, pred_coords, pred_gaze,
         gaze_target: (B, 3) GT 3D gaze target in CCS (for ray loss)
         gaze_depth: (B,) GT depth along gaze ray (for ray loss)
         lam_pose: pose prediction auxiliary loss weight (0 = disabled)
-        pred_head_R: (B, 9) predicted head rotation from PoseEncoder
+        pred_pose_6d: (B, 6) predicted 6D rotation from PoseEncoder
         gt_head_R: (B, 3, 3) GT head rotation matrix
 
     Returns:
@@ -199,11 +277,12 @@ def total_loss(pred_hm, pred_coords, pred_gaze,
         total = total + lam_ray * ray
         components['ray_target_loss'] = ray.detach()
 
-    # Auxiliary pose prediction loss (v4.1, MAGE-style)
-    if lam_pose > 0 and pred_head_R is not None and gt_head_R is not None:
-        pose = pose_prediction_loss(pred_head_R, gt_head_R)
+    # Auxiliary pose prediction loss (v4.1, 6D repr + geodesic)
+    if lam_pose > 0 and pred_pose_6d is not None and gt_head_R is not None:
+        pose = pose_prediction_loss(pred_pose_6d, gt_head_R)
         total = total + lam_pose * pose
         components['pose_loss'] = pose.detach()
+        components['pose_loss_deg'] = torch.rad2deg(pose.detach())
 
     components['total_loss'] = total.detach()
 
