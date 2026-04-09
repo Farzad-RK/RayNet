@@ -1,9 +1,8 @@
-**RayNet v2 Wiki**
+**RayNet v4.1 Wiki**
 
 - [[Home]]
 - [[Architecture]]
 - [[Dataset]]
-- [[Normalization]]
 - [[Training Guide]]
 - [[Loss Functions]]
 - [[Multi-View Consistency]]

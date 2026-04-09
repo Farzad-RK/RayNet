@@ -4,7 +4,9 @@ Loss functions for RayNet v4.1.
 Core losses:
   1. Landmark loss: heatmap MSE + coordinate L1
   2. Gaze loss: L1 on unit gaze vectors (following GazeGene paper Sec 4.1.1)
-  3. Pose loss: geodesic loss on SO(3) with 6D rotation representation
+  3. Pose rotation loss: geodesic loss on SO(3) with 6D rotation representation
+  4. Pose translation loss: SmoothL1 on xy + log-space SmoothL1 on z (depth)
+  5. Ray-to-target loss: geometric constraint tying gaze direction to 3D target
 
 Angular error is computed for metrics only (not backpropagated).
 """
@@ -108,7 +110,7 @@ def rotation_6d_to_matrix(r6d):
     # Gram-Schmidt: orthogonalize and normalize
     b1 = F.normalize(a1, dim=-1)
     b2 = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
-    b2 = F.normalize(b2, dim=-1)
+    b2 = F.normalize(b2, dim=-1, eps=1e-6)
     b3 = torch.cross(b1, b2, dim=-1)
 
     return torch.stack([b1, b2, b3], dim=-1)  # (B, 3, 3)
@@ -230,7 +232,10 @@ def total_loss(pred_hm, pred_coords, pred_gaze,
                lam_ray=0.0,
                eyeball_center=None, gaze_target=None, gaze_depth=None,
                lam_pose=0.0,
-               pred_pose_6d=None, gt_head_R=None):
+               pred_pose_6d=None, gt_head_R=None,
+               lam_trans=0.0,
+               pred_pose_t=None, gt_head_t=None
+               ):
     """
     Total training loss combining landmarks, gaze, ray-to-target, and pose.
 
@@ -272,7 +277,7 @@ def total_loss(pred_hm, pred_coords, pred_gaze,
     }
 
     # Ray-to-target constraint (v4)
-    if lam_ray > 0 and eyeball_center is not None and gaze_target is not None:
+    if lam_ray > 0 and eyeball_center is not None and gaze_target is not None and gaze_depth is not None:
         ray = ray_target_loss(pred_gaze, eyeball_center, gaze_target, gaze_depth)
         total = total + lam_ray * ray
         components['ray_target_loss'] = ray.detach()
@@ -284,6 +289,45 @@ def total_loss(pred_hm, pred_coords, pred_gaze,
         components['pose_loss'] = pose.detach()
         components['pose_loss_deg'] = torch.rad2deg(pose.detach())
 
+    if lam_trans > 0 and pred_pose_t is not None and gt_head_t is not None:
+        trans = translation_loss(pred_pose_t, gt_head_t)
+        total = total + lam_trans * trans
+        components['translation_loss'] = trans.detach()
+
+    components['landmark_loss'] *= 1.0 / (feat_H * feat_W)
     components['total_loss'] = total.detach()
 
     return total, components
+
+
+def translation_loss(pred_t, gt_t, eps=1e-6):
+    """
+    Translation loss with log-depth normalization.
+
+    gt_t must be:
+      - tx, ty normalized to [-1, 1]
+      - tz in metric depth (positive)
+
+    Args:
+        pred_t: (B, 3) predicted translation
+        gt_t: (B, 3) ground-truth translation
+
+    Returns:
+        loss: scalar
+    """
+    pred_xy = pred_t[:, :2]
+    pred_z = pred_t[:, 2:3]
+
+    gt_xy = gt_t[:, :2]
+    gt_z = gt_t[:, 2:3]
+
+    # XY (image-plane)
+    loss_xy = F.smooth_l1_loss(pred_xy, gt_xy)
+
+    # Z (log space → scale invariant)
+    pred_z = pred_z.clamp(min=eps)
+    gt_z = gt_z.clamp(min=eps)
+
+    loss_z = F.smooth_l1_loss(torch.log(pred_z), torch.log(gt_z))
+
+    return loss_xy + loss_z

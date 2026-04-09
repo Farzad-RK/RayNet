@@ -5,18 +5,26 @@ Staged training strategy to establish baselines before full pipeline:
 
   Stage 1 — Landmark + Pose baseline (no gaze):
     Validates both backbones learn useful representations independently.
-    Phase 1 (epochs 1-10):  λ_lm=1.0, λ_pose=0.5, λ_gaze=0
-    Phase 2 (epochs 11-20): λ_lm=1.0, λ_pose=1.0, λ_gaze=0 (pose emphasis)
+    Phase 1 (epochs 1-10):  λ_lm=1.0, λ_pose=0.5, λ_trans=0.5, λ_gaze=0
+    Phase 2 (epochs 11-20): λ_lm=1.0, λ_pose=1.0, λ_trans=1.0, λ_gaze=0 (pose emphasis)
 
   Stage 2 — Add gaze, no bridge:
     Tests gaze learning without the crop-poisoned LandmarkGazeBridge.
-    Phase 1 (epochs 1-5):   λ_lm=1.0, λ_gaze=0.1, λ_pose=0.5
-    Phase 2 (epochs 6-15):  λ_lm=1.0, λ_gaze=0.5, λ_pose=0.5, λ_ray=0.1
-    Phase 3 (epochs 16-25): λ_lm=0.5, λ_gaze=1.0, λ_pose=0.5, λ_ray=0.3
+    Phase 1 (epochs 1-5):   λ_lm=1.0, λ_gaze=0.1, λ_pose=0.5, λ_trans=0.5
+    Phase 2 (epochs 6-15):  λ_lm=1.0, λ_gaze=0.5, λ_pose=0.5, λ_trans=0.5, λ_ray=0.1
+    Phase 3 (epochs 16-25): λ_lm=0.5, λ_gaze=1.0, λ_pose=0.5, λ_trans=0.5, λ_ray=0.3
 
   Stage 3 — Full pipeline with bridge:
     Only run after Stage 2 shows gaze converging on validation.
     Same as Stage 2 but with LandmarkGazeBridge enabled.
+
+  Gradient clipping (max_norm) varies by phase:
+    Phase 1: max_norm=5.0 (aggressive, allows large multi-task gradients)
+    Phase 2+: max_norm=2.0 (conservative, prevents gaze/pose interference)
+
+  Pose representation (9D = 6D rotation + 3D translation):
+    Rotation: 6D continuous repr (Zhou et al. CVPR 2019) + geodesic loss on SO(3)
+    Translation: tanh(tx,ty) for [-1,1] + exp(tz) for depth + log-space SmoothL1
 
 Usage:
     # Stage 1: Landmark + Pose baseline
@@ -137,7 +145,7 @@ HARDWARE_PROFILES = {
         'num_workers': 8,
         'pin_memory': True,
         'amp': True,
-        'amp_dtype': 'float16',
+        'amp_dtype': 'bfloat16',
         'grad_accum_steps': 1,      # effective batch = 1152
         'compile_model': True,
         'tf32': True,
@@ -196,6 +204,7 @@ STAGE_CONFIGS = {
             'lam_mask': 0.0,
             'lam_ray': 0.0,
             'lam_pose': 0.5,
+            'lam_trans': 0.5,
             'lr': 1e-3,
             'sigma': 2.0,
             'multiview': False,
@@ -210,6 +219,7 @@ STAGE_CONFIGS = {
             'lam_mask': 0.0,
             'lam_ray': 0.0,
             'lam_pose': 1.0,
+            'lam_trans': 1.0,
             'lr': 3e-4,
             'sigma': 1.5,
             'multiview': False,
@@ -228,6 +238,7 @@ STAGE_CONFIGS = {
             'lam_mask': 0.0,
             'lam_ray': 0.0,
             'lam_pose': 0.5,
+            'lam_trans': 0.5,
             'lr': 1e-3,
             'sigma': 2.0,
             'multiview': False,
@@ -242,6 +253,7 @@ STAGE_CONFIGS = {
             'lam_mask': 0.02,
             'lam_ray': 0.1,
             'lam_pose': 0.5,
+            'lam_trans': 0.5,
             'lr': 5e-4,
             'sigma': 1.5,
             'multiview': True,
@@ -256,6 +268,7 @@ STAGE_CONFIGS = {
             'lam_mask': 0.05,
             'lam_ray': 0.3,
             'lam_pose': 0.5,
+            'lam_trans': 0.5,
             'lr': 1e-4,
             'sigma': 1.0,
             'multiview': True,
@@ -274,6 +287,7 @@ STAGE_CONFIGS = {
             'lam_mask': 0.0,
             'lam_ray': 0.0,
             'lam_pose': 0.5,
+            'lam_trans': 0.5,
             'lr': 1e-3,
             'sigma': 2.0,
             'multiview': False,
@@ -288,6 +302,7 @@ STAGE_CONFIGS = {
             'lam_mask': 0.02,
             'lam_ray': 0.1,
             'lam_pose': 0.5,
+            'lam_trans': 0.5,
             'lr': 5e-4,
             'sigma': 1.5,
             'multiview': True,
@@ -302,6 +317,7 @@ STAGE_CONFIGS = {
             'lam_mask': 0.05,
             'lam_ray': 0.3,
             'lam_pose': 0.5,
+            'lam_trans': 0.5,
             'lr': 1e-4,
             'sigma': 1.0,
             'multiview': True,
@@ -386,6 +402,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
     running_losses = {
         'total': 0.0, 'landmark': 0.0, 'angular': 0.0, 'angular_deg': 0.0,
         'reproj': 0.0, 'mask': 0.0, 'ray_target': 0.0, 'pose': 0.0,
+        'translation': 0.0,
     }
     n_batches = 0
 
@@ -396,143 +413,165 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
 
         # To prevent accumulation on missing values we use this flag to not process the filtered samples
         has_accumulated = False
-        if batch:
-            # UINT 8 to tensor of floats normalized from 0.0 to 1.0
-            images = batch['image'].to(device, non_blocking=True).float().div_(255.0)
-            gt_landmarks = batch['landmark_coords'].to(device, non_blocking=True)
-            gt_optical_axis = batch['optical_axis'].to(device, non_blocking=True)
+        if not batch or len(batch) == 0:
+            continue
 
-            # Camera extrinsics for geometry-conditioned attention
-            R_cam = batch['R_cam'].to(device, non_blocking=True)
-            T_cam = batch['T_cam'].to(device, non_blocking=True)
+        # UINT 8 to tensor of floats normalized from 0.0 to 1.0
+        images = batch['image'].to(device, non_blocking=True).float().div_(255.0)
+        gt_landmarks = batch['landmark_coords'].to(device, non_blocking=True)
+        gt_optical_axis = batch['optical_axis'].to(device, non_blocking=True)
 
-            # GT head pose for auxiliary pose loss (not passed to model)
-            gt_head_R = batch.get('head_R')
-            if gt_head_R is not None:
-                gt_head_R = gt_head_R.to(device, non_blocking=True)
+        # Camera extrinsics for geometry-conditioned attention
+        R_cam = batch['R_cam'].to(device, non_blocking=True)
+        T_cam = batch['T_cam'].to(device, non_blocking=True)
 
-            # Forward pass with AMP autocast
-            with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                predictions = model(images, n_views=n_views,
-                                    R_cam=R_cam, T_cam=T_cam,
-                                    use_bridge=use_bridge)
+        # GT head pose for auxiliary pose loss (not passed to model)
+        gt_head_R = batch.get('head_R')
+        if gt_head_R is not None:
+            gt_head_R = gt_head_R.to(device, non_blocking=True)
 
-                pred_hm = predictions['landmark_heatmaps']
-                pred_coords = predictions['landmark_coords']
-                pred_gaze = predictions['gaze_vector']
+        gt_head_t = batch.get('head_t')
+        if gt_head_t is not None:
+            gt_head_t = gt_head_t.to(device, non_blocking=True)
 
-                feat_H, feat_W = pred_hm.shape[2], pred_hm.shape[3]
+        # Forward pass with AMP autocast
+        with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            predictions = model(images, n_views=n_views,
+                                R_cam=R_cam, T_cam=T_cam,
+                                use_bridge=use_bridge)
 
-                loss, components = total_loss(
-                    pred_hm, pred_coords, pred_gaze,
-                    gt_landmarks, gt_optical_axis,
-                    feat_H, feat_W,
-                    lam_lm=cfg['lam_lm'],
-                    lam_gaze=cfg['lam_gaze'],
-                    sigma=cfg['sigma'],
-                    lam_ray=cfg.get('lam_ray', 0.0),
-                    eyeball_center=batch['eyeball_center_3d'].to(
-                        device, non_blocking=True),
-                    gaze_target=batch['gaze_target'].to(
-                        device, non_blocking=True),
-                    gaze_depth=batch['gaze_depth'].to(
-                        device, non_blocking=True),
-                    lam_pose=cfg.get('lam_pose', 0.0),
-                    pred_pose_6d=predictions.get('pred_pose_6d'),
-                    gt_head_R=gt_head_R,
+            pred_hm = predictions['landmark_heatmaps']
+            pred_coords = predictions['landmark_coords']
+            pred_gaze = predictions['gaze_vector']
+
+            feat_H, feat_W = pred_hm.shape[2], pred_hm.shape[3]
+
+            loss, components = total_loss(
+                pred_hm, pred_coords, pred_gaze,
+                gt_landmarks, gt_optical_axis,
+                feat_H, feat_W,
+                lam_lm=cfg['lam_lm'],
+                lam_gaze=cfg['lam_gaze'],
+                sigma=cfg['sigma'],
+                lam_ray=cfg.get('lam_ray', 0.0),
+                eyeball_center=batch['eyeball_center_3d'].to(
+                    device, non_blocking=True),
+                gaze_target=batch['gaze_target'].to(
+                    device, non_blocking=True),
+                gaze_depth=batch['gaze_depth'].to(
+                    device, non_blocking=True),
+                lam_pose=cfg.get('lam_pose', 0.0),
+                pred_pose_6d=predictions.get('pred_pose_6d'),
+                gt_head_R=gt_head_R,
+                lam_trans=cfg.get('lam_trans', 0.0),
+                pred_pose_t=predictions.get('pred_pose_t'),
+                gt_head_t=gt_head_t,
+            )
+
+            # Multi-view consistency loss (Phase 2+)
+            # Ray-based: works with unit gaze vectors, numerically stable.
+            if use_multiview:
+                mv_loss, mv_components = multiview_consistency_loss(
+                    pred_gaze,
+                    pred_coords,
+                    R_cam,
+                    lam_gaze_consist=cfg['lam_reproj'],
+                    lam_shape=cfg['lam_mask'],
                 )
+                if torch.isfinite(mv_loss):
+                    mv_weight = min(1.0, epoch / 10.0)  # smooth ramp
+                    loss = loss + mv_weight * mv_loss
+                running_losses['reproj'] += mv_components['gaze_consist_loss'].item()
+                running_losses['mask'] += mv_components['shape_loss'].item()
 
-                # Multi-view consistency loss (Phase 2+)
-                # Ray-based: works with unit gaze vectors, numerically stable.
-                if use_multiview:
-                    mv_loss, mv_components = multiview_consistency_loss(
-                        pred_gaze,
-                        pred_coords,
-                        R_cam,
-                        lam_gaze_consist=cfg['lam_reproj'],
-                        lam_shape=cfg['lam_mask'],
-                    )
-                    if torch.isfinite(mv_loss):
-                        loss = loss + mv_loss
-                    running_losses['reproj'] += mv_components['gaze_consist_loss'].item()
-                    running_losses['mask'] += mv_components['shape_loss'].item()
+            # Track ray-to-target loss and pose loss
+            if 'ray_target_loss' in components:
+                running_losses['ray_target'] += components['ray_target_loss'].item()
+            if 'pose_loss' in components:
+                running_losses['pose'] += components['pose_loss'].item()
+            if 'translation_loss' in components:
+                running_losses['translation'] += components['translation_loss'].item()
 
-                # Track ray-to-target loss and pose loss
-                if 'ray_target_loss' in components:
-                    running_losses['ray_target'] += components['ray_target_loss'].item()
-                if 'pose_loss' in components:
-                    running_losses['pose'] += components['pose_loss'].item()
+            # Scale loss by accumulation steps
+            loss = loss / grad_accum_steps
 
-                # Scale loss by accumulation steps
-                loss = loss / grad_accum_steps
+        # Backward pass with gradient scaling
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
-            # Backward pass with gradient scaling
-            if scaler is not None:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+        # using this flag only when a batch is valid to process
+        has_accumulated = True
 
-            # using this flag only when a batch is valid to process
-            has_accumulated = True
-
-            # Optimizer step at accumulation boundary
-            if (step + 1) % grad_accum_steps == 0:
-                if has_accumulated:
-                    if scaler is not None:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                        optimizer.step()
-                    optimizer.zero_grad()
-                    has_accumulated = False
+        # max_norm for multi-task learning scenario like ours requires a value>1
+        # therefore we set max_norm=5.0 for more aggressive training strategy
+        current_phase_num = get_phase(epoch)
+        if current_phase_num >= 2:
+            max_norm = 2.0
+        else:
+            max_norm = 5.0
+        # Optimizer step at accumulation boundary
+        if (step + 1) % grad_accum_steps == 0:
+            if has_accumulated:
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
                 else:
-                    optimizer.zero_grad()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
+                    optimizer.step()
+                optimizer.zero_grad()
+                has_accumulated = False
+            else:
+                optimizer.zero_grad()
 
-            # Accumulate metrics (use unscaled loss)
-            running_losses['total'] += components['total_loss'].item()
-            running_losses['landmark'] += components['landmark_loss'].item()
-            running_losses['angular'] += components['angular_loss'].item()
-            running_losses['angular_deg'] += components['angular_loss_deg'].item()
-            n_batches += 1
+        # Accumulate metrics (use unscaled loss)
+        running_losses['total'] += components['total_loss'].item()
+        running_losses['landmark'] += components['landmark_loss'].item()
+        running_losses['angular'] += components['angular_loss'].item()
+        running_losses['angular_deg'] += components['angular_loss_deg'].item()
+        n_batches += 1
 
-            # Per-batch CSV logging (high granularity)
-            if batch_csv_writer is not None:
-                ray_val = components.get('ray_target_loss',
-                                         torch.tensor(0.0)).item()
-                pose_val = components.get('pose_loss',
-                                          torch.tensor(0.0)).item()
-                batch_csv_writer.writerow([
-                    epoch, step + 1,
-                    f"{components['total_loss'].item():.6f}",
-                    f"{components['landmark_loss'].item():.6f}",
-                    f"{components['angular_loss_deg'].item():.4f}",
-                    f"{running_losses['reproj'] / n_batches:.6f}",
-                    f"{running_losses['mask'] / n_batches:.6f}",
-                    f"{ray_val:.6f}",
-                    f"{pose_val:.6f}",
-                    f"{optimizer.param_groups[0]['lr']:.8f}",
-                ])
+        # Per-batch CSV logging (high granularity)
+        if batch_csv_writer is not None:
+            ray_val = components.get('ray_target_loss',
+                                     torch.tensor(0.0)).item()
+            pose_val = components.get('pose_loss',
+                                      torch.tensor(0.0)).item()
+            trans_val = components.get('translation_loss',
+                                       torch.tensor(0.0)).item()
+            batch_csv_writer.writerow([
+                epoch, step + 1,
+                f"{components['total_loss'].item():.6f}",
+                f"{components['landmark_loss'].item():.6f}",
+                f"{components['angular_loss_deg'].item():.4f}",
+                f"{running_losses['reproj'] / n_batches:.6f}",
+                f"{running_losses['mask'] / n_batches:.6f}",
+                f"{ray_val:.6f}",
+                f"{pose_val:.6f}",
+                f"{trans_val:.6f}",
+                f"{optimizer.param_groups[0]['lr']:.8f}",
+            ])
 
-            # Progress logging
-            total_batches = len(train_loader)
-            if step == 0 or (step + 1) % max(1, total_batches // 10) == 0 or step + 1 == total_batches:
-                avg_loss = running_losses['total'] / n_batches
-                print(f"  [Epoch {epoch}] batch {step+1}/{total_batches} "
-                      f"loss={avg_loss:.4f}", flush=True)
+        # Progress logging
+        total_batches = len(train_loader)
+        if step == 0 or (step + 1) % max(1, total_batches // 10) == 0 or step + 1 == total_batches:
+            avg_loss = running_losses['total'] / n_batches
+            print(f"  [Epoch {epoch}] batch {step+1}/{total_batches} "
+                  f"loss={avg_loss:.4f}", flush=True)
 
     # Flush any remaining gradients from incomplete accumulation
     if n_batches % grad_accum_steps != 0:
         if has_accumulated:
             if scaler is not None:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
                 optimizer.step()
             optimizer.zero_grad()
 
@@ -553,7 +592,7 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
 
     running_losses = {
         'total': 0.0, 'landmark': 0.0, 'angular': 0.0, 'angular_deg': 0.0,
-        'landmark_px': 0.0,
+        'landmark_px': 0.0, 'pose': 0.0, 'ray': 0.0, 'translation': 0.0,
     }
     n_batches = 0
 
@@ -601,6 +640,15 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
         running_losses['angular'] += components['angular_loss'].item()
         running_losses['angular_deg'] += components['angular_loss_deg'].item()
         running_losses['landmark_px'] += lm_px_error.item()
+        pose_val = components.get('pose_loss')
+        if pose_val is not None:
+            running_losses['pose'] += pose_val.item()
+        ray_val = components.get('ray_target_loss')
+        if ray_val is not None:
+            running_losses['ray'] += ray_val.item()
+        trans_val = components.get('translation_loss')
+        if trans_val is not None:
+            running_losses['translation'] += trans_val.item()
         n_batches += 1
 
     for k in running_losses:
@@ -732,6 +780,7 @@ def train(args):
         'epoch', 'phase', 'lr',
         'train_total', 'train_landmark', 'train_angular_deg',
         'train_reproj', 'train_mask', 'train_ray_target', 'train_pose',
+        'train_translation',
         'val_total', 'val_landmark', 'val_angular_deg', 'val_landmark_px',
     ])
 
@@ -741,7 +790,7 @@ def train(args):
     batch_csv_writer = csv.writer(batch_csv_file)
     batch_csv_writer.writerow([
         'epoch', 'batch', 'loss', 'landmark', 'angular_deg',
-        'gaze_consist', 'shape', 'ray_target', 'pose', 'lr',
+        'gaze_consist', 'shape', 'ray_target', 'pose', 'translation', 'lr',
     ])
 
     # Training loop with phase transitions
@@ -794,7 +843,8 @@ def train(args):
             print(f"Phase {phase}: {cfg['description']}")
             print(f"  lr={cfg['lr']}, lam_lm={cfg['lam_lm']}, "
                   f"lam_gaze={cfg['lam_gaze']}, lam_ray={cfg.get('lam_ray', 0)}, "
-                  f"lam_pose={cfg.get('lam_pose', 0)}, sigma={cfg['sigma']}")
+                  f"lam_pose={cfg.get('lam_pose', 0)}, lam_trans={cfg.get('lam_trans', 0)}, "
+                  f"sigma={cfg['sigma']}")
             if cfg.get('multiview'):
                 print(f"  Multi-view: lam_gaze_consist={cfg['lam_reproj']}, "
                       f"lam_shape={cfg['lam_mask']}")
@@ -856,6 +906,8 @@ def train(args):
             mv_str += f" ray={train_losses['ray_target']:.4f}"
         if train_losses.get('pose', 0) > 0:
             mv_str += f" pose={train_losses['pose']:.4f}"
+        if train_losses.get('translation', 0) > 0:
+            mv_str += f" trans={train_losses['translation']:.4f}"
         print(f"Epoch {epoch:3d} | Phase {phase} | lr {current_lr:.2e} | "
               f"Train: loss={train_losses['total']:.4f} lm={train_losses['landmark']:.4f} "
               f"ang={train_losses['angular_deg']:.2f}deg{mv_str} | "
@@ -875,6 +927,7 @@ def train(args):
             f"{train_losses.get('mask', 0):.6f}",
             f"{train_losses.get('ray_target', 0):.6f}",
             f"{train_losses.get('pose', 0):.6f}",
+            f"{train_losses.get('translation', 0):.6f}",
             f"{val_losses['total']:.6f}",
             f"{val_losses['landmark']:.6f}",
             f"{val_losses['angular_deg']:.4f}",

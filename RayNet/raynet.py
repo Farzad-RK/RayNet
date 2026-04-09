@@ -3,7 +3,7 @@ RayNet v4.1 — Multi-task gaze estimation, landmark detection, and pose.
 
   Task A: Iris + pupil landmark heatmaps (14 points via soft-argmax on P2)
   Task B: Optical axis regression (pitch/yaw on P5) with Cross-View Attention
-  Aux:    Implicit head pose prediction (MAGE-style, separate backbone)
+  Aux:    Implicit head pose prediction (MAGE-style, separate backbone, 9D: 6D rotation + 3D translation)
 
 Main backbone:  RepNeXt-M3 (7.8M params) — landmarks + gaze
 Pose backbone:  RepNeXt-M1 (4.8M params) — implicit head pose (gradient-isolated)
@@ -138,18 +138,28 @@ class PoseEncoder(nn.Module):
     feature learning, avoiding the adversarial optimization seen when
     all tasks share one backbone.
 
-    During training, an auxiliary head predicts GT head_R via 6D rotation
-    representation (Zhou et al. CVPR 2019) with geodesic loss on SO(3).
+    During training, an auxiliary head predicts:
+      - GT head_R via 6D rotation representation (Zhou et al. CVPR 2019)
+        with geodesic loss on SO(3).
+      - GT head_T_vec (3D translation) with SmoothL1 loss to learn the
+        gaze origin and cancel out depth/offset variance from random
+        cropping (MAGE implicit easy-norm).
+
+    Translation normalization:
+      - tx = tanh(raw) → [-1, 1]  (image-plane horizontal offset)
+      - ty = tanh(raw) → [-1, 1]  (image-plane vertical offset)
+      - tz = exp(raw)  → (0, +∞)  (depth, trained in log-space for scale invariance)
+      GT must be pre-normalized to match: tx,ty in [-1,1], tz as positive depth.
+
     At inference, the learned features capture head pose without any
     explicit input — no external head pose estimator needed.
 
     Architecture:
         Image → RepNeXt-M1 → CoordAtt → GlobalAvgPool → Linear(384→d_model)
-                                                        → pose_head(d_model→6)
+                                                        → pose_head(d_model→9)
 
-    6D output: first two columns of rotation matrix, reconstructed via
-    Gram-Schmidt in the loss function. This is the optimal continuous
-    representation of SO(3) for neural networks.
+    9D output: 6D rotation (first two columns of R, Gram-Schmidt) + 3D
+    translation (tanh-normalized xy + exp-normalized depth).
 
     ~4.8M + 0.1M params (backbone + CoordAtt + projection + aux head).
     """
@@ -168,8 +178,8 @@ class PoseEncoder(nn.Module):
         self.coord_att = CoordinateAttention(pose_feat_dim)
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.proj = nn.Linear(pose_feat_dim, d_model)
-        # Auxiliary head: predict 6D rotation (Gram-Schmidt reconstruction)
-        self.pose_head = nn.Linear(d_model, 6)
+        # Auxiliary head: predict 6D rotation + 3D translation
+        self.pose_head = nn.Linear(d_model, 9)
 
     def forward(self, x):
         """
@@ -179,6 +189,7 @@ class PoseEncoder(nn.Module):
         Returns:
             pose_feat: (B, d_model) implicit head pose embedding
             pred_pose_6d: (B, 6) predicted 6D rotation (for aux geodesic loss)
+            pred_pose_t: (B, 3) predicted head translation (for aux translation loss)
         """
         # Run through pose backbone with gradient checkpointing
         c0 = checkpoint(self.backbone.stem, x, use_reentrant=False)
@@ -193,8 +204,20 @@ class PoseEncoder(nn.Module):
         # Global average pool → project to d_model
         pooled = self.pool(c4).flatten(1)            # (B, pose_feat_dim)
         pose_feat = self.proj(pooled)                # (B, d_model)
-        pred_pose_6d = self.pose_head(pose_feat)     # (B, 6)
-        return pose_feat, pred_pose_6d
+
+        pose_out = self.pose_head(pose_feat)         # (B, 9)
+        pred_pose_6d = pose_out[:, :6]
+
+        # Raw translation
+        t_raw = pose_out[:, 6:]  # (B, 3)
+
+        # Normalize
+        tx = torch.tanh(t_raw[:, 0:1])  # [-1, 1]
+        ty = torch.tanh(t_raw[:, 1:2])  # [-1, 1]
+        tz = torch.exp(t_raw[:, 2:3])  # (0, +inf) depth
+
+        pred_pose_t = torch.cat([tx, ty, tz], dim=-1)
+        return pose_feat, pred_pose_6d, pred_pose_t
 
 
 class LandmarkGazeBridge(nn.Module):
@@ -314,7 +337,8 @@ class RayNet(nn.Module):
                 'landmark_heatmaps': (B, 14, H, W) raw logit heatmaps
                 'gaze_vector': (B, 3) optical axis unit vector (CCS)
                 'gaze_angles': (B, 2) pitch/yaw in radians
-                'pred_pose_6d': (B, 6) predicted 6D rotation (for aux geodesic loss)
+                'pred_pose_6d': (B, 6) predicted 6D rotation
+                'pred_pose_t': (B, 3) predicted 3D translation
         """
         # Backbone: 4-stage feature extraction
         c0 = checkpoint(self.backbone.stem, x, use_reentrant=False)
@@ -345,9 +369,10 @@ class RayNet(nn.Module):
 
         # v4.1: Implicit pose from separate backbone (gradient-isolated)
         pred_pose_6d = None
+        pred_pose_t = None
         pose_feat = None
         if self.pose_encoder is not None:
-            pose_feat, pred_pose_6d = self.pose_encoder(x)     # (B, 256), (B, 6)
+            pose_feat, pred_pose_6d, pred_pose_t = self.pose_encoder(x)  # (B,256), (B,6), (B,3)
 
         # v4: Camera extrinsics embedding for cross-view attention
         cam_embed = None
@@ -365,6 +390,7 @@ class RayNet(nn.Module):
             'gaze_vector': gaze_vector,
             'gaze_angles': gaze_angles,
             'pred_pose_6d': pred_pose_6d,
+            'pred_pose_t': pred_pose_t,
         }
 
 
