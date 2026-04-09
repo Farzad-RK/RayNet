@@ -30,24 +30,13 @@ def replace_batchnorm(net):
             replace_batchnorm(child)
 
 def load_pretrained_repnext(backbone_name, weight_path):
-    # Try TorchScript JIT first, fall back to regular state dict
-    try:
-        jit_model = torch.jit.load(weight_path, map_location="cpu")
-        state_dict = jit_model.state_dict()
-    except RuntimeError:
-        checkpoint = torch.load(weight_path, map_location="cpu", weights_only=False)
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
-        elif isinstance(checkpoint, dict):
-            state_dict = checkpoint
-        else:
-            raise ValueError(f"Cannot extract state_dict from {weight_path}")
-
-    state_dict = {k: v for k, v in state_dict.items() if
-                  not k.startswith("head.head") and not k.startswith("head.head_dist")}
-    model = create_repnext(model_name=backbone_name, pretrained=False)
-    model.load_state_dict(state_dict, strict=False)
-    replace_batchnorm(model)
+    model = create_repnext(
+        backbone_name,
+        pretrained=True,
+        deploy=False
+    )
+    model = model.cuda(0)
+    jit_model = torch.jit.load(weight_path, map_location=f"cuda:{0}")
+    state_dict = jit_model.state_dict()
+    model.backbone.load_state_dict(state_dict, strict=False)
     return model
