@@ -22,10 +22,10 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from backbone.repnext_utils import load_pretrained_repnext
 from RayNet.panet import PANet
 from RayNet.coordatt import CoordinateAttention
 from RayNet.heads import IrisPupilLandmarkHead, OpticalAxisHead
+from backbone.repnext import create_repnext
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -360,7 +360,7 @@ class RayNet(nn.Module):
         }
 
 
-def create_raynet(backbone_name="repnext_m3", weight_path=None, n_landmarks=14,
+def create_raynet(backbone_name="repnext_m3", core_backbone_weight_path=None,pose_backbone=None, n_landmarks=14,
                   cross_view_cfg=None, pose_backbone_name="repnext_m1"):
     """
     Factory function to create RayNet v4.1.
@@ -377,24 +377,16 @@ def create_raynet(backbone_name="repnext_m3", weight_path=None, n_landmarks=14,
     Returns:
         RayNet model on device
     """
-    from backbone.repnext import create_repnext
 
-    # Main backbone
-    if weight_path is not None:
-        backbone = load_pretrained_repnext(backbone_name, weight_path)
-    else:
-        backbone = create_repnext(model_name=backbone_name, pretrained=False)
+    # Core backbone: RepNeXt-M3 distilled not fused (training mode) repnext_m3_distill_300e.pth
+    backbone = create_repnext(model_name=backbone_name, pretrained=True,weight_path=core_backbone_weight_path)
     backbone = backbone.to(device)
     in_channels_list = BACKBONE_CHANNELS[backbone_name]
 
-    # Pose backbone (separate, gradient-isolated)
-    pose_backbone = None
-    pose_channels = None
-    if pose_backbone_name is not None:
-        pose_backbone = create_repnext(
-            model_name=pose_backbone_name, pretrained=False)
-        pose_backbone = pose_backbone.to(device)
-        pose_channels = BACKBONE_CHANNELS[pose_backbone_name]
+    # Head Pose backbone RepNeXt-M1 distilled and not fused (training mode) repnext_m1_distill_300e.pth
+    pose_backbone = create_repnext(model_name=pose_backbone_name, pretrained=True,weight_path=pose_backbone)
+    pose_backbone = pose_backbone.to(device)
+    pose_channels = BACKBONE_CHANNELS[pose_backbone_name]
 
     model = RayNet(backbone, in_channels_list, n_landmarks=n_landmarks,
                    cross_view_cfg=cross_view_cfg,
