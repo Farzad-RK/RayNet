@@ -152,9 +152,13 @@ def geodesic_loss(pred_R, gt_R):
     R_diff = torch.bmm(pred_R.transpose(1, 2), gt_R)
     trace = R_diff[:, 0, 0] + R_diff[:, 1, 1] + R_diff[:, 2, 2]
 
-    # arccos((trace - 1) / 2), clamped for numerical stability
-    cos_angle = (trace - 1.0) / 2.0
-    cos_angle = cos_angle.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+    # arccos((trace - 1) / 2), clamped for numerical stability.
+    # Cast to float32 before acos: under BF16 autocast, a clamp margin of
+    # 1e-7 is below BF16 epsilon (~7.8e-3), so (1 - 1e-7) rounds to exactly
+    # 1.0, acos' derivative becomes -1/sqrt(0) = -inf, and every backward
+    # produces nan gradients on batch 1.
+    cos_angle = ((trace - 1.0) / 2.0).float()
+    cos_angle = cos_angle.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
     angle = torch.acos(cos_angle)
 
     return angle.mean()
