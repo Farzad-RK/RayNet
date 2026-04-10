@@ -755,8 +755,11 @@ def train(args):
         print("  Compiling model with torch.compile...")
         model = torch.compile(model)
 
-    # AMP scaler
-    scaler = GradScaler('cuda', enabled=hw['amp']) if hw['amp'] else None
+    # AMP scaler — ONLY for float16. BF16 has FP32 range, so loss scaling is
+    # unnecessary and actively harmful (the scaler misdetects inf gradients
+    # and silently skips every optimizer step, freezing training at init).
+    use_scaler = hw['amp'] and hw.get('amp_dtype', 'float16') == 'float16'
+    scaler = GradScaler('cuda', enabled=True) if use_scaler else None
 
     # --- Data loading ---
     # v3: multi-view is always active, so we create MV loader upfront.
