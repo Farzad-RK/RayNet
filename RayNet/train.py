@@ -99,9 +99,9 @@ HARDWARE_PROFILES = {
         'num_workers': 4,
         'pin_memory': True,
         'amp': True,
-        'amp_dtype': 'float16',
+        'amp_dtype': 'bfloat16',    # BF16: same range as FP32 → no exp/log overflow
         'grad_accum_steps': 1,      # effective batch = 288
-        'compile_model': True,      # Ada supports compile well
+        'compile_model': False,     # disabled: interacts badly with grad checkpointing
         'tf32': True,               # Ada supports TF32
         'prefetch_factor': 2,
         'persistent_workers': True,
@@ -114,9 +114,9 @@ HARDWARE_PROFILES = {
         'num_workers': 4,
         'pin_memory': True,
         'amp': True,
-        'amp_dtype': 'float16',
+        'amp_dtype': 'bfloat16',    # BF16: same range as FP32 → no exp/log overflow
         'grad_accum_steps': 1,      # effective batch = 288
-        'compile_model': True,
+        'compile_model': False,     # disabled: interacts badly with grad checkpointing
         'tf32': True,
         'prefetch_factor': 2,
         'persistent_workers': True,
@@ -434,6 +434,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
         if gt_head_t is not None:
             gt_head_t = gt_head_t.to(device, non_blocking=True)
 
+        mv_components = None
         # Forward pass with AMP autocast
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             predictions = model(images, n_views=n_views,
@@ -481,16 +482,6 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                 if torch.isfinite(mv_loss):
                     mv_weight = min(1.0, epoch / 10.0)  # smooth ramp
                     loss = loss + mv_weight * mv_loss
-                running_losses['reproj'] += mv_components['gaze_consist_loss'].item()
-                running_losses['mask'] += mv_components['shape_loss'].item()
-
-            # Track ray-to-target loss and pose loss
-            if 'ray_target_loss' in components:
-                running_losses['ray_target'] += components['ray_target_loss'].item()
-            if 'pose_loss' in components:
-                running_losses['pose'] += components['pose_loss'].item()
-            if 'translation_loss' in components:
-                running_losses['translation'] += components['translation_loss'].item()
 
             # Scale loss by accumulation steps
             loss = loss / grad_accum_steps
@@ -529,14 +520,23 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
 
         # Accumulate metrics (use unscaled loss); skip nan to prevent poisoning epoch avg
         batch_total = components['total_loss'].item()
-        if not (batch_total != batch_total):  # fast nan check
-            running_losses['total'] += batch_total
-            running_losses['landmark'] += components['landmark_loss'].item()
-            running_losses['angular'] += components['angular_loss'].item()
-            running_losses['angular_deg'] += components['angular_loss_deg'].item()
-            n_batches += 1
-        else:
+        if batch_total != batch_total:  # nan check
             log.warning("Epoch %d batch %d: nan loss detected, skipping metrics", epoch, step + 1)
+            continue
+        running_losses['total'] += batch_total
+        running_losses['landmark'] += components['landmark_loss'].item()
+        running_losses['angular'] += components['angular_loss'].item()
+        running_losses['angular_deg'] += components['angular_loss_deg'].item()
+        if mv_components is not None:
+            running_losses['reproj'] += mv_components['gaze_consist_loss'].item()
+            running_losses['mask'] += mv_components['shape_loss'].item()
+        if 'ray_target_loss' in components:
+            running_losses['ray_target'] += components['ray_target_loss'].item()
+        if 'pose_loss' in components:
+            running_losses['pose'] += components['pose_loss'].item()
+        if 'translation_loss' in components:
+            running_losses['translation'] += components['translation_loss'].item()
+        n_batches += 1
 
         # Per-batch CSV logging (high granularity)
         if batch_csv_writer is not None:
@@ -551,8 +551,8 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                 f"{components['total_loss'].item():.6f}",
                 f"{components['landmark_loss'].item():.6f}",
                 f"{components['angular_loss_deg'].item():.4f}",
-                f"{running_losses['reproj'] / n_batches:.6f}",
-                f"{running_losses['mask'] / n_batches:.6f}",
+                f"{running_losses['reproj'] / max(n_batches, 1):.6f}",
+                f"{running_losses['mask'] / max(n_batches, 1):.6f}",
                 f"{ray_val:.6f}",
                 f"{pose_val:.6f}",
                 f"{trans_val:.6f}",
@@ -562,7 +562,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
         # Progress logging
         total_batches = len(train_loader)
         if step == 0 or (step + 1) % max(1, total_batches // 10) == 0 or step + 1 == total_batches:
-            avg_loss = running_losses['total'] / n_batches
+            avg_loss = running_losses['total'] / max(n_batches, 1)
             print(f"  [Epoch {epoch}] batch {step+1}/{total_batches} "
                   f"loss={avg_loss:.4f}", flush=True)
 
@@ -784,7 +784,7 @@ def train(args):
     csv_file = open(csv_path, 'w', newline='')
     csv_writer = csv.writer(csv_file)
     csv_writer.writerow([
-        'epoch', 'phase', 'lr',
+        'epoch', 'stage', 'phase', 'lr',
         'train_total', 'train_landmark', 'train_angular_deg',
         'train_reproj', 'train_mask', 'train_ray_target', 'train_pose',
         'train_translation',
@@ -926,7 +926,7 @@ def train(args):
             print(f"  GPU memory peak: {mem_gb:.1f} GB")
 
         csv_writer.writerow([
-            epoch, phase, f"{current_lr:.2e}",
+            epoch, args.stage, phase, f"{current_lr:.2e}",
             f"{train_losses['total']:.6f}",
             f"{train_losses['landmark']:.6f}",
             f"{train_losses['angular_deg']:.4f}",
@@ -984,13 +984,15 @@ def train(args):
                     scheduler=scheduler, scaler=scaler, phase=phase,
                     train_metrics=train_losses, val_metrics=val_losses,
                 )
-            # Upload batch log after each epoch (survives interruption)
+            # Upload logs after each epoch (survives interruption/crash)
             try:
                 batch_csv_file.flush()
-                log_key = f"{args.ckpt_prefix}/{ckpt_mgr.run_id}/batch_log.csv"
-                ckpt_mgr._client.fput_object(args.ckpt_bucket, log_key, batch_csv_path)
-            except Exception:
-                pass  # non-critical
+                csv_file.flush()
+                for local_path in (batch_csv_path, csv_path):
+                    log_key = f"{args.ckpt_prefix}/{ckpt_mgr.run_id}/{os.path.basename(local_path)}"
+                    ckpt_mgr._client.fput_object(args.ckpt_bucket, log_key, local_path)
+            except Exception as e:
+                log.warning("MinIO log upload failed: %s", e)
         else:
             if epoch % args.ckpt_every == 0:
                 save_dict = {

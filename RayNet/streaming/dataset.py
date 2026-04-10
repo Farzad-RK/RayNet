@@ -113,6 +113,35 @@ class StreamingGazeGeneDataset(_Base):
         }
 
 
+class NonEmptyBatchLoader:
+    """Wraps a DataLoader, transparently skipping empty batches.
+
+    When ``samples_per_subject`` filters out all samples in a micro-batch,
+    the collate_fn returns an empty dict ``{}``. This wrapper silently
+    drops those so the training loop sees a clean sequence of real batches:
+    batch counters and gradient-accumulation boundaries stay consistent.
+
+    ``__len__`` is an UPPER BOUND (the underlying loader's length) because
+    the actual number of non-empty batches per epoch depends on filtering
+    and cannot be known ahead of iteration.
+    """
+
+    def __init__(self, loader):
+        self._loader = loader
+
+    def __iter__(self):
+        for batch in self._loader:
+            if batch and len(batch) > 0:
+                yield batch
+
+    def __len__(self):
+        return len(self._loader)
+
+    @property
+    def dataset(self):
+        return self._loader.dataset
+
+
 def _collate_fn(batch):
     """Collate matching gazegene_collate_fn format."""
 
@@ -228,6 +257,15 @@ def create_streaming_dataloaders(
         train_dataset, batch_size=batch_size, **loader_kwargs)
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, **loader_kwargs)
+
+    # Wrap with empty-batch skipper when samples_per_subject filtering is on.
+    # Without this, fully-filtered batches reach the training loop and pollute
+    # step counters, batch_log.csv row numbering, and gradient-accumulation
+    # boundaries (they are handled via `continue`, but at the cost of wasted
+    # iterations and confusing logs).
+    if samples_per_subject is not None:
+        train_loader = NonEmptyBatchLoader(train_loader)
+        val_loader = NonEmptyBatchLoader(val_loader)
 
     return train_loader, val_loader
 
