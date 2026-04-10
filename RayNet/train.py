@@ -527,12 +527,16 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
             else:
                 optimizer.zero_grad()
 
-        # Accumulate metrics (use unscaled loss)
-        running_losses['total'] += components['total_loss'].item()
-        running_losses['landmark'] += components['landmark_loss'].item()
-        running_losses['angular'] += components['angular_loss'].item()
-        running_losses['angular_deg'] += components['angular_loss_deg'].item()
-        n_batches += 1
+        # Accumulate metrics (use unscaled loss); skip nan to prevent poisoning epoch avg
+        batch_total = components['total_loss'].item()
+        if not (batch_total != batch_total):  # fast nan check
+            running_losses['total'] += batch_total
+            running_losses['landmark'] += components['landmark_loss'].item()
+            running_losses['angular'] += components['angular_loss'].item()
+            running_losses['angular_deg'] += components['angular_loss_deg'].item()
+            n_batches += 1
+        else:
+            log.warning("Epoch %d batch %d: nan loss detected, skipping metrics", epoch, step + 1)
 
         # Per-batch CSV logging (high granularity)
         if batch_csv_writer is not None:
@@ -635,7 +639,10 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
         pred_coords_px = pred_coords * (img_size / feat_size)
         lm_px_error = torch.mean(torch.norm(pred_coords_px - gt_landmarks_px, dim=-1))
 
-        running_losses['total'] += components['total_loss'].item()
+        batch_total = components['total_loss'].item()
+        if batch_total != batch_total:  # nan check
+            continue
+        running_losses['total'] += batch_total
         running_losses['landmark'] += components['landmark_loss'].item()
         running_losses['angular'] += components['angular_loss'].item()
         running_losses['angular_deg'] += components['angular_loss_deg'].item()

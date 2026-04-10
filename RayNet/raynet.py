@@ -214,7 +214,7 @@ class PoseEncoder(nn.Module):
         # Normalize
         tx = torch.tanh(t_raw[:, 0:1])  # [-1, 1]
         ty = torch.tanh(t_raw[:, 1:2])  # [-1, 1]
-        tz = torch.exp(t_raw[:, 2:3])  # (0, +inf) depth
+        tz = torch.exp(t_raw[:, 2:3].clamp(max=10.0))  # (0, ~22026] depth, safe for float16
 
         pred_pose_t = torch.cat([tx, ty, tz], dim=-1)
         return pose_feat, pred_pose_6d, pred_pose_t
