@@ -506,13 +506,22 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
         if (step + 1) % grad_accum_steps == 0:
             if has_accumulated:
                 if scaler is not None:
+                    # FP16 path: scaler handles inf/nan detection internally
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
-                    optimizer.step()
+                    # FP32 / BF16 path: manually check grad norm and skip step
+                    # if non-finite (BF16 has no scaler to catch overflow/nan)
+                    total_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_norm=max_norm)
+                    if torch.isfinite(total_norm):
+                        optimizer.step()
+                    else:
+                        log.warning("Epoch %d batch %d: non-finite grad norm "
+                                    "(%s), skipping optimizer step",
+                                    epoch, step + 1, total_norm.item())
                 optimizer.zero_grad()
                 has_accumulated = False
             else:
@@ -575,8 +584,10 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
-                optimizer.step()
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=max_norm)
+                if torch.isfinite(total_norm):
+                    optimizer.step()
             optimizer.zero_grad()
 
     for k in running_losses:

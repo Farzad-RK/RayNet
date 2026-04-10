@@ -108,7 +108,7 @@ def rotation_6d_to_matrix(r6d):
     a2 = r6d[:, 3:6]  # second column
 
     # Gram-Schmidt: orthogonalize and normalize
-    b1 = F.normalize(a1, dim=-1)
+    b1 = F.normalize(a1, dim=-1, eps=1e-6)
     b2 = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
     b2 = F.normalize(b2, dim=-1, eps=1e-6)
     b3 = torch.cross(b1, b2, dim=-1)
