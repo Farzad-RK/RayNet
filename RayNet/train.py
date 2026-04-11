@@ -193,6 +193,31 @@ HARDWARE_PROFILES = {
 #            If bridge hurts: val gaze worse than Stage 2 → remove bridge.
 #   Anomaly: Bridge loss oscillating wildly = crop augmentation poisoning.
 
+#
+# -----------------------------------------------------------------------------
+# IMPORTANT — meaning of the `multiview` flag in phase configs below:
+#
+#   `multiview` does NOT control whether CrossViewAttention runs. It ONLY
+#   gates the auxiliary `multiview_consistency_loss` (which adds
+#   `lam_reproj` gaze-consistency and `lam_mask` shape terms).
+#
+#   CrossViewAttention itself is *always active during training* when
+#   --mv_groups > 1, regardless of the phase's `multiview` setting. This is
+#   because the MDS dataloader is constructed once before the phase loop,
+#   producing 9-grouped multi-view batches, and `active_n_views` is
+#   hardcoded to 9 at train.py:active_n_views (only suppressed by the
+#   --no_multiview CLI ablation flag).
+#
+#   Validation uses n_views=1, so CrossViewAttention, camera embeddings,
+#   and the PoseEncoder features ALL bypass during validation. This creates
+#   a deliberate train/val asymmetry: training sees fused 9-view geometry,
+#   val sees single-view — val metrics are therefore a strict lower bound
+#   on what the model is actually capable of at inference with multi-view.
+#
+#   If you truly want a "no multi-view fusion" phase, pass --no_multiview
+#   on the CLI (not the `multiview: False` config flag).
+# -----------------------------------------------------------------------------
+
 STAGE_CONFIGS = {
     # ---- Stage 1: Landmark + Pose baseline ----
     1: {
@@ -229,6 +254,11 @@ STAGE_CONFIGS = {
     },
 
     # ---- Stage 2: Add gaze, NO bridge ----
+    # Revised to address warmstart shock from Stage 1:
+    #  - S2P1 LR is now 3e-4 (not 1e-3) to avoid disrupting converged weights.
+    #  - Sigma is monotonically tightened 1.5 → 1.3 → 1.0 (no 1.5 → 2.0 reset).
+    #  - S2P3 keeps lam_lm=1.0 instead of halving it (don't weaken landmark
+    #    supervision at the same time the target sharpens).
     2: {
         1: {
             'epochs': (1, 5),
@@ -239,11 +269,11 @@ STAGE_CONFIGS = {
             'lam_ray': 0.0,
             'lam_pose': 0.5,
             'lam_trans': 0.5,
-            'lr': 1e-3,
-            'sigma': 2.0,
-            'multiview': False,
+            'lr': 3e-4,                 # continuation LR, not cold-start 1e-3
+            'sigma': 1.5,               # continue from Stage-1 endpoint
+            'multiview': False,         # aux MV losses off (CVA still active)
             'no_bridge': True,
-            'description': 'S2P1: Landmark + pose + gaze warmup (no bridge)',
+            'description': 'S2P1: Gaze warmup from Stage-1 weights (no bridge)',
         },
         2: {
             'epochs': (6, 15),
@@ -254,15 +284,15 @@ STAGE_CONFIGS = {
             'lam_ray': 0.1,
             'lam_pose': 0.5,
             'lam_trans': 0.5,
-            'lr': 5e-4,
-            'sigma': 1.5,
-            'multiview': True,
+            'lr': 3e-4,                 # smoother continuation from P1
+            'sigma': 1.3,               # monotonic tightening
+            'multiview': True,          # aux MV consistency losses on
             'no_bridge': True,
-            'description': 'S2P2: Balanced training + multi-view + ray (no bridge)',
+            'description': 'S2P2: Balanced + ray + MV aux losses (no bridge)',
         },
         3: {
             'epochs': (16, 25),
-            'lam_lm': 0.5,
+            'lam_lm': 1.0,              # keep landmark strong (was 0.5)
             'lam_gaze': 1.0,
             'lam_reproj': 0.1,
             'lam_mask': 0.05,
@@ -270,10 +300,10 @@ STAGE_CONFIGS = {
             'lam_pose': 0.5,
             'lam_trans': 0.5,
             'lr': 1e-4,
-            'sigma': 1.0,
+            'sigma': 1.0,               # tightest landmark target
             'multiview': True,
             'no_bridge': True,
-            'description': 'S2P3: Gaze-focused fine-tuning (no bridge)',
+            'description': 'S2P3: Gaze fine-tuning, landmark weight preserved',
         },
     },
 
@@ -776,8 +806,13 @@ def train(args):
     # v3: multi-view is always active, so we create MV loader upfront.
     # Three modes: local disk, MDS streaming (MosaicML + MinIO), WebDataset streaming
     if args.mds_streaming:
-        _, val_loader = _create_mds_loaders(args, hw)
-        train_loader_mv = _create_mds_mv_loader(args, hw)
+        # Build MV loaders for BOTH train and val. The single-view val loader
+        # from _create_mds_loaders was previously used here, which forced
+        # validation to run with n_views=1 — bypassing CrossViewAttention,
+        # cam_embed, and PoseEncoder fusion. That made val gaze metrics
+        # uninformative. We now validate under the same multi-view topology
+        # the model is trained with.
+        train_loader_mv, val_loader = _create_mds_mv_loader(args, hw)
         streaming_mode = False
     elif args.streaming:
         _create_streaming_loaders(args, hw)
@@ -931,7 +966,12 @@ def train(args):
             active_train_loader = train_loader_mv
             active_val_loader = val_loader
 
-        # n_views for CrossViewAttention (9 for multi-view, 1 if ablation)
+        # n_views for CrossViewAttention during TRAINING.
+        # NOTE: this is independent of cfg['multiview']. CrossViewAttention
+        # runs whenever mv_groups > 1 (which produces 9-grouped batches).
+        # cfg['multiview'] only gates the auxiliary multiview_consistency_loss
+        # inside train_one_epoch — see header comment on STAGE_CONFIGS above.
+        # Pass --no_multiview on the CLI to truly ablate cross-view fusion.
         active_n_views = 1 if args.no_multiview else 9
 
         # Train
@@ -946,12 +986,17 @@ def train(args):
         )
         batch_csv_file.flush()
 
-        # Validate (always single-view)
+        # Validate with the SAME multi-view topology used in training.
+        # Previously hardcoded to n_views=1, which bypassed CrossViewAttention,
+        # camera embeddings, and the PoseEncoder fusion path — producing
+        # uninformative val gaze metrics. The val loader now delivers
+        # 9-grouped batches (see _create_mds_mv_loader), so the reshape
+        # inside CrossViewAttention is well-defined.
         val_losses = validate(
             model, active_val_loader, device, epoch, cfg,
             amp_enabled=hw['amp'],
             amp_dtype=amp_dtype,
-            n_views=1,
+            n_views=active_n_views,
         )
 
         # Step scheduler
@@ -1163,10 +1208,18 @@ def _create_mds_loaders(args, hw):
 
 
 def _create_mds_mv_loader(args, hw):
-    """Create multi-view MDS loader lazily (only called when Phase 2 starts)."""
+    """Create multi-view MDS loaders (both train and val).
+
+    Returns (train_loader_mv, val_loader_mv). The MV val loader delivers
+    batches of mv_groups * 9 samples in (subject, frame, cam) order so
+    that CrossViewAttention, cam_embed, and PoseEncoder features are
+    exercised during validation — matching the training forward pass.
+    Without this, validation bypasses all multi-view fusion (n_views=1)
+    and val gaze metrics are a pessimistic lower bound that never moves.
+    """
     from RayNet.streaming.dataset import create_multiview_streaming_dataloaders
 
-    # Same augmentation as single-view loader
+    # Same augmentation as single-view loader (train only)
     from torchvision import transforms as T
     train_transform = T.Compose([
         T.ColorJitter(brightness=0.4, contrast=0.4,
@@ -1174,8 +1227,8 @@ def _create_mds_mv_loader(args, hw):
         T.RandomAffine(degrees=0, translate=(0.05, 0.05)),
     ])
 
-    print("Creating multi-view MDS streaming loader...")
-    train_loader_mv, _ = create_multiview_streaming_dataloaders(
+    print("Creating multi-view MDS streaming loaders (train + val)...")
+    train_loader_mv, val_loader_mv = create_multiview_streaming_dataloaders(
         remote_train=args.mds_train,
         remote_val=args.mds_val,
         local_cache=os.path.join(args.output_dir, 'mds_cache_mv'),
@@ -1187,7 +1240,7 @@ def _create_mds_mv_loader(args, hw):
         persistent_workers=hw['persistent_workers'],
         samples_per_subject=args.samples_per_subject,
     )
-    return train_loader_mv
+    return train_loader_mv, val_loader_mv
 
 
 def _create_streaming_loaders(args, hw):
