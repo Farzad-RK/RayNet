@@ -1,4 +1,4 @@
-# Architecture
+    # Architecture
 
 RayNet v4.1 is a multi-task architecture with two gradient-isolated backbones. It predicts 14 eye landmarks, optical axis direction, and implicit head pose (9D: 6D rotation + 3D translation) from a 224x224 face crop.
 

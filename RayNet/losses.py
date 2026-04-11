@@ -194,6 +194,20 @@ def ray_target_loss(pred_gaze, eyeball_center, gaze_target, gaze_depth):
     explicit geometric constraint that ties gaze direction to a
     physical target location.
 
+    IMPORTANT — scale-invariant formulation:
+        The naive version `F.l1_loss(origin + depth * dir, target)` is
+        position-space L1 in whatever unit gaze_depth is stored in. For
+        the GazeGene data used here, raw values reach 10^4 magnitude, so
+        this loss overwhelms every other term the moment it turns on
+        (previously epoch 6 of Stage 2 P2, where ray_target jumped to
+        ~7000–26000 per batch and poisoned the shared backbone).
+
+        We normalize by per-sample gaze_depth before the L1. This makes
+        the loss numerically equivalent to a bounded angular-error term
+        on the ray endpoint, independent of scene scale / units:
+            |origin/depth + dir - target/depth|
+        which is O(|pred_gaze - unit_direction_to_target|).
+
     Args:
         pred_gaze: (B, 3) predicted gaze direction (unit vector)
         eyeball_center: (B, 3) eyeball center in CCS (ray origin)
@@ -201,11 +215,18 @@ def ray_target_loss(pred_gaze, eyeball_center, gaze_target, gaze_depth):
         gaze_depth: (B,) ground-truth depth along gaze ray
 
     Returns:
-        loss: scalar ray-target consistency loss
+        loss: scalar, O(1) regardless of gaze_depth unit/magnitude
     """
-    # Reconstruct target: target_hat = origin + depth * direction
-    target_hat = eyeball_center + gaze_depth.unsqueeze(-1) * pred_gaze  # (B, 3)
-    return F.l1_loss(target_hat, gaze_target)
+    # Clamp depth to avoid division explosions on any pathological samples
+    # (zero/negative depth shouldn't exist in GT, but be defensive in BF16).
+    depth = gaze_depth.unsqueeze(-1).clamp(min=1.0)  # (B, 1)
+
+    # Reconstruct target in depth-normalized coordinates:
+    #   target_hat / depth = eyeball_center / depth + pred_gaze
+    #   gaze_target / depth (the GT reference)
+    target_hat_norm = eyeball_center / depth + pred_gaze          # (B, 3)
+    gaze_target_norm = gaze_target / depth                        # (B, 3)
+    return F.l1_loss(target_hat_norm, gaze_target_norm)
 
 
 def angular_error(pred_gaze, gt_gaze):
