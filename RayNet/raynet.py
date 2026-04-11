@@ -147,9 +147,9 @@ class PoseEncoder(nn.Module):
 
     Translation normalization:
       - tx = tanh(raw) → [-1, 1]  (image-plane horizontal offset)
-      - ty = tanh(raw) → [-1, 1]  (image-plane vertical offset)
-      - tz = exp(raw)  → (0, +∞)  (depth, trained in log-space for scale invariance)
-      GT must be pre-normalized to match: tx,ty in [-1,1], tz as positive depth.
+      - Translation (tx, ty, tz) is output as a raw Linear activation and
+        interpreted directly as metric translation in METERS. GT head_t is
+        converted cm→m inside translation_loss, so no activation saturates.
 
     At inference, the learned features capture head pose without any
     explicit input — no external head pose estimator needed.
@@ -159,7 +159,7 @@ class PoseEncoder(nn.Module):
                                                         → pose_head(d_model→9)
 
     9D output: 6D rotation (first two columns of R, Gram-Schmidt) + 3D
-    translation (tanh-normalized xy + exp-normalized depth).
+    translation (raw linear, interpreted as meters).
 
     ~4.8M + 0.1M params (backbone + CoordAtt + projection + aux head).
     """
@@ -208,15 +208,13 @@ class PoseEncoder(nn.Module):
         pose_out = self.pose_head(pose_feat)         # (B, 9)
         pred_pose_6d = pose_out[:, :6]
 
-        # Raw translation
-        t_raw = pose_out[:, 6:]  # (B, 3)
-
-        # Normalize
-        tx = torch.tanh(t_raw[:, 0:1])  # [-1, 1]
-        ty = torch.tanh(t_raw[:, 1:2])  # [-1, 1]
-        tz = torch.exp(t_raw[:, 2:3].clamp(max=10.0))  # (0, ~22026] depth, safe for float16
-
-        pred_pose_t = torch.cat([tx, ty, tz], dim=-1)
+        # Raw linear translation in metric units (meters).
+        # The earlier version applied tanh(xy) + exp(z), which physically
+        # clipped xy predictions to [-1, 1] while GT head_t is in cm. That
+        # made the loss unable to match GT and plateaued at ~mean(|gt_xy|) - 1
+        # with dead gradients at tanh saturation. Direct linear output pairs
+        # with a cm→m SmoothL1 loss (see losses.translation_loss).
+        pred_pose_t = pose_out[:, 6:]  # (B, 3)
         return pose_feat, pred_pose_6d, pred_pose_t
 
 

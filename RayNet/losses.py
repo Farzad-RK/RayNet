@@ -325,34 +325,33 @@ def total_loss(pred_hm, pred_coords, pred_gaze,
     return total, components
 
 
-def translation_loss(pred_t, gt_t, eps=1e-6):
+def translation_loss(pred_t, gt_t, gt_scale_cm_per_m=100.0):
     """
-    Translation loss with log-depth normalization.
+    Direct-metric SmoothL1 translation loss in METERS.
 
-    gt_t must be:
-      - tx, ty normalized to [-1, 1]
-      - tz in metric depth (positive)
+    pred_t is the raw Linear output of the pose head, interpreted as
+    translation in meters. gt_t is GazeGene CCS head translation in
+    CENTIMETERS — we divide by `gt_scale_cm_per_m` on the fly so both
+    sides live in the same metric space with O(0.1-1) magnitudes.
+
+    Why this replaces the earlier tanh(xy) + exp(z) / log-space split:
+        The previous head applied tanh on xy, clipping predictions to
+        [-1, 1] while GT head_t sits in cm (typical |tx|, |ty| = 5-30 cm,
+        |tz| = 40-100 cm). The loss was mathematically incapable of
+        matching GT: at best it plateaued at ~mean(|gt_xy|) - 1, with
+        gradients killed by tanh saturation. Observed plateau in
+        run_20260411_050522 was 0.93 over 20 epochs of active training.
+
+        Direct SmoothL1 on an unbounded linear head restores full range,
+        Huber-clips outliers, and gives O(1) gradients everywhere.
 
     Args:
-        pred_t: (B, 3) predicted translation
-        gt_t: (B, 3) ground-truth translation
+        pred_t: (B, 3) predicted translation in meters (raw linear head)
+        gt_t:   (B, 3) GT translation in centimeters (GazeGene convention)
+        gt_scale_cm_per_m: cm→m conversion factor (default 100.0)
 
     Returns:
-        loss: scalar
+        loss: scalar SmoothL1, units of meters
     """
-    pred_xy = pred_t[:, :2]
-    pred_z = pred_t[:, 2:3]
-
-    gt_xy = gt_t[:, :2]
-    gt_z = gt_t[:, 2:3]
-
-    # XY (image-plane)
-    loss_xy = F.smooth_l1_loss(pred_xy, gt_xy)
-
-    # Z (log space → scale invariant)
-    pred_z = pred_z.clamp(min=eps)
-    gt_z = gt_z.clamp(min=eps)
-
-    loss_z = F.smooth_l1_loss(torch.log(pred_z), torch.log(gt_z))
-
-    return loss_xy + loss_z
+    gt_m = gt_t / gt_scale_cm_per_m
+    return F.smooth_l1_loss(pred_t, gt_m)

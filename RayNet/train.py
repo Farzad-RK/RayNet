@@ -916,6 +916,22 @@ def train(args):
         src_epoch = ws_state.get('epoch', '?')
         print(f"  Loaded weights from stage {src_stage} epoch {src_epoch}. "
               f"Starting fresh optimizer at epoch 1 of stage {args.stage}.")
+
+        # Translation loss formulation changed (tanh/exp → direct linear
+        # meters). The old pose_head rows 6:9 were trained for the prior
+        # interpretation and would output garbage under the new loss.
+        # Zero-init those rows while keeping rotation rows 0:6 (which
+        # converged cleanly to ~0.015 rad geodesic). With zeroed
+        # weight+bias, initial translation prediction is (0,0,0) m and
+        # gradient flow resumes normally from the first batch.
+        if (args.reset_pose_translation and hasattr(target, 'pose_encoder')
+                and hasattr(target.pose_encoder, 'pose_head')):
+            with torch.no_grad():
+                target.pose_encoder.pose_head.weight[6:].zero_()
+                target.pose_encoder.pose_head.bias[6:].zero_()
+            print("  [warmstart] Reset pose_head translation rows (6:9) "
+                  "to zero — translation loss reformulated to direct "
+                  "cm→m SmoothL1. Rotation rows (0:6) preserved.")
         # start_epoch stays at 1, optimizer/scheduler stay None — they will
         # be created in the phase-transition block below exactly like a
         # from-scratch run.
@@ -1376,6 +1392,12 @@ def parse_args():
     parser.add_argument('--warmstart_checkpoint', type=str, default='best_model.pt',
                         help='Checkpoint file to pull from --warmstart_from run '
                              '(default: best_model.pt)')
+    parser.add_argument('--reset_pose_translation', action='store_true',
+                        help='After warmstart, zero-init pose_head rows 6:9 '
+                             '(translation). Use when the translation loss '
+                             'formulation changed between the source run and '
+                             'the current code (e.g. tanh/exp → direct '
+                             'cm→m SmoothL1). Rotation rows 0:6 are preserved.')
 
     args = parser.parse_args()
 
