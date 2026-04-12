@@ -960,7 +960,7 @@ def train(args):
         if args.gaze_only:
             cfg['lam_lm'] = 0.0
 
-        # Phase transition: update optimizer and scheduler
+        # Phase transition: update LR schedule, keep optimizer state
         if phase != current_phase:
             current_phase = phase
             print(f"\n{'='*60}")
@@ -974,13 +974,29 @@ def train(args):
                       f"lam_shape={cfg['lam_mask']}")
             print(f"{'='*60}")
 
-            optimizer = optim.AdamW(
-                model.parameters(),
-                lr=cfg['lr'],
-                betas=(0.5, 0.95),
-                weight_decay=1e-4,
-            )
             phase_start, phase_end = cfg['epochs']
+
+            if optimizer is None:
+                # First phase of the stage: create fresh optimizer
+                optimizer = optim.AdamW(
+                    model.parameters(),
+                    lr=cfg['lr'],
+                    betas=(0.5, 0.95),
+                    weight_decay=1e-4,
+                )
+                print(f"  Created new AdamW optimizer (lr={cfg['lr']})")
+            else:
+                # Subsequent phases: carry over optimizer state (momentum +
+                # adaptive second-moment estimates), only update the LR.
+                # Recreating AdamW here would zero out m and v, causing a
+                # destructive transient: raw-gradient steps at peak LR with
+                # no per-parameter scaling — the "phase shock" that wastes
+                # ~4 epochs recovering each time.
+                for pg in optimizer.param_groups:
+                    pg['lr'] = cfg['lr']
+                    pg['initial_lr'] = cfg['lr']  # CosineAnnealingLR reads this
+                print(f"  Carried over optimizer state, updated LR → {cfg['lr']}")
+
             scheduler = CosineAnnealingLR(
                 optimizer,
                 T_max=phase_end - phase_start + 1,
