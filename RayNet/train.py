@@ -312,17 +312,17 @@ STAGE_CONFIGS = {
         1: {
             'epochs': (1, 5),
             'lam_lm': 1.0,
-            'lam_gaze': 0.1,
+            'lam_gaze': 0.3,           # was 0.1 — too weak, couldn't protect gaze
             'lam_reproj': 0.0,
             'lam_mask': 0.0,
             'lam_ray': 0.0,
             'lam_pose': 0.5,
             'lam_trans': 0.5,
-            'lr': 1e-3,
+            'lr': 3e-4,                # was 1e-3 — too aggressive for warmed weights
             'sigma': 2.0,
             'multiview': False,
             'no_bridge': False,
-            'description': 'S3P1: Full pipeline warmup (with bridge)',
+            'description': 'S3P1: Bridge warmup (zero-init out_proj, gentle LR)',
         },
         2: {
             'epochs': (6, 15),
@@ -333,7 +333,7 @@ STAGE_CONFIGS = {
             'lam_ray': 0.1,
             'lam_pose': 0.5,
             'lam_trans': 0.5,
-            'lr': 5e-4,
+            'lr': 3e-4,                # was 5e-4 — aligned with S2 proven LR
             'sigma': 1.5,
             'multiview': True,
             'no_bridge': False,
@@ -932,6 +932,18 @@ def train(args):
             print("  [warmstart] Reset pose_head translation rows (6:9) "
                   "to zero — translation loss reformulated to direct "
                   "cm→m SmoothL1. Rotation rows (0:6) preserved.")
+        # Zero-init LandmarkGazeBridge out_proj so it starts as an identity
+        # (skip connection). The bridge was disabled in earlier stages, so its
+        # weights in the checkpoint are untrained random init. Loading them
+        # overwrites the zero-init from __init__ — we must re-apply it here.
+        if (args.reset_bridge and hasattr(target, 'landmark_gaze_bridge')
+                and hasattr(target.landmark_gaze_bridge, 'cross_attn')):
+            with torch.no_grad():
+                target.landmark_gaze_bridge.cross_attn.out_proj.weight.zero_()
+                target.landmark_gaze_bridge.cross_attn.out_proj.bias.zero_()
+            print("  [warmstart] Zero-init bridge out_proj — bridge starts "
+                  "as identity (skip connection), learns gradually.")
+
         # start_epoch stays at 1, optimizer/scheduler stay None — they will
         # be created in the phase-transition block below exactly like a
         # from-scratch run.
@@ -1398,6 +1410,12 @@ def parse_args():
                              'formulation changed between the source run and '
                              'the current code (e.g. tanh/exp → direct '
                              'cm→m SmoothL1). Rotation rows 0:6 are preserved.')
+    parser.add_argument('--reset_bridge', action='store_true',
+                        help='After warmstart, zero-init LandmarkGazeBridge '
+                             'out_proj so the bridge starts as a pure identity '
+                             '(skip connection). Required when transitioning '
+                             'to a stage with bridge enabled from a stage '
+                             'where bridge was disabled (e.g. Stage 2 → 3).')
 
     args = parser.parse_args()
 

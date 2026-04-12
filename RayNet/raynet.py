@@ -241,6 +241,14 @@ class LandmarkGazeBridge(nn.Module):
         self.norm_q = nn.LayerNorm(d_model)
         self.norm_kv = nn.LayerNorm(d_model)
 
+        # Zero-init the output projection so the bridge starts as a pure
+        # identity (skip connection).  residual = p5_pooled + 0 = p5_pooled.
+        # Without this, randomly-initialized out_proj injects noise that
+        # destroys the gaze pathway when the bridge is first enabled after
+        # stages where it was disabled (the "cold bridge" problem).
+        nn.init.zeros_(self.cross_attn.out_proj.weight)
+        nn.init.zeros_(self.cross_attn.out_proj.bias)
+
     def forward(self, p5_pooled, p2_feat):
         """
         Args:
