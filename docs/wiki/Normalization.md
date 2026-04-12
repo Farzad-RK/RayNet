@@ -1,54 +1,70 @@
 # Normalization
 
-RayNet uses **per-frame image normalization** (Zhang et al. 2018) to remove depth ambiguity from the learning task. Every eye crop is warped to a virtual camera at a canonical distance and focal length.
+RayNet v4 uses **Easy-Norm** (MAGE, Bao et al. CVPR 2025) for image normalization. Unlike the previous Zhang et al. 2018 approach, Easy-Norm requires only the face center (from bounding box or landmarks) — no head pose needed.
+
+This is critical for the GazeGene dataset, where random translation and scaling augmentation during face cropping breaks camera intrinsics, making traditional Zhang normalization invalid.
 
 **Source**: `RayNet/normalization.py`
 
-## Why Normalize?
+## Why Easy-Norm?
 
-Without normalization, the same eye at different distances produces images of different scales. The network would need to implicitly learn depth estimation before it can localize landmarks or estimate gaze. Normalization removes this confound by placing every eye at the same virtual distance.
+| Property | Zhang Normalization | Easy-Norm |
+|----------|-------------------|-----------|
+| Requires head pose | Yes (R_head, t_eye) | **No** |
+| Requires accurate K | Yes | Tolerant of augmented K |
+| Works with GazeGene crops | No (intrinsics broken) | **Yes** |
+| Rotation | Full 3D warp | Z-axis toward face center |
 
 ## Parameters
 
 | Parameter | Value | Meaning |
 |-----------|-------|---------|
-| `d_norm` | 600 mm | Canonical distance from camera to eye |
 | `f_norm` | 960 px | Canonical focal length |
+| `d_norm` | 600 mm | Canonical distance from camera to face |
 | `img_size` | 224 px | Output image dimensions |
 
-## Step-by-Step Pipeline
+## Split Pipeline
+
+RayNet v4 uses task-specific normalization:
+
+| Task | Normalization | Reason |
+|------|--------------|--------|
+| **Gaze regression** | Full (rotation + scaling) | Remove head pose confound |
+| **Iris/pupil landmarks** | Partial (scaling only, no roll) | Preserve iris appearance, avoid OCR artifacts |
+| **3D geometry (triangulation)** | None | Stay in original CCS, avoid z-axis distortion |
+
+## Easy-Norm Pipeline
 
 ### Input
 
-- `image`: Original camera frame (H, W, 3) BGR
-- `K`: Camera intrinsic matrix (3, 3)
-- `R_head`: Head rotation matrix (3, 3) in camera coords
-- `t_eye`: Eye center position (3,) in camera coords (mm)
+- `image`: Face crop (H, W, 3) BGR
+- `K`: Camera intrinsic matrix (3, 3) — can be approximate
+- `t_face`: Face center position (3,) in camera coordinates
 
-### 1. Distance-Based Scaling
-
-Compute the actual distance and build a scaling matrix:
+### 1. Face Distance
 
 ```
-z_actual = ||t_eye||
-S = diag([1, 1, d_norm / z_actual])
+z_actual = ||t_face||
 ```
-
-This scales the Z-axis to move the eye from its actual distance to the canonical distance.
 
 ### 2. Virtual Camera Rotation
 
-Build a rotation matrix so the virtual camera directly faces the eye center:
+Build a rotation matrix so the virtual camera's z-axis points at the face center:
 
 ```
-z_axis = t_eye / z_actual              # points toward eye
-x_axis = cross([0, 1, 0], z_axis)     # horizontal
-x_axis = x_axis / ||x_axis||
-y_axis = cross(z_axis, x_axis)        # vertical
+z_axis = t_face / ||t_face||
+x_axis = cross([0, 1, 0], z_axis) / ||cross||
+y_axis = cross(z_axis, x_axis)
 R_norm = stack([x_axis, y_axis, z_axis])   # (3, 3)
 ```
 
-### 3. Canonical Intrinsics
+### 3. Depth Scaling
+
+```
+S = diag([1, 1, d_norm / z_actual])
+```
+
+### 4. Canonical Intrinsics
 
 ```
 K_norm = [f_norm,  0,       112]     # 112 = 224 / 2
@@ -56,12 +72,10 @@ K_norm = [f_norm,  0,       112]     # 112 = 224 / 2
          [0,       0,       1  ]
 ```
 
-### 4. Perspective Warp
-
-Combine into a single homography:
+### 5. Homography
 
 ```
-M = K_norm @ R_norm @ S @ K_inv
+M = K_norm @ S @ R_norm @ K_inv
 ```
 
 Apply to the image:
@@ -72,12 +86,11 @@ img_norm = cv2.warpPerspective(image, M, (224, 224))
 
 ### Output
 
-- `img_norm`: (224, 224, 3) normalized eye crop
-- `R_norm`: (3, 3) the normalization rotation matrix (needed for denormalization)
+- `img_norm`: (224, 224, 3) normalized face image
+- `R_norm`: (3, 3) normalization rotation (for gaze vector transform)
+- `M_inv`: (3, 3) inverse homography (for denormalization)
 
 ## Gaze Direction Transformation
-
-Gaze directions must be transformed between camera space and normalized space:
 
 ### Camera -> Normalized (training)
 
@@ -86,8 +99,6 @@ gaze_norm = R_norm @ gaze_cam
 gaze_norm = gaze_norm / ||gaze_norm||
 ```
 
-The network is trained to predict gaze in **normalized space**.
-
 ### Normalized -> Camera (inference)
 
 ```python
@@ -95,50 +106,34 @@ gaze_cam = R_norm^T @ gaze_norm
 gaze_cam = gaze_cam / ||gaze_cam||
 ```
 
-## Landmark Warping
+## Partial Normalization (Landmarks)
 
-2D landmarks in the original image are warped to normalized space using the same homography M:
+For landmark detection, only depth scaling is applied (no rotation):
 
 ```python
-# Homogeneous coordinates
-pts_h = [u, v, 1]^T
-warped_h = M @ pts_h
-warped = warped_h[:2] / warped_h[2]    # dehomogenize
+S_partial = diag([d_norm / z_actual, d_norm / z_actual, 1])
+M_partial = K_norm @ S_partial @ K_inv
+img_scaled = cv2.warpPerspective(image, M_partial, (224, 224))
+```
+
+This preserves iris ellipse appearance and avoids artificial Ocular Counter-Rolling (OCR) artifacts.
+
+## Landmark Warping
+
+2D landmarks in the original image are warped to normalized space:
+
+```python
+warped = warp_points_2d(landmarks, M)
 ```
 
 **Source**: `normalization.py:warp_points_2d`
-
-## Inverse Warp (Denormalization)
-
-To convert predictions back to original camera pixel space (needed for multi-view consistency):
-
-```python
-M_inv = inv(M)
-# Apply M_inv to normalized pixel coordinates
-original_px = dehomogenize(M_inv @ [u_norm, v_norm, 1]^T)
-```
-
-The dataset stores `M_norm_inv` in each sample for this purpose.
-
-## Sanity Check
-
-The normalization pipeline includes a round-trip sanity check (`multiview_loss.py:sanity_check_roundtrip`):
-
-1. Take original 2D landmarks
-2. Warp to normalized space with M
-3. Warp back with M_inv
-4. Compare with original
-
-**Acceptance criterion**: Maximum pixel error < 2.0 px across all test samples.
-
-This check runs automatically at training startup.
 
 ## Coordinate Spaces Summary
 
 ```
 Original camera pixels
     |
-    |  M (perspective warp)
+    |  M (Easy-Norm homography)
     v
 Normalized image pixels (224x224)
     |
@@ -150,7 +145,7 @@ Feature map space (56x56)           <-- model predictions live here
     v
 Normalized image pixels (224x224)
     |
-    |  M_inv (inverse warp)
+    |  M_inv (inverse homography)
     v
 Original camera pixels              <-- multi-view geometry lives here
     |

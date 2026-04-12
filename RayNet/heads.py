@@ -79,7 +79,7 @@ class OpticalAxisHead(nn.Module):
     Optical axis regression head.
 
     Predicts pitch and yaw angles, then converts to a unit 3D vector.
-    Attaches to P5 (stride=32, 14x14 for 448 input) via GAP.
+    Attaches to P5 (stride=32, 7x7 for 224 input) via GAP.
 
     Split into pool_features() and predict_from_pooled() to allow
     CrossViewAttention to be inserted between them.

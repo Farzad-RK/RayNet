@@ -95,6 +95,12 @@ class StreamingGazeGeneDataset(_Base):
                 raw['T_cam'].astype(np.float32)),
             'eyeball_center_3d': torch.from_numpy(
                 raw['eyeball_center_3d'].astype(np.float32)),
+            'head_R': torch.from_numpy(
+                raw['head_R'].astype(np.float32))
+                if 'head_R' in raw else torch.eye(3),
+            'head_t': torch.from_numpy(
+                raw['head_t'].astype(np.float32))
+                if 'head_t' in raw else torch.zeros(3),
             'gaze_target': torch.from_numpy(
                 raw['gaze_target'].astype(np.float32))
                 if 'gaze_target' in raw else torch.zeros(3),
@@ -105,6 +111,35 @@ class StreamingGazeGeneDataset(_Base):
             'cam_id': int(raw['cam_id']),
             'frame_idx': int(raw['frame_idx']),
         }
+
+
+class NonEmptyBatchLoader:
+    """Wraps a DataLoader, transparently skipping empty batches.
+
+    When ``samples_per_subject`` filters out all samples in a micro-batch,
+    the collate_fn returns an empty dict ``{}``. This wrapper silently
+    drops those so the training loop sees a clean sequence of real batches:
+    batch counters and gradient-accumulation boundaries stay consistent.
+
+    ``__len__`` is an UPPER BOUND (the underlying loader's length) because
+    the actual number of non-empty batches per epoch depends on filtering
+    and cannot be known ahead of iteration.
+    """
+
+    def __init__(self, loader):
+        self._loader = loader
+
+    def __iter__(self):
+        for batch in self._loader:
+            if batch and len(batch) > 0:
+                yield batch
+
+    def __len__(self):
+        return len(self._loader)
+
+    @property
+    def dataset(self):
+        return self._loader.dataset
 
 
 def _collate_fn(batch):
@@ -120,7 +155,7 @@ def _collate_fn(batch):
     tensor_keys = [
         'image', 'landmark_coords', 'landmark_coords_px',
         'optical_axis', 'R_kappa',
-        'K', 'R_cam', 'T_cam', 'eyeball_center_3d',
+        'K', 'R_cam', 'T_cam', 'eyeball_center_3d', 'head_R', 'head_t',
         'gaze_target', 'gaze_depth',
     ]
     scalar_keys = ['subject', 'cam_id', 'frame_idx']
@@ -222,6 +257,15 @@ def create_streaming_dataloaders(
         train_dataset, batch_size=batch_size, **loader_kwargs)
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, **loader_kwargs)
+
+    # Wrap with empty-batch skipper when samples_per_subject filtering is on.
+    # Without this, fully-filtered batches reach the training loop and pollute
+    # step counters, batch_log.csv row numbering, and gradient-accumulation
+    # boundaries (they are handled via `continue`, but at the cost of wasted
+    # iterations and confusing logs).
+    if samples_per_subject is not None:
+        train_loader = NonEmptyBatchLoader(train_loader)
+        val_loader = NonEmptyBatchLoader(val_loader)
 
     return train_loader, val_loader
 

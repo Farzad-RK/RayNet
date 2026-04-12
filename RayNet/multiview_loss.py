@@ -30,8 +30,11 @@ def reshape_multiview(tensor, n_views=9):
     return tensor.view(G, n_views, *tensor.shape[1:])
 
 
-def _normalize_vec(v, dim=-1, eps=1e-8):
-    """L2-normalize vectors along given dimension."""
+def _normalize_vec(v, dim=-1, eps=1e-4):
+    """L2-normalize vectors along given dimension.
+
+    eps=1e-4 is the minimum safe value for FP16 (min normal ~6e-5).
+    """
     return v / (v.norm(dim=dim, keepdim=True) + eps)
 
 

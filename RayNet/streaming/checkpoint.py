@@ -304,6 +304,37 @@ class CheckpointManager:
         """Load the most recent checkpoint for resuming training."""
         return self.load('latest.pt', map_location=map_location)
 
+    def load_from_run(self, source_run_id, filename='best_model.pt',
+                      map_location='cpu'):
+        """
+        Load a checkpoint from a *different* run_id without changing
+        this manager's current run_id.
+
+        Used for warmstarting a new training run (e.g. Stage 2) with
+        weights from a previous run (e.g. completed Stage 1). Only the
+        raw checkpoint state dict is returned — the caller is
+        responsible for loading *only* the model weights and leaving
+        optimizer/scheduler/epoch untouched.
+
+        Args:
+            source_run_id: The run_id to pull weights from.
+            filename: Checkpoint file name (default 'best_model.pt').
+            map_location: torch.load map_location argument.
+
+        Returns:
+            Checkpoint state dict.
+        """
+        key = self._object_key(filename, run_id=source_run_id)
+        local_path = os.path.join(
+            self._local_dir, f"__warmstart_{source_run_id}_{filename}")
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        self._client.fget_object(self.bucket, key, local_path)
+        state = torch.load(
+            local_path, map_location=map_location, weights_only=False)
+        log.info("Loaded warmstart weights from run %s (%s, epoch %d)",
+                 source_run_id, filename, state.get('epoch', -1))
+        return state
+
     def load_best(self, map_location='cpu'):
         """Load the best validation checkpoint."""
         return self.load('best_model.pt', map_location=map_location)

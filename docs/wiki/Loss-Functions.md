@@ -1,14 +1,17 @@
 # Loss Functions
 
-All loss functions used in RayNet v2 training.
+All loss functions used in RayNet v4.1 training.
 
 ## Overview
 
 ```
-Total Loss = lam_lm * Landmark_Loss
-           + lam_gaze * Gaze_Loss                          (Phase 2+)
-           + lam_gaze_consist * Gaze_Ray_Consistency_Loss   (Phase 2+)
-           + lam_shape * Landmark_Shape_Consistency_Loss     (Phase 2+)
+Total Loss = lam_lm    * Landmark_Loss
+           + lam_gaze  * Gaze_Loss
+           + lam_pose  * Pose_Rotation_Loss (geodesic)
+           + lam_trans  * Pose_Translation_Loss (log-depth SmoothL1)
+           + lam_ray   * Ray_Target_Loss
+           + mv_weight * (lam_reproj * Gaze_Ray_Consistency
+                        + lam_mask  * Landmark_Shape_Consistency)
 ```
 
 ---
@@ -37,13 +40,11 @@ L_heatmap = MSE(sigmoid(pred_heatmaps), GT_heatmaps)
 
 ### Coordinate L1
 
-Direct L1 regression on predicted vs ground-truth coordinates:
+Direct L1 regression on predicted vs ground-truth coordinates in feature-map space (0 to 56):
 
 ```
 L_coord = L1(pred_coords, gt_coords)
 ```
-
-Both are in feature-map space (0 to 56).
 
 ### Combined
 
@@ -57,175 +58,191 @@ L_landmark = L_heatmap + L_coord
 
 **Source**: `RayNet/losses.py:gaze_loss`
 
-L1 loss on predicted vs ground-truth unit gaze vectors in normalized space. This follows the GazeGene paper (Sec 4.1.1), which uses L1 loss between predicted 3D unit head gaze vector and ground truth.
+L1 loss on predicted vs ground-truth unit gaze vectors in camera coordinate space (CCS). This follows the GazeGene paper (Sec 4.1.1).
 
 ```
-L_gaze = L1(pred_gaze, gt_gaze)     (both unit vectors in normalized space)
+L_gaze = L1(pred_gaze, gt_gaze)     (both unit vectors in CCS)
 ```
 
 ### Why L1 Instead of Angular (acos)?
 
-Previous versions used `torch.acos(cosine_similarity)` as the training loss. This has an **infinite gradient singularity** at cos_sim = +/-1:
+`torch.acos(cosine_similarity)` has an infinite gradient singularity at cos_sim = +/-1:
 
 ```
 d/dx acos(x) = -1/sqrt(1 - x^2)  -->  infinity when x = +/-1
 ```
 
-When gaze predictions start aligning with ground truth (cos_sim approaches 1.0), the gradient explodes and causes NaN. This was observed empirically at batch ~500 of Phase 2 training.
-
-L1 on unit vectors is:
-- Numerically stable everywhere (bounded gradients)
-- Consistent with the GazeGene paper's methodology
-- Monotonically related to angular error for unit vectors
+L1 on unit vectors is numerically stable everywhere, consistent with the GazeGene paper, and monotonically related to angular error.
 
 ### Angular Error (Metrics Only)
 
-Angular error is computed for logging/metrics using the numerically stable `atan2` formulation, but is **not backpropagated**:
+Angular error is computed for logging using the `atan2` formulation, but is **not backpropagated**:
 
 ```python
 cross = cross_product(pred, gt)
 dot = dot_product(pred, gt)
-angle = atan2(||cross||, dot)       # stable everywhere, no singularity
+angle = atan2(||cross||, dot)       # stable everywhere
 ```
 
 **Source**: `RayNet/losses.py:angular_error`
 
 ---
 
-## 3. Total Single-View Loss
+## 3. Pose Rotation Loss (Geodesic)
 
-**Source**: `RayNet/losses.py:total_loss`
+**Source**: `RayNet/losses.py:pose_prediction_loss`, `RayNet/losses.py:geodesic_loss`
 
-```python
-total = lam_lm * landmark_loss(pred_hm, pred_coords, gt_coords, H, W, sigma)
-      + lam_gaze * gaze_loss(pred_gaze, gt_gaze)
+Auxiliary loss on the PoseEncoder's 6D rotation prediction. The 6D output is reconstructed to a 3x3 rotation matrix via Gram-Schmidt, then compared to GT using geodesic distance on SO(3).
+
+```
+R_pred = gram_schmidt(pred_6d)              # (B, 3, 3)
+R_diff = R_pred^T @ R_gt
+L_geo  = arccos( (trace(R_diff) - 1) / 2 ) # mean over batch
 ```
 
-Returns `(total_loss, components_dict)` where components contains detached values for logging:
-- `landmark_loss`
-- `angular_loss` (in radians, from `angular_error`, detached)
-- `angular_loss_deg` (converted to degrees)
-- `total_loss`
+This measures the actual rotation angle needed to go from predicted to GT orientation, respecting the SO(3) manifold geometry. Numerically stabilized with clamp to avoid NaN from arccos at +/-1.
+
+**Source**: `RayNet/losses.py:rotation_6d_to_matrix`, `RayNet/losses.py:geodesic_loss`
 
 ---
 
-## 4. Gaze Ray Consistency Loss
+## 4. Pose Translation Loss (Log-Depth SmoothL1)
+
+**Source**: `RayNet/losses.py:translation_loss`
+
+Auxiliary loss on the PoseEncoder's 3D translation prediction. Uses separate treatment for image-plane offsets (xy) and depth (z):
+
+```
+L_trans = SmoothL1(pred_xy, gt_xy) + SmoothL1(log(pred_z), log(gt_z))
+```
+
+| Component | Pred activation | GT range | Loss |
+|-----------|----------------|----------|------|
+| tx, ty | `tanh` -> [-1, 1] | [-1, 1] (normalized) | SmoothL1 |
+| tz | `exp` -> (0, +inf) | positive metric depth | SmoothL1 in log-space |
+
+Log-space comparison for depth makes the loss **scale-invariant**: a 10% depth error at 50cm is penalized equally to 10% at 5m. Since `log(exp(raw)) = raw`, the depth loss effectively becomes `SmoothL1(raw, log(gt_z))`.
+
+**GT normalization requirement**: Ground-truth `head_t` from GazeGene (`head_T_vec`) is in centimeters. It must be pre-normalized so tx, ty are in [-1, 1] and tz is positive depth before the loss sees it.
+
+---
+
+## 5. Ray-to-Target Loss
+
+**Source**: `RayNet/losses.py:ray_target_loss`
+
+Geometric constraint that ties gaze direction to a physical target location:
+
+```
+target_hat = eyeball_center + gaze_depth * pred_gaze
+L_ray = L1(target_hat, gt_gaze_target)
+```
+
+Uses ground-truth depth along the gaze ray and known eye center to reconstruct the 3D gaze target from the predicted gaze direction. This provides an explicit geometric signal beyond direction-only loss.
+
+Active in Stage 2 Phase 2+ and Stage 3 Phase 2+.
+
+---
+
+## 6. Gaze Ray Consistency Loss
 
 **Source**: `RayNet/multiview_loss.py:gaze_ray_consistency_loss`
 
-Enforces that predicted gaze vectors from different camera views of the same subject point in the same world-frame direction.
-
-### Algorithm
-
-For each multi-view group (same subject, same frame, 9 cameras):
-
-1. Each view `v` predicts a gaze vector `g_v` in **normalized space**
-2. Transform to world frame: `g_world_v = R_norm_v^T @ g_v` (R_norm is orthogonal)
-3. Compute group mean direction: `g_mean = normalize(mean(g_world))`
-4. **L1 loss** between each view's world gaze and the detached group mean
+Enforces that predicted gaze vectors from different camera views of the same subject, transformed to world frame via camera extrinsics, point in the same direction.
 
 ```
-L_gaze_consist = L1(g_world, detach(g_mean))
+g_world_v = R_cam_v^T @ g_v           # transform to world frame
+g_mean = normalize(mean(g_world))      # group consensus
+L_consist = L1(g_world, detach(g_mean))
 ```
 
-### Why This Works
+Uses `R_cam` (static camera extrinsics) for the world-frame transformation. All operations involve unit vectors -- numerically stable under AMP float16.
 
-All operations involve **unit vectors** (bounded [-1, 1]). No matrix inversions, no large-scale 3D coordinates, no SVD. Numerically stable under AMP float16.
-
-### Why Not Pixel-Space Reprojection?
-
-Earlier versions used a pixel-space reprojection approach (unproject landmarks to 3D, transform between camera frames, reproject to 2D). This was numerically unstable because:
-
-- Camera intrinsic values (focal lengths ~500-2000) caused precision loss in float16
-- Depth values (eyeball at ~5m = 5000mm) amplified errors
-- Matrix inversions (`torch.linalg.inv(K)`) produced garbage in float16
-- SVD (`torch.linalg.svd`) doesn't support float16 on CUDA
-- Even in float32, large coordinate values caused inf/NaN in the loss
-
-The ray-based approach avoids all of these issues by working entirely with unit vectors in normalized space.
+See [[Multi-View Consistency]] for details.
 
 ---
 
-## 5. Landmark Shape Consistency Loss
+## 7. Landmark Shape Consistency Loss
 
 **Source**: `RayNet/multiview_loss.py:landmark_shape_consistency_loss`
 
-Enforces that the spatial pattern of predicted landmarks is consistent across views, using a translation-and-scale-invariant comparison (Procrustes-style).
-
-### Algorithm
-
-For each sampled camera pair (i, j):
-
-1. Extract landmarks in feature-map space (no denormalization needed)
-2. **Center**: subtract centroid of 14 landmarks per view
-3. **Scale-normalize**: divide by RMS distance from centroid
-4. **Smooth L1 loss** between the normalized shapes
+Enforces that the spatial pattern of predicted landmarks is consistent across camera views. Translation-and-scale-invariant (Procrustes-style):
 
 ```
-pts_centered = pts - mean(pts)
+pts_centered = pts - centroid
 pts_normalized = pts_centered / rms_distance
 L_shape = SmoothL1(pts_normalized_i, pts_normalized_j)
 ```
 
-### Why Translation/Scale Invariant?
-
-Each camera view has a different normalization warp (M_norm), so raw coordinates are not directly comparable. By removing translation and scale, we compare only the relative **shape** of the landmark configuration, which should be anatomically consistent across views.
+See [[Multi-View Consistency]] for details.
 
 ---
 
-## 6. Combined Multi-View Loss
+## Total Loss Assembly
 
-**Source**: `RayNet/multiview_loss.py:multiview_consistency_loss`
+**Source**: `RayNet/losses.py:total_loss`
 
 ```python
-L_multiview = lam_gaze_consist * L_gaze_ray_consistency
-            + lam_shape * L_landmark_shape_consistency
+total = lam_lm * landmark_loss + lam_gaze * gaze_loss
+
+# Ray-to-target (active when lam_ray > 0 and GT available)
+total += lam_ray * ray_target_loss
+
+# Pose rotation (active when lam_pose > 0 and pose encoder exists)
+total += lam_pose * pose_prediction_loss
+
+# Pose translation (active when lam_trans > 0 and GT available)
+total += lam_trans * translation_loss
+
+# Multi-view consistency (added in train loop when multiview enabled)
+total += mv_weight * (lam_reproj * gaze_consist + lam_mask * shape_consist)
 ```
 
-Returns `(total_mv_loss, {'gaze_consist_loss': ..., 'shape_loss': ...})`.
+The `mv_weight` ramps linearly from 0 to 1 over the first 10 epochs to smooth multi-view loss activation.
+
+### Logged Components
+
+| Component | Key in CSV | Description |
+|-----------|-----------|-------------|
+| Total loss | `loss` / `train_total` | Weighted sum of all active losses |
+| Landmark | `landmark` / `train_landmark` | Heatmap MSE + coord L1 (normalized by feat area) |
+| Angular error | `angular_deg` / `train_angular_deg` | Degrees (metric only, not in loss) |
+| Gaze consistency | `gaze_consist` / `train_reproj` | Multi-view gaze ray agreement |
+| Shape consistency | `shape` / `train_mask` | Multi-view landmark shape agreement |
+| Ray-to-target | `ray_target` / `train_ray_target` | Gaze ray geometric constraint |
+| Pose rotation | `pose` / `train_pose` | Geodesic loss in radians |
+| Translation | `translation` / `train_translation` | Log-depth SmoothL1 |
 
 ---
 
-## Loss Weight Schedule
+## Loss Weight Schedule (All Stages)
 
-| Phase | Epochs | lam_lm | lam_gaze | lam_gaze_consist | lam_shape |
-|-------|--------|--------|----------|------------------|-----------|
-| 1 | 1-5 | 1.0 | 0.0 | 0.0 | 0.0 |
-| 2 | 6-15 | 1.0 | 0.3 | 0.1 | 0.05 |
-| 3 | 16-30 | 0.5 | 0.5 | 0.2 | 0.1 |
+### Stage 1: Landmark + Pose Baseline
 
-**Rationale**:
-- **Phase 1**: Landmark-only warmup. Each camera view is treated as an independent sample (no view grouping). The gaze head receives no gradients — its weights remain at initialization.
-- **Phase 2**: Gaze loss (L1 on unit vectors) introduced at 0.3 weight. Multi-view consistency activated with the grouped multiview dataloader (9 cameras per group). Gaze ray consistency ensures cross-view directional agreement; shape consistency regularizes landmark structure.
-- **Phase 3**: Equal task weighting (0.5/0.5). Multi-view weights doubled. Sigma tightened for sub-pixel landmark precision.
+| Phase | Epochs | lam_lm | lam_gaze | lam_pose | lam_trans | lam_ray | Multi-view |
+|-------|--------|--------|----------|----------|-----------|---------|------------|
+| 1 | 1-10 | 1.0 | 0.0 | 0.5 | 0.5 | 0.0 | Off |
+| 2 | 11-20 | 1.0 | 0.0 | 1.0 | 1.0 | 0.0 | Off |
 
----
+### Stage 2: Add Gaze, No Bridge
 
-## Methodology Alignment with GazeGene Paper
+| Phase | Epochs | lam_lm | lam_gaze | lam_pose | lam_trans | lam_ray | lam_reproj | lam_mask |
+|-------|--------|--------|----------|----------|-----------|---------|------------|----------|
+| 1 | 1-5 | 1.0 | 0.1 | 0.5 | 0.5 | 0.0 | 0.0 | 0.0 |
+| 2 | 6-15 | 1.0 | 0.5 | 0.5 | 0.5 | 0.1 | 0.05 | 0.02 |
+| 3 | 16-25 | 0.5 | 1.0 | 0.5 | 0.5 | 0.3 | 0.1 | 0.05 |
 
-The loss design follows the GazeGene paper (Bao et al., CVPR 2025):
+### Stage 3: Full Pipeline with Bridge
 
-| Aspect | Paper (Sec 4.1) | Our Implementation |
-|--------|-----------------|-------------------|
-| Normalization | Zhang et al. 2018 | Yes, `normalize_sample()` with R_norm |
-| Image size | 224 x 224 | 224 x 224 |
-| Gaze target | 3D unit vector in normalized space | `optical_axis_norm = R_norm @ optical_axis` |
-| Training loss | L1 between predicted and GT gaze vectors | `gaze_loss = F.l1_loss(pred, gt)` |
-| Optimizer | Adam, betas=(0.5, 0.95), lr=1e-4 | AdamW, betas=(0.5, 0.95), lr varies by phase |
-| Backbone | ResNet-18/50 | RepNeXt-M3 |
-
-**Key design principle**: All training losses operate in **normalized space** (unit vectors, feature-map coordinates). Raw 3D camera coordinates and pixel-space geometric operations are never used in the loss computation, avoiding the numerical instability documented in Section 4.2 of the paper where normalization distortion along the z-axis makes 3D coordinate regression ill-conditioned.
+Same weights as Stage 2, but with `use_bridge=True` (LandmarkGazeBridge enabled).
 
 ---
 
-## Regularization Losses (EyeFLAME Module)
+## Gradient Clipping
 
-The experimental EyeFLAME model (`RayNet/EyeFLAME/loss.py`) uses additional losses:
+Gradient clipping varies by training phase to balance multi-task learning:
 
-| Loss | Formula | Purpose |
-|------|---------|---------|
-| `scale_reg` | `mean((scale - 1)^2)` | Keep weak perspective scale near 1 |
-| `trans_reg` | `mean(translation^2)` | Prevent translation drift |
-| `norm_centers_reg` | `mean(abs(normalized_centers))` | Regularize 3D structure |
-
-These are not used in the main RayNet pipeline.
+| Phase | max_norm | Rationale |
+|-------|----------|-----------|
+| 1 | 5.0 | Aggressive -- allows large gradients during multi-task warmup |
+| 2+ | 2.0 | Conservative -- prevents gaze/pose gradient interference during fine-tuning |

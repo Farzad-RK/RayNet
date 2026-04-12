@@ -1,30 +1,40 @@
 """
-RayNet v3 Training Script.
+RayNet v4.1 Training Script.
 
-Progressive 3-phase training schedule with multi-view from epoch 1:
-  Phase 1 (epochs 1-5):   landmark focus + gaze warmup   λ_lm=1.0, λ_gaze=0.1
-  Phase 2 (epochs 6-15):  balanced training               λ_lm=1.0, λ_gaze=0.3
-  Phase 3 (epochs 16-30): gaze-focused fine-tuning        λ_lm=0.5, λ_gaze=0.5
+Staged training strategy to establish baselines before full pipeline:
 
-Multi-view + CrossViewAttention active from Phase 1 so the transformer
-encoder learns cross-view consistency alongside gaze from the start.
+  Stage 1 — Landmark + Pose baseline (no gaze):
+    Validates both backbones learn useful representations independently.
+    Phase 1 (epochs 1-10):  λ_lm=1.0, λ_pose=0.5, λ_trans=0.5, λ_gaze=0
+    Phase 2 (epochs 11-20): λ_lm=1.0, λ_pose=1.0, λ_trans=1.0, λ_gaze=0 (pose emphasis)
 
-Supports hardware profiles (default, t4, l4, a10g, v100, a100, h100) with AMP,
-gradient accumulation, torch.compile, and MDS/WebDataset streaming.
+  Stage 2 — Add gaze, no bridge:
+    Tests gaze learning without the crop-poisoned LandmarkGazeBridge.
+    Phase 1 (epochs 1-5):   λ_lm=1.0, λ_gaze=0.1, λ_pose=0.5, λ_trans=0.5
+    Phase 2 (epochs 6-15):  λ_lm=1.0, λ_gaze=0.5, λ_pose=0.5, λ_trans=0.5, λ_ray=0.1
+    Phase 3 (epochs 16-25): λ_lm=0.5, λ_gaze=1.0, λ_pose=0.5, λ_trans=0.5, λ_ray=0.3
+
+  Stage 3 — Full pipeline with bridge:
+    Only run after Stage 2 shows gaze converging on validation.
+    Same as Stage 2 but with LandmarkGazeBridge enabled.
+
+  Gradient clipping (max_norm) varies by phase:
+    Phase 1: max_norm=5.0 (aggressive, allows large multi-task gradients)
+    Phase 2+: max_norm=2.0 (conservative, prevents gaze/pose interference)
+
+  Pose representation (9D = 6D rotation + 3D translation):
+    Rotation: 6D continuous repr (Zhou et al. CVPR 2019) + geodesic loss on SO(3)
+    Translation: tanh(tx,ty) for [-1,1] + exp(tz) for depth + log-space SmoothL1
 
 Usage:
-    # Local dataset, default hardware
-    python -m RayNet.train --data_dir /path/to/gazegene --backbone repnext_m3
+    # Stage 1: Landmark + Pose baseline
+    python -m RayNet.train --stage 1 --profile t4 ...
 
-    # MDS streaming from MinIO with checkpoints, on A100 (v3 shards)
-    python -m RayNet.train --profile a100 --mds_streaming \
-        --mds_train s3://gazegene-v3/train --mds_val s3://gazegene-v3/val \
-        --ckpt_bucket raynet-checkpoints --minio_endpoint http://IP:9000
+    # Stage 2: Add gaze, no bridge
+    python -m RayNet.train --stage 2 --profile t4 ...
 
-    # Resume interrupted run
-    python -m RayNet.train --profile a100 --mds_streaming \
-        --mds_train s3://gazegene-v3/train --mds_val s3://gazegene-v3/val \
-        --ckpt_bucket raynet-checkpoints --run_id run_20260405_003135 --resume
+    # Stage 3: Full pipeline (legacy default)
+    python -m RayNet.train --stage 3 --profile t4 ...
 """
 
 import argparse
@@ -50,11 +60,10 @@ log = logging.getLogger(__name__)
 
 HARDWARE_PROFILES = {
     # ---- CPU / low-end GPU (testing, debugging) ----
-    # v3 note: 448×448 input → 4× larger feature maps than 224×224.
-    # Batch sizes tuned for 448×448 with CrossViewAttention (~1M params).
+    # v4: 224×224 input. Batch sizes ~4× larger than v3 (448×448).
     'default': {
-        'batch_size': 126,          # 14 mv_groups × 9 views
-        'mv_groups': 14,
+        'batch_size': 504,          # 56 mv_groups × 9 views
+        'mv_groups': 56,
         'num_workers': 4,
         'pin_memory': True,
         'amp': False,
@@ -67,15 +76,15 @@ HARDWARE_PROFILES = {
     },
     # ---- NVIDIA T4  (16 GB, Colab free / GCP n1-standard) ----
     # FP16 is critical — T4 has weak FP32 but decent FP16 (65 TFLOPS).
-    # 16 GB VRAM tight at 448×448: ~4 mv_groups (36 samples).
+    # 16 GB VRAM comfortable at 224×224: ~16 mv_groups (144 samples).
     't4': {
-        'batch_size': 36,           # 4 mv_groups × 9 views
-        'mv_groups': 4,
+        'batch_size': 144,          # 16 mv_groups × 9 views
+        'mv_groups': 16,
         'num_workers': 2,
         'pin_memory': True,
         'amp': True,
         'amp_dtype': 'float16',
-        'grad_accum_steps': 8,      # effective batch = 288
+        'grad_accum_steps': 2,      # effective batch = 288
         'compile_model': False,     # T4 doesn't benefit much from compile
         'tf32': False,              # T4 doesn't support TF32
         'prefetch_factor': 2,
@@ -83,16 +92,16 @@ HARDWARE_PROFILES = {
     },
     # ---- NVIDIA L4  (24 GB, GCP g2-standard) ----
     # Ada Lovelace arch: good FP16/BF16 (121 TFLOPS FP16).
-    # 24 GB allows ~8 mv_groups at 448×448.
+    # 24 GB comfortable at 224×224: ~32 mv_groups.
     'l4': {
-        'batch_size': 72,           # 8 mv_groups × 9 views
-        'mv_groups': 8,
+        'batch_size': 288,          # 32 mv_groups × 9 views
+        'mv_groups': 32,
         'num_workers': 4,
         'pin_memory': True,
         'amp': True,
-        'amp_dtype': 'float16',
-        'grad_accum_steps': 4,      # effective batch = 288
-        'compile_model': True,      # Ada supports compile well
+        'amp_dtype': 'bfloat16',    # BF16: same range as FP32 → no exp/log overflow
+        'grad_accum_steps': 1,      # effective batch = 288
+        'compile_model': False,     # disabled: interacts badly with grad checkpointing
         'tf32': True,               # Ada supports TF32
         'prefetch_factor': 2,
         'persistent_workers': True,
@@ -100,14 +109,14 @@ HARDWARE_PROFILES = {
     # ---- NVIDIA A10G  (24 GB, AWS g5) ----
     # Ampere arch, similar to L4 in VRAM but different compute profile.
     'a10g': {
-        'batch_size': 72,           # 8 mv_groups × 9 views
-        'mv_groups': 8,
+        'batch_size': 288,          # 32 mv_groups × 9 views
+        'mv_groups': 32,
         'num_workers': 4,
         'pin_memory': True,
         'amp': True,
-        'amp_dtype': 'float16',
-        'grad_accum_steps': 4,      # effective batch = 288
-        'compile_model': True,
+        'amp_dtype': 'bfloat16',    # BF16: same range as FP32 → no exp/log overflow
+        'grad_accum_steps': 1,      # effective batch = 288
+        'compile_model': False,     # disabled: interacts badly with grad checkpointing
         'tf32': True,
         'prefetch_factor': 2,
         'persistent_workers': True,
@@ -115,13 +124,13 @@ HARDWARE_PROFILES = {
     # ---- NVIDIA V100  (16 GB / 32 GB, GCP / AWS p3) ----
     # Volta: no TF32, no torch.compile benefit. Good FP16 via Tensor Cores.
     'v100': {
-        'batch_size': 36,           # 4 mv_groups × 9 views
-        'mv_groups': 4,
+        'batch_size': 144,          # 16 mv_groups × 9 views
+        'mv_groups': 16,
         'num_workers': 4,
         'pin_memory': True,
         'amp': True,
         'amp_dtype': 'float16',
-        'grad_accum_steps': 8,      # effective batch = 288
+        'grad_accum_steps': 2,      # effective batch = 288
         'compile_model': False,     # Volta doesn't benefit from compile
         'tf32': False,              # Volta doesn't support TF32
         'prefetch_factor': 2,
@@ -129,15 +138,15 @@ HARDWARE_PROFILES = {
     },
     # ---- NVIDIA A100  (40 GB / 80 GB, GCP a2, Colab Pro+) ----
     # Ampere flagship: TF32, BF16, huge memory bandwidth (2 TB/s).
-    # At 448×448: ~68 GB estimated for 288 samples. Conservative start.
+    # At 224×224: fits large batches comfortably.
     'a100': {
-        'batch_size': 288,          # 32 mv_groups × 9 views
-        'mv_groups': 32,
+        'batch_size': 1152,         # 128 mv_groups × 9 views
+        'mv_groups': 128,
         'num_workers': 8,
         'pin_memory': True,
         'amp': True,
-        'amp_dtype': 'float16',
-        'grad_accum_steps': 4,      # effective batch = 1152
+        'amp_dtype': 'bfloat16',
+        'grad_accum_steps': 1,      # effective batch = 1152
         'compile_model': True,
         'tf32': True,
         'prefetch_factor': 10,
@@ -147,13 +156,13 @@ HARDWARE_PROFILES = {
     # Hopper: FP8 support, Transformer Engine, 3.4 TB/s bandwidth.
     # BF16 preferred (less overflow risk than FP16 at similar speed).
     'h100': {
-        'batch_size': 576,          # 64 mv_groups × 9 views
-        'mv_groups': 64,
+        'batch_size': 2304,         # 256 mv_groups × 9 views
+        'mv_groups': 256,
         'num_workers': 8,
         'pin_memory': True,
         'amp': True,
         'amp_dtype': 'bfloat16',
-        'grad_accum_steps': 2,      # effective batch = 1152
+        'grad_accum_steps': 1,      # effective batch = 2304
         'compile_model': True,
         'tf32': True,
         'prefetch_factor': 4,
@@ -162,43 +171,194 @@ HARDWARE_PROFILES = {
 }
 
 
-# ============== Training Phase Configuration ==============
+# ============== Staged Training Configuration ==============
+#
+# Stage 1: Landmark + Pose baseline (no gaze, no bridge, no cross-view)
+#   Purpose: Validate both backbones learn useful features independently.
+#   Expect:  Landmark px error < 5px by epoch 10, pose geodesic < 10° by epoch 15.
+#   Anomaly: Pose loss stuck > 30° = backbone not learning face geometry.
+#            Landmark loss diverging = PANet/CoordAtt issue (check BN float32).
+#
+# Stage 2: Add gaze, no bridge
+#   Purpose: Test gaze learning without crop-poisoned LandmarkGazeBridge.
+#   Expect:  Gaze angular error improving on BOTH train and val (no divergence).
+#            Val gaze < 20° by epoch 15 = gaze learns from appearance alone.
+#   Anomaly: Train gaze improving but val worsening = still adversarial.
+#            If this happens WITHOUT bridge, problem is in shared backbone,
+#            not the bridge — would need backbone freezing strategy.
+#
+# Stage 3: Full pipeline with bridge
+#   Purpose: Test if bridge helps or hurts. Compare val gaze to Stage 2.
+#   Expect:  If bridge helps: val gaze improves over Stage 2 baseline.
+#            If bridge hurts: val gaze worse than Stage 2 → remove bridge.
+#   Anomaly: Bridge loss oscillating wildly = crop augmentation poisoning.
 
-PHASE_CONFIG = {
+#
+# -----------------------------------------------------------------------------
+# IMPORTANT — meaning of the `multiview` flag in phase configs below:
+#
+#   `multiview` does NOT control whether CrossViewAttention runs. It ONLY
+#   gates the auxiliary `multiview_consistency_loss` (which adds
+#   `lam_reproj` gaze-consistency and `lam_mask` shape terms).
+#
+#   CrossViewAttention itself is *always active during training* when
+#   --mv_groups > 1, regardless of the phase's `multiview` setting. This is
+#   because the MDS dataloader is constructed once before the phase loop,
+#   producing 9-grouped multi-view batches, and `active_n_views` is
+#   hardcoded to 9 at train.py:active_n_views (only suppressed by the
+#   --no_multiview CLI ablation flag).
+#
+#   Validation uses n_views=1, so CrossViewAttention, camera embeddings,
+#   and the PoseEncoder features ALL bypass during validation. This creates
+#   a deliberate train/val asymmetry: training sees fused 9-view geometry,
+#   val sees single-view — val metrics are therefore a strict lower bound
+#   on what the model is actually capable of at inference with multi-view.
+#
+#   If you truly want a "no multi-view fusion" phase, pass --no_multiview
+#   on the CLI (not the `multiview: False` config flag).
+# -----------------------------------------------------------------------------
+
+STAGE_CONFIGS = {
+    # ---- Stage 1: Landmark + Pose baseline ----
     1: {
-        'epochs': (1, 5),
-        'lam_lm': 1.0,
-        'lam_gaze': 0.1,
-        'lam_reproj': 0.05,
-        'lam_mask': 0.02,
-        'lr': 1e-3,
-        'sigma': 2.0,
-        'multiview': True,
-        'description': 'Landmark focus + gaze/cross-view warmup',
+        1: {
+            'epochs': (1, 10),
+            'lam_lm': 1.0,
+            'lam_gaze': 0.0,
+            'lam_reproj': 0.0,
+            'lam_mask': 0.0,
+            'lam_ray': 0.0,
+            'lam_pose': 0.5,
+            'lam_trans': 0.5,
+            'lr': 1e-3,
+            'sigma': 2.0,
+            'multiview': False,
+            'no_bridge': True,
+            'description': 'S1P1: Landmark warmup + pose learning',
+        },
+        2: {
+            'epochs': (11, 20),
+            'lam_lm': 1.0,
+            'lam_gaze': 0.0,
+            'lam_reproj': 0.0,
+            'lam_mask': 0.0,
+            'lam_ray': 0.0,
+            'lam_pose': 1.0,
+            'lam_trans': 1.0,
+            'lr': 3e-4,
+            'sigma': 1.5,
+            'multiview': False,
+            'no_bridge': True,
+            'description': 'S1P2: Landmark refinement + pose emphasis',
+        },
     },
+
+    # ---- Stage 2: Add gaze, NO bridge ----
+    # Revised to address warmstart shock from Stage 1:
+    #  - S2P1 LR is now 3e-4 (not 1e-3) to avoid disrupting converged weights.
+    #  - Sigma is monotonically tightened 1.5 → 1.3 → 1.0 (no 1.5 → 2.0 reset).
+    #  - S2P3 keeps lam_lm=1.0 instead of halving it (don't weaken landmark
+    #    supervision at the same time the target sharpens).
     2: {
-        'epochs': (6, 15),
-        'lam_lm': 1.0,
-        'lam_gaze': 0.3,
-        'lam_reproj': 0.1,
-        'lam_mask': 0.05,
-        'lr': 5e-4,
-        'sigma': 1.5,
-        'multiview': True,
-        'description': 'Balanced landmark + gaze with multi-view',
+        1: {
+            'epochs': (1, 5),
+            'lam_lm': 1.0,
+            'lam_gaze': 0.1,
+            'lam_reproj': 0.0,
+            'lam_mask': 0.0,
+            'lam_ray': 0.0,
+            'lam_pose': 0.5,
+            'lam_trans': 0.5,
+            'lr': 3e-4,                 # continuation LR, not cold-start 1e-3
+            'sigma': 1.5,               # continue from Stage-1 endpoint
+            'multiview': False,         # aux MV losses off (CVA still active)
+            'no_bridge': True,
+            'description': 'S2P1: Gaze warmup from Stage-1 weights (no bridge)',
+        },
+        2: {
+            'epochs': (6, 15),
+            'lam_lm': 1.0,
+            'lam_gaze': 0.5,
+            'lam_reproj': 0.05,
+            'lam_mask': 0.02,
+            'lam_ray': 0.1,
+            'lam_pose': 0.5,
+            'lam_trans': 0.5,
+            'lr': 3e-4,                 # smoother continuation from P1
+            'sigma': 1.3,               # monotonic tightening
+            'multiview': True,          # aux MV consistency losses on
+            'no_bridge': True,
+            'description': 'S2P2: Balanced + ray + MV aux losses (no bridge)',
+        },
+        3: {
+            'epochs': (16, 25),
+            'lam_lm': 1.0,              # keep landmark strong (was 0.5)
+            'lam_gaze': 1.0,
+            'lam_reproj': 0.1,
+            'lam_mask': 0.05,
+            'lam_ray': 0.3,
+            'lam_pose': 0.5,
+            'lam_trans': 0.5,
+            'lr': 1e-4,
+            'sigma': 1.0,               # tightest landmark target
+            'multiview': True,
+            'no_bridge': True,
+            'description': 'S2P3: Gaze fine-tuning, landmark weight preserved',
+        },
     },
+
+    # ---- Stage 3: Full pipeline WITH bridge ----
     3: {
-        'epochs': (16, 30),
-        'lam_lm': 0.5,
-        'lam_gaze': 0.5,
-        'lam_reproj': 0.2,
-        'lam_mask': 0.1,
-        'lr': 1e-4,
-        'sigma': 1.0,
-        'multiview': True,
-        'description': 'Gaze-focused fine-tuning with full multi-view',
+        1: {
+            'epochs': (1, 5),
+            'lam_lm': 1.0,
+            'lam_gaze': 0.3,           # was 0.1 — too weak, couldn't protect gaze
+            'lam_reproj': 0.0,
+            'lam_mask': 0.0,
+            'lam_ray': 0.0,
+            'lam_pose': 0.5,
+            'lam_trans': 0.5,
+            'lr': 3e-4,                # was 1e-3 — too aggressive for warmed weights
+            'sigma': 2.0,
+            'multiview': False,
+            'no_bridge': False,
+            'description': 'S3P1: Bridge warmup (zero-init out_proj, gentle LR)',
+        },
+        2: {
+            'epochs': (6, 15),
+            'lam_lm': 1.0,
+            'lam_gaze': 0.5,
+            'lam_reproj': 0.05,
+            'lam_mask': 0.02,
+            'lam_ray': 0.1,
+            'lam_pose': 0.5,
+            'lam_trans': 0.5,
+            'lr': 3e-4,                # was 5e-4 — aligned with S2 proven LR
+            'sigma': 1.5,
+            'multiview': True,
+            'no_bridge': False,
+            'description': 'S3P2: Balanced + multi-view + ray + bridge',
+        },
+        3: {
+            'epochs': (16, 25),
+            'lam_lm': 0.5,
+            'lam_gaze': 1.0,
+            'lam_reproj': 0.1,
+            'lam_mask': 0.05,
+            'lam_ray': 0.3,
+            'lam_pose': 0.5,
+            'lam_trans': 0.5,
+            'lr': 1e-4,
+            'sigma': 1.0,
+            'multiview': True,
+            'no_bridge': False,
+            'description': 'S3P3: Gaze-focused fine-tuning (with bridge)',
+        },
     },
 }
+
+# Default: Stage 3 (full pipeline) for backward compatibility
+PHASE_CONFIG = STAGE_CONFIGS[3]
 
 
 def get_phase(epoch):
@@ -265,12 +425,14 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
     """Run one training epoch with AMP and gradient accumulation support."""
     model.train()
     use_multiview = cfg.get('multiview', False)
+    use_bridge = not cfg.get('no_bridge', False)
     if not amp_enabled:
         amp_dtype = torch.float32
 
     running_losses = {
         'total': 0.0, 'landmark': 0.0, 'angular': 0.0, 'angular_deg': 0.0,
-        'reproj': 0.0, 'mask': 0.0,
+        'reproj': 0.0, 'mask': 0.0, 'ray_target': 0.0, 'pose': 0.0,
+        'translation': 0.0,
     }
     n_batches = 0
 
@@ -281,111 +443,181 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
 
         # To prevent accumulation on missing values we use this flag to not process the filtered samples
         has_accumulated = False
-        if batch:
-            # UINT 8 to tensor of floats normalized from 0.0 to 1.0
-            images = batch['image'].to(device, non_blocking=True).float().div_(255.0)
-            gt_landmarks = batch['landmark_coords'].to(device, non_blocking=True)
-            gt_optical_axis = batch['optical_axis'].to(device, non_blocking=True)
+        if not batch or len(batch) == 0:
+            continue
 
-            # Forward pass with AMP autocast
-            with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                predictions = model(images, n_views=n_views)
+        # UINT 8 to tensor of floats normalized from 0.0 to 1.0
+        images = batch['image'].to(device, non_blocking=True).float().div_(255.0)
+        gt_landmarks = batch['landmark_coords'].to(device, non_blocking=True)
+        gt_optical_axis = batch['optical_axis'].to(device, non_blocking=True)
 
-                pred_hm = predictions['landmark_heatmaps']
-                pred_coords = predictions['landmark_coords']
-                pred_gaze = predictions['gaze_vector']
+        # Camera extrinsics for geometry-conditioned attention
+        R_cam = batch['R_cam'].to(device, non_blocking=True)
+        T_cam = batch['T_cam'].to(device, non_blocking=True)
 
-                feat_H, feat_W = pred_hm.shape[2], pred_hm.shape[3]
+        # GT head pose for auxiliary pose loss (not passed to model)
+        gt_head_R = batch.get('head_R')
+        if gt_head_R is not None:
+            gt_head_R = gt_head_R.to(device, non_blocking=True)
 
-                loss, components = total_loss(
-                    pred_hm, pred_coords, pred_gaze,
-                    gt_landmarks, gt_optical_axis,
-                    feat_H, feat_W,
-                    lam_lm=cfg['lam_lm'],
-                    lam_gaze=cfg['lam_gaze'],
-                    sigma=cfg['sigma'],
+        gt_head_t = batch.get('head_t')
+        if gt_head_t is not None:
+            gt_head_t = gt_head_t.to(device, non_blocking=True)
+
+        mv_components = None
+        # Forward pass with AMP autocast
+        with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            predictions = model(images, n_views=n_views,
+                                R_cam=R_cam, T_cam=T_cam,
+                                use_bridge=use_bridge)
+
+            pred_hm = predictions['landmark_heatmaps']
+            pred_coords = predictions['landmark_coords']
+            pred_gaze = predictions['gaze_vector']
+
+            feat_H, feat_W = pred_hm.shape[2], pred_hm.shape[3]
+
+            loss, components = total_loss(
+                pred_hm, pred_coords, pred_gaze,
+                gt_landmarks, gt_optical_axis,
+                feat_H, feat_W,
+                lam_lm=cfg['lam_lm'],
+                lam_gaze=cfg['lam_gaze'],
+                sigma=cfg['sigma'],
+                lam_ray=cfg.get('lam_ray', 0.0),
+                eyeball_center=batch['eyeball_center_3d'].to(
+                    device, non_blocking=True),
+                gaze_target=batch['gaze_target'].to(
+                    device, non_blocking=True),
+                gaze_depth=batch['gaze_depth'].to(
+                    device, non_blocking=True),
+                lam_pose=cfg.get('lam_pose', 0.0),
+                pred_pose_6d=predictions.get('pred_pose_6d'),
+                gt_head_R=gt_head_R,
+                lam_trans=cfg.get('lam_trans', 0.0),
+                pred_pose_t=predictions.get('pred_pose_t'),
+                gt_head_t=gt_head_t,
+            )
+
+            # Multi-view consistency loss (Phase 2+)
+            # Ray-based: works with unit gaze vectors, numerically stable.
+            if use_multiview:
+                mv_loss, mv_components = multiview_consistency_loss(
+                    pred_gaze,
+                    pred_coords,
+                    R_cam,
+                    lam_gaze_consist=cfg['lam_reproj'],
+                    lam_shape=cfg['lam_mask'],
                 )
+                if torch.isfinite(mv_loss):
+                    mv_weight = min(1.0, epoch / 10.0)  # smooth ramp
+                    loss = loss + mv_weight * mv_loss
 
-                # Multi-view consistency loss (Phase 2+)
-                # Ray-based: works with unit gaze vectors, numerically stable.
-                if use_multiview:
-                    mv_loss, mv_components = multiview_consistency_loss(
-                        pred_gaze,
-                        pred_coords,
-                        batch['R_cam'].to(device, non_blocking=True),
-                        lam_gaze_consist=cfg['lam_reproj'],
-                        lam_shape=cfg['lam_mask'],
-                    )
-                    if torch.isfinite(mv_loss):
-                        loss = loss + mv_loss
-                    running_losses['reproj'] += mv_components['gaze_consist_loss'].item()
-                    running_losses['mask'] += mv_components['shape_loss'].item()
+            # Scale loss by accumulation steps
+            loss = loss / grad_accum_steps
 
-                # Scale loss by accumulation steps
-                loss = loss / grad_accum_steps
+        # Backward pass with gradient scaling
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
-            # Backward pass with gradient scaling
-            if scaler is not None:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+        # using this flag only when a batch is valid to process
+        has_accumulated = True
 
-            # using this flag only when a batch is valid to process
-            has_accumulated = True
-
-            # Optimizer step at accumulation boundary
-            if (step + 1) % grad_accum_steps == 0:
-                if has_accumulated:
-                    if scaler is not None:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                        optimizer.step()
-                    optimizer.zero_grad()
-                    has_accumulated = False
+        # max_norm for multi-task learning scenario like ours requires a value>1
+        # therefore we set max_norm=5.0 for more aggressive training strategy
+        current_phase_num = get_phase(epoch)
+        if current_phase_num >= 2:
+            max_norm = 2.0
+        else:
+            max_norm = 5.0
+        # Optimizer step at accumulation boundary
+        if (step + 1) % grad_accum_steps == 0:
+            if has_accumulated:
+                if scaler is not None:
+                    # FP16 path: scaler handles inf/nan detection internally
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
                 else:
-                    optimizer.zero_grad()
+                    # FP32 / BF16 path: manually check grad norm and skip step
+                    # if non-finite (BF16 has no scaler to catch overflow/nan)
+                    total_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_norm=max_norm)
+                    if torch.isfinite(total_norm):
+                        optimizer.step()
+                    else:
+                        log.warning("Epoch %d batch %d: non-finite grad norm "
+                                    "(%s), skipping optimizer step",
+                                    epoch, step + 1, total_norm.item())
+                optimizer.zero_grad()
+                has_accumulated = False
+            else:
+                optimizer.zero_grad()
 
-            # Accumulate metrics (use unscaled loss)
-            running_losses['total'] += components['total_loss'].item()
-            running_losses['landmark'] += components['landmark_loss'].item()
-            running_losses['angular'] += components['angular_loss'].item()
-            running_losses['angular_deg'] += components['angular_loss_deg'].item()
-            n_batches += 1
+        # Accumulate metrics (use unscaled loss); skip nan to prevent poisoning epoch avg
+        batch_total = components['total_loss'].item()
+        if batch_total != batch_total:  # nan check
+            log.warning("Epoch %d batch %d: nan loss detected, skipping metrics", epoch, step + 1)
+            continue
+        running_losses['total'] += batch_total
+        running_losses['landmark'] += components['landmark_loss'].item()
+        running_losses['angular'] += components['angular_loss'].item()
+        running_losses['angular_deg'] += components['angular_loss_deg'].item()
+        if mv_components is not None:
+            running_losses['reproj'] += mv_components['gaze_consist_loss'].item()
+            running_losses['mask'] += mv_components['shape_loss'].item()
+        if 'ray_target_loss' in components:
+            running_losses['ray_target'] += components['ray_target_loss'].item()
+        if 'pose_loss' in components:
+            running_losses['pose'] += components['pose_loss'].item()
+        if 'translation_loss' in components:
+            running_losses['translation'] += components['translation_loss'].item()
+        n_batches += 1
 
-            # Per-batch CSV logging (high granularity)
-            if batch_csv_writer is not None:
-                batch_csv_writer.writerow([
-                    epoch, step + 1,
-                    f"{components['total_loss'].item():.6f}",
-                    f"{components['landmark_loss'].item():.6f}",
-                    f"{components['angular_loss_deg'].item():.4f}",
-                    f"{running_losses['reproj'] / n_batches:.6f}",
-                    f"{running_losses['mask'] / n_batches:.6f}",
-                    f"{optimizer.param_groups[0]['lr']:.8f}",
-                ])
+        # Per-batch CSV logging (high granularity)
+        if batch_csv_writer is not None:
+            ray_val = components.get('ray_target_loss',
+                                     torch.tensor(0.0)).item()
+            pose_val = components.get('pose_loss',
+                                      torch.tensor(0.0)).item()
+            trans_val = components.get('translation_loss',
+                                       torch.tensor(0.0)).item()
+            batch_csv_writer.writerow([
+                epoch, step + 1,
+                f"{components['total_loss'].item():.6f}",
+                f"{components['landmark_loss'].item():.6f}",
+                f"{components['angular_loss_deg'].item():.4f}",
+                f"{running_losses['reproj'] / max(n_batches, 1):.6f}",
+                f"{running_losses['mask'] / max(n_batches, 1):.6f}",
+                f"{ray_val:.6f}",
+                f"{pose_val:.6f}",
+                f"{trans_val:.6f}",
+                f"{optimizer.param_groups[0]['lr']:.8f}",
+            ])
 
-            # Progress logging
-            total_batches = len(train_loader)
-            if step == 0 or (step + 1) % max(1, total_batches // 10) == 0 or step + 1 == total_batches:
-                avg_loss = running_losses['total'] / n_batches
-                print(f"  [Epoch {epoch}] batch {step+1}/{total_batches} "
-                      f"loss={avg_loss:.4f}", flush=True)
+        # Progress logging
+        total_batches = len(train_loader)
+        if step == 0 or (step + 1) % max(1, total_batches // 10) == 0 or step + 1 == total_batches:
+            avg_loss = running_losses['total'] / max(n_batches, 1)
+            print(f"  [Epoch {epoch}] batch {step+1}/{total_batches} "
+                  f"loss={avg_loss:.4f}", flush=True)
 
     # Flush any remaining gradients from incomplete accumulation
     if n_batches % grad_accum_steps != 0:
         if has_accumulated:
             if scaler is not None:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=max_norm)
+                if torch.isfinite(total_norm):
+                    optimizer.step()
             optimizer.zero_grad()
 
     for k in running_losses:
@@ -399,12 +631,13 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
              amp_dtype=torch.float16, n_views=1):
     """Run validation."""
     model.eval()
+    use_bridge = not cfg.get('no_bridge', False)
     if not amp_enabled:
         amp_dtype = torch.float32
 
     running_losses = {
         'total': 0.0, 'landmark': 0.0, 'angular': 0.0, 'angular_deg': 0.0,
-        'landmark_px': 0.0,
+        'landmark_px': 0.0, 'pose': 0.0, 'ray': 0.0, 'translation': 0.0,
     }
     n_batches = 0
 
@@ -419,8 +652,13 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
         gt_optical_axis = batch['optical_axis'].to(device, non_blocking=True)
         gt_landmarks_px = batch['landmark_coords_px'].to(device, non_blocking=True)
 
+        R_cam = batch['R_cam'].to(device, non_blocking=True)
+        T_cam = batch['T_cam'].to(device, non_blocking=True)
+
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            predictions = model(images, n_views=n_views)
+            predictions = model(images, n_views=n_views,
+                                R_cam=R_cam, T_cam=T_cam,
+                                use_bridge=use_bridge)
 
             pred_hm = predictions['landmark_heatmaps']
             pred_coords = predictions['landmark_coords']
@@ -442,11 +680,23 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
         pred_coords_px = pred_coords * (img_size / feat_size)
         lm_px_error = torch.mean(torch.norm(pred_coords_px - gt_landmarks_px, dim=-1))
 
-        running_losses['total'] += components['total_loss'].item()
+        batch_total = components['total_loss'].item()
+        if batch_total != batch_total:  # nan check
+            continue
+        running_losses['total'] += batch_total
         running_losses['landmark'] += components['landmark_loss'].item()
         running_losses['angular'] += components['angular_loss'].item()
         running_losses['angular_deg'] += components['angular_loss_deg'].item()
         running_losses['landmark_px'] += lm_px_error.item()
+        pose_val = components.get('pose_loss')
+        if pose_val is not None:
+            running_losses['pose'] += pose_val.item()
+        ray_val = components.get('ray_target_loss')
+        if ray_val is not None:
+            running_losses['ray'] += ray_val.item()
+        trans_val = components.get('translation_loss')
+        if trans_val is not None:
+            running_losses['translation'] += trans_val.item()
         n_batches += 1
 
     for k in running_losses:
@@ -460,8 +710,10 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
 def _build_run_config(args, hw):
     """Collect all training configuration into a single dict for metadata."""
     return {
+        'stage': args.stage,
         'profile': args.profile,
-        'backbone': args.backbone,
+        'core_backbone': args.core_backbone,
+        'pose_backbone': args.pose_backbone,
         'epochs': args.epochs,
         'eye': args.eye,
         'hardware': hw,
@@ -472,7 +724,8 @@ def _build_run_config(args, hw):
         'streaming': args.streaming,
         'dataset_url': getattr(args, 'dataset_url', None),
         'data_dir': getattr(args, 'data_dir', None),
-        'weight_path': args.weight_path,
+        'core_backbone_weight_path': args.core_backbone_weight_path,
+        'pose_backbone_weight_path': args.pose_backbone_weight_path,
         'started_at': datetime.now().isoformat(),
     }
 
@@ -494,8 +747,13 @@ def _init_checkpoint_manager(args):
 
 def train(args):
     """Main training function."""
+    # Select stage config — updates module-level PHASE_CONFIG for get_phase/get_phase_config
+    global PHASE_CONFIG
+    PHASE_CONFIG = STAGE_CONFIGS[args.stage]
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
+    print(f"Training stage: {args.stage}")
 
     # Apply hardware profile
     hw = apply_hardware_profile(args)
@@ -525,9 +783,12 @@ def train(args):
     os.makedirs(output_dir, exist_ok=True)
 
     # Create model
+    pose_bb = args.pose_backbone if args.pose_backbone != 'none' else None
     model = create_raynet(
-        backbone_name=args.backbone,
-        weight_path=args.weight_path,
+        core_backbone_name=args.core_backbone,
+        core_backbone_weight_path=args.core_backbone_weight_path,
+        pose_backbone_name=args.pose_backbone,
+        pose_backbone_weight_path=args.pose_backbone_weight_path,
         n_landmarks=14,
     )
 
@@ -535,15 +796,23 @@ def train(args):
         print("  Compiling model with torch.compile...")
         model = torch.compile(model)
 
-    # AMP scaler
-    scaler = GradScaler('cuda', enabled=hw['amp']) if hw['amp'] else None
+    # AMP scaler — ONLY for float16. BF16 has FP32 range, so loss scaling is
+    # unnecessary and actively harmful (the scaler misdetects inf gradients
+    # and silently skips every optimizer step, freezing training at init).
+    use_scaler = hw['amp'] and hw.get('amp_dtype', 'float16') == 'float16'
+    scaler = GradScaler('cuda', enabled=True) if use_scaler else None
 
     # --- Data loading ---
     # v3: multi-view is always active, so we create MV loader upfront.
     # Three modes: local disk, MDS streaming (MosaicML + MinIO), WebDataset streaming
     if args.mds_streaming:
-        _, val_loader = _create_mds_loaders(args, hw)
-        train_loader_mv = _create_mds_mv_loader(args, hw)
+        # Build MV loaders for BOTH train and val. The single-view val loader
+        # from _create_mds_loaders was previously used here, which forced
+        # validation to run with n_views=1 — bypassing CrossViewAttention,
+        # cam_embed, and PoseEncoder fusion. That made val gaze metrics
+        # uninformative. We now validate under the same multi-view topology
+        # the model is trained with.
+        train_loader_mv, val_loader = _create_mds_mv_loader(args, hw)
         streaming_mode = False
     elif args.streaming:
         _create_streaming_loaders(args, hw)
@@ -564,9 +833,10 @@ def train(args):
     csv_file = open(csv_path, 'w', newline='')
     csv_writer = csv.writer(csv_file)
     csv_writer.writerow([
-        'epoch', 'phase', 'lr',
+        'epoch', 'stage', 'phase', 'lr',
         'train_total', 'train_landmark', 'train_angular_deg',
-        'train_reproj', 'train_mask',
+        'train_reproj', 'train_mask', 'train_ray_target', 'train_pose',
+        'train_translation',
         'val_total', 'val_landmark', 'val_angular_deg', 'val_landmark_px',
     ])
 
@@ -576,7 +846,7 @@ def train(args):
     batch_csv_writer = csv.writer(batch_csv_file)
     batch_csv_writer.writerow([
         'epoch', 'batch', 'loss', 'landmark', 'angular_deg',
-        'gaze_consist', 'shape', 'lr',
+        'gaze_consist', 'shape', 'ray_target', 'pose', 'translation', 'lr',
     ])
 
     # Training loop with phase transitions
@@ -610,6 +880,74 @@ def train(args):
         print(f"  Resumed at epoch {start_epoch} (phase {current_phase}), "
               f"best_val_loss={best_val_loss:.4f}")
 
+        # Guard: empty training range. Happens when resuming a completed run
+        # without extending --epochs. Fail loudly instead of silently exiting.
+        if start_epoch > args.epochs:
+            raise RuntimeError(
+                f"Cannot resume: checkpoint is already at epoch "
+                f"{resume_ckpt['epoch']}, so training would start at epoch "
+                f"{start_epoch}, but --epochs={args.epochs}. Increase --epochs "
+                f"to a value > {resume_ckpt['epoch']}, or use --warmstart_from "
+                f"{ckpt_mgr.run_id} to start a new stage from these weights."
+            )
+
+    # --- Warmstart from a different run (e.g. Stage 1 -> Stage 2) ---
+    # Loads ONLY model weights. Optimizer, scheduler, epoch counter, and
+    # scaler stay fresh. A new run_id has already been generated by the
+    # checkpoint manager (since --run_id is forbidden with --warmstart_from).
+    if args.warmstart_from and ckpt_mgr is not None:
+        print(f"Warmstarting from run {args.warmstart_from} "
+              f"({args.warmstart_checkpoint}) into new run {ckpt_mgr.run_id} ...")
+        ws_state = ckpt_mgr.load_from_run(
+            source_run_id=args.warmstart_from,
+            filename=args.warmstart_checkpoint,
+            map_location=device,
+        )
+        target = model._orig_mod if hasattr(model, '_orig_mod') else model
+        missing, unexpected = target.load_state_dict(
+            ws_state['model_state_dict'], strict=False)
+        if missing:
+            print(f"  [warmstart] missing keys: {len(missing)} "
+                  f"(first: {missing[:3]})")
+        if unexpected:
+            print(f"  [warmstart] unexpected keys: {len(unexpected)} "
+                  f"(first: {unexpected[:3]})")
+        src_stage = ws_state.get('config', {}).get('stage', '?')
+        src_epoch = ws_state.get('epoch', '?')
+        print(f"  Loaded weights from stage {src_stage} epoch {src_epoch}. "
+              f"Starting fresh optimizer at epoch 1 of stage {args.stage}.")
+
+        # Translation loss formulation changed (tanh/exp → direct linear
+        # meters). The old pose_head rows 6:9 were trained for the prior
+        # interpretation and would output garbage under the new loss.
+        # Zero-init those rows while keeping rotation rows 0:6 (which
+        # converged cleanly to ~0.015 rad geodesic). With zeroed
+        # weight+bias, initial translation prediction is (0,0,0) m and
+        # gradient flow resumes normally from the first batch.
+        if (args.reset_pose_translation and hasattr(target, 'pose_encoder')
+                and hasattr(target.pose_encoder, 'pose_head')):
+            with torch.no_grad():
+                target.pose_encoder.pose_head.weight[6:].zero_()
+                target.pose_encoder.pose_head.bias[6:].zero_()
+            print("  [warmstart] Reset pose_head translation rows (6:9) "
+                  "to zero — translation loss reformulated to direct "
+                  "cm→m SmoothL1. Rotation rows (0:6) preserved.")
+        # Zero-init LandmarkGazeBridge out_proj so it starts as an identity
+        # (skip connection). The bridge was disabled in earlier stages, so its
+        # weights in the checkpoint are untrained random init. Loading them
+        # overwrites the zero-init from __init__ — we must re-apply it here.
+        if (args.reset_bridge and hasattr(target, 'landmark_gaze_bridge')
+                and hasattr(target.landmark_gaze_bridge, 'cross_attn')):
+            with torch.no_grad():
+                target.landmark_gaze_bridge.cross_attn.out_proj.weight.zero_()
+                target.landmark_gaze_bridge.cross_attn.out_proj.bias.zero_()
+            print("  [warmstart] Zero-init bridge out_proj — bridge starts "
+                  "as identity (skip connection), learns gradually.")
+
+        # start_epoch stays at 1, optimizer/scheduler stay None — they will
+        # be created in the phase-transition block below exactly like a
+        # from-scratch run.
+
     for epoch in range(start_epoch, args.epochs + 1):
         phase = get_phase(epoch)
         cfg = get_phase_config(epoch)
@@ -622,25 +960,43 @@ def train(args):
         if args.gaze_only:
             cfg['lam_lm'] = 0.0
 
-        # Phase transition: update optimizer and scheduler
+        # Phase transition: update LR schedule, keep optimizer state
         if phase != current_phase:
             current_phase = phase
             print(f"\n{'='*60}")
             print(f"Phase {phase}: {cfg['description']}")
             print(f"  lr={cfg['lr']}, lam_lm={cfg['lam_lm']}, "
-                  f"lam_gaze={cfg['lam_gaze']}, sigma={cfg['sigma']}")
+                  f"lam_gaze={cfg['lam_gaze']}, lam_ray={cfg.get('lam_ray', 0)}, "
+                  f"lam_pose={cfg.get('lam_pose', 0)}, lam_trans={cfg.get('lam_trans', 0)}, "
+                  f"sigma={cfg['sigma']}")
             if cfg.get('multiview'):
                 print(f"  Multi-view: lam_gaze_consist={cfg['lam_reproj']}, "
                       f"lam_shape={cfg['lam_mask']}")
             print(f"{'='*60}")
 
-            optimizer = optim.AdamW(
-                model.parameters(),
-                lr=cfg['lr'],
-                betas=(0.5, 0.95),
-                weight_decay=1e-4,
-            )
             phase_start, phase_end = cfg['epochs']
+
+            if optimizer is None:
+                # First phase of the stage: create fresh optimizer
+                optimizer = optim.AdamW(
+                    model.parameters(),
+                    lr=cfg['lr'],
+                    betas=(0.5, 0.95),
+                    weight_decay=1e-4,
+                )
+                print(f"  Created new AdamW optimizer (lr={cfg['lr']})")
+            else:
+                # Subsequent phases: carry over optimizer state (momentum +
+                # adaptive second-moment estimates), only update the LR.
+                # Recreating AdamW here would zero out m and v, causing a
+                # destructive transient: raw-gradient steps at peak LR with
+                # no per-parameter scaling — the "phase shock" that wastes
+                # ~4 epochs recovering each time.
+                for pg in optimizer.param_groups:
+                    pg['lr'] = cfg['lr']
+                    pg['initial_lr'] = cfg['lr']  # CosineAnnealingLR reads this
+                print(f"  Carried over optimizer state, updated LR → {cfg['lr']}")
+
             scheduler = CosineAnnealingLR(
                 optimizer,
                 T_max=phase_end - phase_start + 1,
@@ -654,7 +1010,12 @@ def train(args):
             active_train_loader = train_loader_mv
             active_val_loader = val_loader
 
-        # n_views for CrossViewAttention (9 for multi-view, 1 if ablation)
+        # n_views for CrossViewAttention during TRAINING.
+        # NOTE: this is independent of cfg['multiview']. CrossViewAttention
+        # runs whenever mv_groups > 1 (which produces 9-grouped batches).
+        # cfg['multiview'] only gates the auxiliary multiview_consistency_loss
+        # inside train_one_epoch — see header comment on STAGE_CONFIGS above.
+        # Pass --no_multiview on the CLI to truly ablate cross-view fusion.
         active_n_views = 1 if args.no_multiview else 9
 
         # Train
@@ -669,12 +1030,17 @@ def train(args):
         )
         batch_csv_file.flush()
 
-        # Validate (always single-view)
+        # Validate with the SAME multi-view topology used in training.
+        # Previously hardcoded to n_views=1, which bypassed CrossViewAttention,
+        # camera embeddings, and the PoseEncoder fusion path — producing
+        # uninformative val gaze metrics. The val loader now delivers
+        # 9-grouped batches (see _create_mds_mv_loader), so the reshape
+        # inside CrossViewAttention is well-defined.
         val_losses = validate(
             model, active_val_loader, device, epoch, cfg,
             amp_enabled=hw['amp'],
             amp_dtype=amp_dtype,
-            n_views=1,
+            n_views=active_n_views,
         )
 
         # Step scheduler
@@ -686,6 +1052,12 @@ def train(args):
         if cfg.get('multiview'):
             mv_str = (f" gaze_mv={train_losses['reproj']:.4f}"
                       f" shape={train_losses['mask']:.4f}")
+        if train_losses.get('ray_target', 0) > 0:
+            mv_str += f" ray={train_losses['ray_target']:.4f}"
+        if train_losses.get('pose', 0) > 0:
+            mv_str += f" pose={train_losses['pose']:.4f}"
+        if train_losses.get('translation', 0) > 0:
+            mv_str += f" trans={train_losses['translation']:.4f}"
         print(f"Epoch {epoch:3d} | Phase {phase} | lr {current_lr:.2e} | "
               f"Train: loss={train_losses['total']:.4f} lm={train_losses['landmark']:.4f} "
               f"ang={train_losses['angular_deg']:.2f}deg{mv_str} | "
@@ -697,12 +1069,15 @@ def train(args):
             print(f"  GPU memory peak: {mem_gb:.1f} GB")
 
         csv_writer.writerow([
-            epoch, phase, f"{current_lr:.2e}",
+            epoch, args.stage, phase, f"{current_lr:.2e}",
             f"{train_losses['total']:.6f}",
             f"{train_losses['landmark']:.6f}",
             f"{train_losses['angular_deg']:.4f}",
             f"{train_losses.get('reproj', 0):.6f}",
             f"{train_losses.get('mask', 0):.6f}",
+            f"{train_losses.get('ray_target', 0):.6f}",
+            f"{train_losses.get('pose', 0):.6f}",
+            f"{train_losses.get('translation', 0):.6f}",
             f"{val_losses['total']:.6f}",
             f"{val_losses['landmark']:.6f}",
             f"{val_losses['angular_deg']:.4f}",
@@ -752,13 +1127,15 @@ def train(args):
                     scheduler=scheduler, scaler=scaler, phase=phase,
                     train_metrics=train_losses, val_metrics=val_losses,
                 )
-            # Upload batch log after each epoch (survives interruption)
+            # Upload logs after each epoch (survives interruption/crash)
             try:
                 batch_csv_file.flush()
-                log_key = f"{args.ckpt_prefix}/{ckpt_mgr.run_id}/batch_log.csv"
-                ckpt_mgr._client.fput_object(args.ckpt_bucket, log_key, batch_csv_path)
-            except Exception:
-                pass  # non-critical
+                csv_file.flush()
+                for local_path in (batch_csv_path, csv_path):
+                    log_key = f"{args.ckpt_prefix}/{ckpt_mgr.run_id}/{os.path.basename(local_path)}"
+                    ckpt_mgr._client.fput_object(args.ckpt_bucket, log_key, local_path)
+            except Exception as e:
+                log.warning("MinIO log upload failed: %s", e)
         else:
             if epoch % args.ckpt_every == 0:
                 save_dict = {
@@ -875,10 +1252,18 @@ def _create_mds_loaders(args, hw):
 
 
 def _create_mds_mv_loader(args, hw):
-    """Create multi-view MDS loader lazily (only called when Phase 2 starts)."""
+    """Create multi-view MDS loaders (both train and val).
+
+    Returns (train_loader_mv, val_loader_mv). The MV val loader delivers
+    batches of mv_groups * 9 samples in (subject, frame, cam) order so
+    that CrossViewAttention, cam_embed, and PoseEncoder features are
+    exercised during validation — matching the training forward pass.
+    Without this, validation bypasses all multi-view fusion (n_views=1)
+    and val gaze metrics are a pessimistic lower bound that never moves.
+    """
     from RayNet.streaming.dataset import create_multiview_streaming_dataloaders
 
-    # Same augmentation as single-view loader
+    # Same augmentation as single-view loader (train only)
     from torchvision import transforms as T
     train_transform = T.Compose([
         T.ColorJitter(brightness=0.4, contrast=0.4,
@@ -886,8 +1271,8 @@ def _create_mds_mv_loader(args, hw):
         T.RandomAffine(degrees=0, translate=(0.05, 0.05)),
     ])
 
-    print("Creating multi-view MDS streaming loader...")
-    train_loader_mv, _ = create_multiview_streaming_dataloaders(
+    print("Creating multi-view MDS streaming loaders (train + val)...")
+    train_loader_mv, val_loader_mv = create_multiview_streaming_dataloaders(
         remote_train=args.mds_train,
         remote_val=args.mds_val,
         local_cache=os.path.join(args.output_dir, 'mds_cache_mv'),
@@ -899,7 +1284,7 @@ def _create_mds_mv_loader(args, hw):
         persistent_workers=hw['persistent_workers'],
         samples_per_subject=args.samples_per_subject,
     )
-    return train_loader_mv
+    return train_loader_mv, val_loader_mv
 
 
 def _create_streaming_loaders(args, hw):
@@ -972,11 +1357,18 @@ def parse_args():
                         help='WebDataset shard URL pattern for validation')
 
     # Model
-    parser.add_argument('--backbone', type=str, default='repnext_m3',
+    parser.add_argument('--core_backbone', type=str, default='repnext_m3',
                         choices=['repnext_m0', 'repnext_m1', 'repnext_m2',
                                  'repnext_m3', 'repnext_m4', 'repnext_m5'])
-    parser.add_argument('--weight_path', type=str, default=None,
-                        help='Path to pretrained backbone weights')
+    parser.add_argument('--pose_backbone', type=str, default='repnext_m1',
+                        choices=['repnext_m0', 'repnext_m1', 'repnext_m2',
+                                 'none'],
+                        help='Pose encoder backbone (separate from main). '
+                             '"none" disables pose encoder.')
+    parser.add_argument('--core_backbone_weight_path', type=str, default=None,
+                        help='Path to pretrained core backbone  weights(not fused)')
+    parser.add_argument('--pose_backbone_weight_path', type=str, default=None,
+                        help='Path to pretrained head pose  weights(not fused)')
 
     # Hardware profile
     parser.add_argument('--profile', type=str, default='default',
@@ -984,6 +1376,9 @@ def parse_args():
                         help=f'Hardware profile ({", ".join(HARDWARE_PROFILES.keys())})')
     parser.add_argument('--no_compile', action='store_true',
                         help='Disable torch.compile even if profile enables it')
+    parser.add_argument('--stage', type=int, default=3, choices=[1, 2, 3],
+                        help='Training stage: 1=landmark+pose baseline, '
+                             '2=add gaze (no bridge), 3=full pipeline (with bridge)')
     parser.add_argument('--no_multiview', action='store_true',
                         help='Disable multi-view losses and CrossViewAttention '
                              '(n_views=1 throughout, for ablation)')
@@ -1012,10 +1407,31 @@ def parse_args():
     parser.add_argument('--run_id', type=str, default=None,
                         help='Run ID for checkpoint grouping (auto-generated if omitted)')
     parser.add_argument('--resume', action='store_true',
-                        help='Resume training from the latest checkpoint of --run_id')
+                        help='Resume training from the latest checkpoint of --run_id '
+                             '(same run, same stage, continues epoch counter)')
     parser.add_argument('--resume_from', type=str, default=None,
                         help='Resume from a specific checkpoint file '
                              '(e.g. checkpoint_epoch5.pt, best_model.pt)')
+    parser.add_argument('--warmstart_from', type=str, default=None,
+                        help='Warmstart from a DIFFERENT run (e.g. start Stage 2 '
+                             'with weights from a completed Stage 1 run). Loads '
+                             'ONLY model weights — optimizer/scheduler/epoch are '
+                             'reset. A new run_id is auto-generated.')
+    parser.add_argument('--warmstart_checkpoint', type=str, default='best_model.pt',
+                        help='Checkpoint file to pull from --warmstart_from run '
+                             '(default: best_model.pt)')
+    parser.add_argument('--reset_pose_translation', action='store_true',
+                        help='After warmstart, zero-init pose_head rows 6:9 '
+                             '(translation). Use when the translation loss '
+                             'formulation changed between the source run and '
+                             'the current code (e.g. tanh/exp → direct '
+                             'cm→m SmoothL1). Rotation rows 0:6 are preserved.')
+    parser.add_argument('--reset_bridge', action='store_true',
+                        help='After warmstart, zero-init LandmarkGazeBridge '
+                             'out_proj so the bridge starts as a pure identity '
+                             '(skip connection). Required when transitioning '
+                             'to a stage with bridge enabled from a stage '
+                             'where bridge was disabled (e.g. Stage 2 → 3).')
 
     args = parser.parse_args()
 
@@ -1033,6 +1449,16 @@ def parse_args():
         parser.error("--resume requires --run_id to identify which run to resume")
     if args.resume and not args.ckpt_bucket:
         parser.error("--resume requires --ckpt_bucket")
+    if args.warmstart_from and args.resume:
+        parser.error("--warmstart_from and --resume are mutually exclusive. "
+                     "Use --resume to continue an interrupted run; use "
+                     "--warmstart_from to start a new stage with weights "
+                     "from another run.")
+    if args.warmstart_from and not args.ckpt_bucket:
+        parser.error("--warmstart_from requires --ckpt_bucket")
+    if args.warmstart_from and args.run_id:
+        parser.error("--warmstart_from creates a new run — do not pass --run_id "
+                     "(a fresh timestamped run_id will be generated).")
 
     return args
 
