@@ -25,7 +25,7 @@ from torch.utils.checkpoint import checkpoint
 from RayNet.panet import PANet
 from RayNet.coordatt import CoordinateAttention
 from RayNet.heads import IrisPupilLandmarkHead, OpticalAxisHead
-from backbone.repnext_utils import load_pretrained_repnext
+from backbone.repnext_utils import load_pretrained_repnext,replace_batchnorm
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -456,3 +456,27 @@ def create_raynet(core_backbone_name="repnext_m3", core_backbone_weight_path=Non
     print(f"  Device: {device}")
 
     return model
+
+def load_pretrained_raynet(weight_path):
+    model = create_raynet(
+        core_backbone_name="repnext_m3",
+        core_backbone_weight_path=None,
+        pose_backbone_name="repnext_m1",
+        pose_backbone_weight_path=None,
+        n_landmarks=14
+    )
+    model = model.to(device)
+    # loading pretrained weights
+    state_dict = torch.load(weight_path, map_location=device)
+
+    # If the checkpoint contains 'state_dict' or 'model' keys, use state_dict['state_dict']
+    if 'state_dict' in state_dict:
+        model.load_state_dict(state_dict['state_dict'])
+    else:
+        model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    model = replace_batchnorm()
+    print("RayNet Model is loaded")
+    return model
+
