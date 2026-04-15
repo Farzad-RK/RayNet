@@ -183,13 +183,16 @@ def main():
     for i in range(n):
         sample = ds[i]
         K_orig = sample['intrinsic_original'].numpy().astype(np.float64)
-        K_crop_native = sample['K'].numpy().astype(np.float64)  # calibrated for raw jpg
         eye_3d = sample['eyeball_center_3d'].numpy().astype(np.float64)
 
         # Read the RAW face crop from disk (GazeGene's K_crop is native-resolution).
         raw_path = ds.samples[i]['img_path']
         raw_bgr = cv2.imread(raw_path)
         raw_h, raw_w = raw_bgr.shape[:2]
+
+        # Pull the native-resolution K_crop directly from GazeGene metadata so we
+        # don't depend on dataset.py's rescaling behaviour.
+        K_crop_native = np.array(ds.samples[i]['K_cropped'], dtype=np.float64)
 
         # Rescale K_crop into the 224 tensor space for BoxEncoder / losses.
         sx_224 = 224.0 / raw_w
@@ -220,6 +223,20 @@ def main():
         # Also project against raw K_crop (GazeGene visualizer convention).
         u_raw, v_raw = project_point(K_crop_native, eye_3d)
 
+        # Pupil center (on eye surface) + iris mesh — what GazeGene's own
+        # visualiser draws. These MUST land on the visible eye.
+        eye_idx = 0 if ds.eye == 'L' else 1
+        pupil_3d = np.array(ds.samples[i]['pupil_center_3D'][eye_idx],
+                            dtype=np.float64)
+        iris_3d = np.array(ds.samples[i]['iris_mesh_3D'][eye_idx],
+                           dtype=np.float64)  # (100, 3)
+        u_pup_raw, v_pup_raw = project_point(K_crop_native, pupil_3d)
+        iris_proj_raw = (K_crop_native @ iris_3d.T).T  # (100, 3)
+        iris_proj_raw = iris_proj_raw[:, :2] / iris_proj_raw[:, 2:3]
+        iris_proj_224 = iris_proj_raw * np.array(
+            [224.0 / raw_w, 224.0 / raw_h])
+        u_pup, v_pup = u_pup_raw * (224.0 / raw_w), v_pup_raw * (224.0 / raw_h)
+
         # Try candidate frames to find the one that puts the eye in bounds.
         R_cam = sample['R_cam'].numpy().astype(np.float64)
         T_cam = sample['T_cam'].numpy().astype(np.float64)
@@ -247,21 +264,26 @@ def main():
 
         fig, axes = plt.subplots(1, 4, figsize=(16, 4))
         axes[0].imshow(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
-        # Overlay every candidate; the one landing on the eye is the right frame.
-        colors = plt.cm.tab10(np.linspace(0, 1, len(cands)))
-        for (name, (uu, vv, _)), c in zip(cands.items(), colors):
-            if not (np.isfinite(uu) and np.isfinite(vv)):
-                continue
-            axes[0].scatter([uu], [vv], s=60, marker='x', color=c, label=name)
+        # Iris mesh (yellow, on eye surface) + pupil (cyan) + eyeball center (red).
+        axes[0].scatter(iris_proj_224[:, 0], iris_proj_224[:, 1],
+                        s=6, c='yellow', label='iris_mesh_3D')
+        axes[0].scatter([u_pup], [v_pup], s=80, marker='o',
+                        facecolors='none', edgecolors='cyan', linewidths=2,
+                        label='pupil_center_3D')
+        axes[0].scatter([u_c], [v_c], s=80, marker='x', c='red',
+                        label='eyeball_center_3D')
         axes[0].set_xlim(-20, 244); axes[0].set_ylim(244, -20)
-        axes[0].legend(loc='upper right', fontsize=6, framealpha=0.7)
-        axes[0].set_title('crop + candidate reprojections')
+        axes[0].legend(loc='upper right', fontsize=7, framealpha=0.8)
+        axes[0].set_title('224 crop — iris(●) pupil(◯) eyeball(×)')
 
-        axes[1].imshow(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
-        rect = plt.Rectangle((x1, y1), x2 - x1, y2 - y1,
-                             linewidth=2, edgecolor='lime', facecolor='none')
-        axes[1].add_patch(rect)
-        axes[1].set_title(f'reconstructed {int(W_o)}x{int(H_o)} (black pad)')
+        # Native 448 raw jpg with iris/pupil/eyeball from GazeGene convention.
+        axes[1].imshow(cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2RGB))
+        axes[1].scatter(iris_proj_raw[:, 0], iris_proj_raw[:, 1],
+                        s=6, c='yellow')
+        axes[1].scatter([u_pup_raw], [v_pup_raw], s=80, marker='o',
+                        facecolors='none', edgecolors='cyan', linewidths=2)
+        axes[1].scatter([u_raw], [v_raw], s=80, marker='x', c='red')
+        axes[1].set_title(f'raw {raw_w}x{raw_h} (GazeGene convention)')
 
         axes[2].imshow(cv2.cvtColor(recrop, cv2.COLOR_BGR2RGB))
         axes[2].set_title(f're-crop (MAE={mae:.2f})')
