@@ -26,6 +26,7 @@ from RayNet.panet import PANet
 from RayNet.coordatt import CoordinateAttention
 from RayNet.heads import IrisPupilLandmarkHead, OpticalAxisHead
 from backbone.repnext_utils import load_pretrained_repnext
+from backbone.repnext import create_repnext
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -454,5 +455,43 @@ def create_raynet(core_backbone_name="repnext_m3", core_backbone_weight_path=Non
     print(f"  Total params: {total_params:.1f}M")
     print(f"  Trainable params: {trainable_params:.1f}M")
     print(f"  Device: {device}")
+
+    return model
+
+
+def create_raynet_architecture(core_backbone_name="repnext_m3",
+                               pose_backbone_name="repnext_m1",
+                               n_landmarks=14, cross_view_cfg=None):
+    """
+    Create RayNet v4.1 architecture WITHOUT loading pretrained backbone weights.
+
+    Use this for inference: build the empty architecture, then load ALL weights
+    from a training checkpoint via model.load_state_dict(). The checkpoint
+    contains trained backbone weights — pretrained .pth files are not needed.
+
+    Args:
+        core_backbone_name: RepNeXt variant for main backbone
+        pose_backbone_name: RepNeXt variant for pose encoder
+        n_landmarks: number of landmarks (default 14)
+        cross_view_cfg: dict of kwargs for CrossViewAttention
+
+    Returns:
+        RayNet model (random weights, ready for checkpoint loading)
+    """
+    core_backbone = create_repnext(core_backbone_name, pretrained=False)
+    in_channels_list = BACKBONE_CHANNELS[core_backbone_name]
+
+    pose_backbone = create_repnext(pose_backbone_name, pretrained=False)
+    pose_channels = BACKBONE_CHANNELS[pose_backbone_name]
+
+    model = RayNet(core_backbone, in_channels_list, n_landmarks=n_landmarks,
+                   cross_view_cfg=cross_view_cfg,
+                   pose_backbone=pose_backbone,
+                   pose_backbone_channels=pose_channels)
+    model = model.to(device)
+
+    total_params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"RayNet v4.1 architecture created (no pretrained weights): "
+          f"{total_params:.1f}M params on {device}")
 
     return model

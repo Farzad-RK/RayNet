@@ -242,8 +242,9 @@ class GazeGeneDataset(Dataset):
         # Subject attributes
         subject_attrs = self.attr_dict.get(subj_num, {})
 
-        # Eye center in camera coordinates
+        # Eye center and pupil center in camera coordinates
         t_eye = np.array(s['eyeball_center_3D'][eye_idx], dtype=np.float64)
+        t_pupil = np.array(s['pupil_center_3D'][eye_idx], dtype=np.float64)
 
         # Head pose rotation (per-frame, varies across samples)
         head_R = np.array(s['head_R'], dtype=np.float64)  # (3, 3)
@@ -314,6 +315,7 @@ class GazeGeneDataset(Dataset):
             'head_R': torch.from_numpy(head_R).float(),                     # (3, 3) head pose rotation
             'head_t': torch.from_numpy(np.array(s['head_t'], dtype=np.float64)).float(),  # (3,) head translation
             'eyeball_center_3d': torch.from_numpy(t_eye).float(),           # (3,) eye center in CCS
+            'pupil_center_3d': torch.from_numpy(t_pupil).float(),           # (3,) pupil center in CCS
             # GazeGene gaze labels
             'gaze_target': torch.from_numpy(gaze_target).float(),           # (3,) 3D target, CCS
             'gaze_depth': torch.tensor(gaze_depth).float(),                 # scalar, vergence depth

@@ -57,17 +57,21 @@ COLOR_BG = (40, 40, 40)        # dark gray
 
 
 def load_model(args):
-    """Load RayNet model with trained weights."""
-    from RayNet.raynet import create_raynet, device
+    """
+    Load RayNet model with trained weights from checkpoint.
 
-    model = create_raynet(
+    The checkpoint contains ALL weights (backbone + heads + everything),
+    so pretrained backbone .pth files are NOT needed. We build the empty
+    architecture and load the full state dict from the checkpoint.
+    """
+    from RayNet.raynet import create_raynet_architecture, device
+
+    model = create_raynet_architecture(
         core_backbone_name=args.core_backbone,
-        core_backbone_weight_path=args.core_backbone_weight_path,
         pose_backbone_name=args.pose_backbone,
-        pose_backbone_weight_path=args.pose_backbone_weight_path,
     )
 
-    # Load checkpoint
+    # Load checkpoint (contains ALL trained weights)
     if args.checkpoint:
         state = torch.load(args.checkpoint, map_location=device, weights_only=False)
     elif args.run_id:
@@ -341,7 +345,7 @@ def visualize_predictions(image_bgr, landmarks_feat, gaze_vector, gaze_angles,
     draw_landmarks(canvas, landmarks_px, radius=lm_radius)
 
     # Draw gaze arrow from eye center
-    draw_gaze_arrow(canvas, eye_center, gaze_vector, length=arrow_len, thickness=2)
+    # draw_gaze_arrow(canvas, eye_center, gaze_vector, length=arrow_len, thickness=2)
 
     # Draw head pose axes
     if pose_6d is not None:
@@ -349,7 +353,7 @@ def visualize_predictions(image_bgr, landmarks_feat, gaze_vector, gaze_angles,
         draw_pose_axes(canvas, pose_center, R_mat, axis_length=axis_len)
 
     # Draw text overlay
-    draw_info_overlay(canvas, gaze_angles, pose_t)
+    # draw_info_overlay(canvas, gaze_angles, pose_t)
 
     return canvas
 
@@ -502,15 +506,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    # Model
+    # Model architecture (no pretrained weights needed — checkpoint has everything)
     parser.add_argument('--core_backbone', default='repnext_m3',
-                        help='Core backbone name (default: repnext_m3)')
-    parser.add_argument('--core_backbone_weight_path', default=None,
-                        help='Path to pretrained core backbone weights')
+                        help='Core backbone architecture name (default: repnext_m3)')
     parser.add_argument('--pose_backbone', default='repnext_m1',
-                        help='Pose backbone name (default: repnext_m1)')
-    parser.add_argument('--pose_backbone_weight_path', default=None,
-                        help='Path to pretrained pose backbone weights')
+                        help='Pose backbone architecture name (default: repnext_m1)')
 
     # Checkpoint (local or MinIO)
     parser.add_argument('--checkpoint', type=str, default=None,

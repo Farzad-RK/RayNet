@@ -1,3 +1,150 @@
+# RayNet v5 — Triple-M1 Multi-Task Gaze Estimation
+
+## Architecture Overview
+
+RayNet v5 is a multi-task architecture for joint gaze estimation, landmark detection, and head pose estimation. It uses three task-specialized RepNeXt-M1 branch encoders sharing a common low-level stem, with MAGE-style bounding box encoding and GazeGene 3D eyeball structure estimation.
+
+```
+                        ┌─────────────────────────────────────────────────────────┐
+                        │                   RayNet v5 Architecture                │
+                        └─────────────────────────────────────────────────────────┘
+
+  Face Image (3, 224, 224)                         Face BBox (x_p, y_p, L_x)
+         │                                                  │
+         ▼                                                  ▼
+  ┌──────────────┐                                  ┌───��──────────┐
+  │  SharedStem  │                                  │  BoxEncoder  │
+  │  M1 stem +   │                                  │  3→64→128→   │
+  │  stage0 (48) │                                  │  256 (MAGE)  │
+  │  stage1 (96) │                                  └──────┬───────┘
+  └──────��───────┘                                         │
+         │                                                 │
+    s0 (48ch)  s1 (96ch)                                   │
+    56x56      28x28                                       │
+         │        │                                        │
+         │   ┌────┴────────────────┬───────────────┐       │
+         │   │                     │               │       │
+         │   ▼                     ▼               ▼       │
+         │ ┌─────────┐    ┌─────────────┐   ┌──────────┐  │
+         │ │Landmark │    │    Gaze     │   │   Pose   │  │
+         │ │ Branch  │    │   Branch    │   │  Branch  │  │
+         │ │Encoder  │    │  Encoder    │   │ Encoder  │  │
+         │ │M1 s2+s3 │    │  M1 s2+s3  │   │ M1 s2+s3 │  │
+         │ └────┬���───┘    └─────┬──────┘   └────┬─────┘  │
+         │      │               │               │         │
+         │ s2(192) s3(384) s2(192) s3(384)  pose_feat     │
+         │  14x14   7x7    14x14   7x7      (256)        │
+         │      │               │               │         │
+         │      │               │         ┌─────┴────┐    │
+         │      │               │         │CoordAtt  │    │
+         │      │               │         │Pool→Proj │    │
+         │      │               │         └─────┬────┘    │
+         │      │               │               │         │
+         │      │               │         ┌─────┴─────────┴───┐
+         │      │               │         │   FusionBlock     │
+         │      │               │         │ pose_feat + bbox  │
+         │      │               │         │  (MAGE Sec 3.2)  │
+         │      │               │         └────────┬──────────┘
+         │      │               │                  │
+         │      │               ▼                  │
+         │      │         ┌───────────┐            │
+         │      │         │ CoordAtt  │            │
+         │      │         │ Pool→Proj │            │
+         │      │         └─────┬─────┘            │
+         │      │               │                  │
+         │      │               ▼                  ▼
+         │      │         ┌──────────────────────────┐
+         │      ├────────►│  PoseGazeModulation      │
+         │      │  lm_s2  │  (SHMA sigmoid gating)   │
+         │      │         └────────────┬─────────────┘
+         │      │                      │
+         │      │                      ▼
+         │      ├─────────────►┌──────────────────┐
+         │      │   lm_s2      │ LandmarkGaze     │
+         │      │              │ CrossAttention    │
+         │      │              └────────┬─────────┘
+         │      │                       │
+         │      ▼                       ▼
+  ┌──────┴──────────┐         ┌──────────────────┐     ┌──���───────┐
+  │   U-Net Decoder │         │ GeometricGaze    │     │ PoseHead │
+  │   + AttGates    │         │ Head (GazeGene)  │     │ 6D+3D   │
+  │  7→14→28→56     │         │                  │     │          │
+  └────────┬────────┘         │ eyeball_fc→(B,3) │     └────┬─────┘
+           │                  │ pupil_fc  →(B,3) │          │
+           ▼                  │                  │          ▼
+  14 landmarks (56x56)        │ optical_axis =   │   6D rotation
+  10 iris + 4 pupil           │ norm(pupil-eye)  │   3D translation
+                              └────────┬─��───────┘
+                                       │
+                                       ▼
+                              eyeball_center (B,3)
+                              pupil_center   (B,3)
+                              optical_axis   (B,3) ← derived from geometry
+                              gaze_angles    (B,2) ← pitch, yaw
+```
+
+### Key Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| **Triple-M1** (3 separate branch encoders) | Each task gets dedicated stages 2-3, preventing gradient conflict at high-level features while sharing low-level edges/textures via the stem |
+| **U-Net decoder** with attention gates | State-of-the-art for dense prediction; skip connections preserve spatial precision lost in deep encoding; attention gates suppress irrelevant skip features |
+| **GazeGene 3D eyeball structure** | Predicting eyeball + pupil centers forces anatomically consistent geometry; optical axis is DERIVED not regressed, providing physical grounding |
+| **MAGE BoxEncoder** | Eliminates MediaPipe dependency at inference — only a fast face bbox detector needed; encodes face position + scale for gaze origin estimation |
+| **Zero-init bridges** | All inter-branch connections start as identity (ControlNet/ReZero pattern), preventing cold-start training collapse |
+| **Gradient isolation** for pose | `s1.detach()` prevents pose gradients from steering shared features away from what landmark/gaze need |
+| **Pose-conditioned gaze modulation** | SHMA-style sigmoid gating lets gaze branch interpret eye textures relative to head orientation |
+
+### Loss Functions (V5)
+
+GazeGene 3D Eyeball Structure Estimation losses (Sec 4.2.2):
+
+| Loss | Formula | Purpose |
+|------|---------|---------|
+| **Eyeball center L1** | `L1(pred_eyeball, gt_eyeball)` | Localize eye center in 3D |
+| **Pupil center L1** | `L1(pred_pupil, gt_pupil)` | Localize pupil in 3D |
+| **Iris contour L1** | Part of landmark loss (10 iris points) | 2D eye structure |
+| **Geometric angular** | `angular_error(normalize(pupil-eyeball), gt_axis)` | Geometric consistency |
+| **Gaze L1** | `L1(pred_axis, gt_axis)` | Direct gaze supervision |
+| **Ray-to-target** | Scale-invariant endpoint constraint | Ties gaze to 3D target |
+| **Geodesic pose** | `arccos((tr(R_pred^T R_gt) - 1) / 2)` | SO(3) rotation distance |
+| **Translation SmoothL1** | Direct metric in meters | Head position |
+| **Landmark heatmap MSE** | Gaussian heatmap + coordinate L1 | Dense spatial supervision |
+
+### Parameters
+
+| Component | Params |
+|-----------|--------|
+| SharedStem (M1 stem + stages 0-1) | ~1.5M |
+| Landmark BranchEncoder (M1 stages 2-3) | ~3.3M |
+| Gaze BranchEncoder (M1 stages 2-3) | ~3.3M |
+| Pose BranchEncoder (M1 stages 2-3) | ~3.3M |
+| U-Net decoder + attention gates | ~0.5M |
+| BoxEncoder + FusionBlock | ~0.1M |
+| Bridges + heads | ~1.0M |
+| **Total** | **~16M** |
+
+### Training Phases
+
+| Phase | Active Components | Loss Weights |
+|-------|-------------------|--------------|
+| **Stage 1** | Landmark + Pose branches | lam_lm=1.0, lam_pose=1.0, lam_trans=0.5 |
+| **Stage 2** | + Gaze branch (bridges zero-init) | + lam_gaze=0.5, lam_eyeball=0.3, lam_pupil=0.3 |
+| **Stage 3** | + All bridges + geometric angular | + lam_geom_angular=0.2, lam_ray=0.1 |
+
+### References
+
+- **MAGE** (Sec 3.2): Bounding box encoder + fusion block for gaze origin estimation
+- **GazeGene** (Sec 4.2.2): 3D eyeball structure estimation with 4-loss formulation
+- **RepNeXt-M1**: embed_dim=(48, 96, 192, 384), depth=(2, 2, 6, 2)
+- **SixDRepNet**: 6D continuous rotation representation (Zhou et al., CVPR 2019)
+- **Attention U-Net**: Oktay et al., 2018 — attention gates for skip connections
+
+---
+---
+
+# Legacy Documentation (v1-v3)
+
 ## RayNet: GazeGene Dataset Loader & Multi-View Sampler
 
 This module provides PyTorch Dataset and Sampler classes for the GazeGene synthetic gaze estimation dataset, 

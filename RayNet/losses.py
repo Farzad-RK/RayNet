@@ -1,12 +1,20 @@
 """
-Loss functions for RayNet v4.1.
+Loss functions for RayNet v4.1 / v5.
 
-Core losses:
+Core losses (v4.1):
   1. Landmark loss: heatmap MSE + coordinate L1
   2. Gaze loss: L1 on unit gaze vectors (following GazeGene paper Sec 4.1.1)
   3. Pose rotation loss: geodesic loss on SO(3) with 6D rotation representation
   4. Pose translation loss: SmoothL1 on xy + log-space SmoothL1 on z (depth)
   5. Ray-to-target loss: geometric constraint tying gaze direction to 3D target
+
+GazeGene 3D Eyeball Structure losses (v5, Sec 4.2.2):
+  6. Eyeball center L1: L1 on predicted vs GT eyeball center 3D
+  7. Pupil center L1: L1 on predicted vs GT pupil center 3D
+  8. Geometric angular error: angular error between optical axis derived from
+     predicted geometry (normalize(pupil - eyeball)) and GT optical axis
+  (Loss 3 from paper = iris contour L1, handled by landmark_loss on the
+   10 iris contour points within the 14 landmarks)
 
 Angular error is computed for metrics only (not backpropagated).
 """
@@ -229,6 +237,67 @@ def ray_target_loss(pred_gaze, eyeball_center, gaze_target, gaze_depth):
     return F.l1_loss(target_hat_norm, gaze_target_norm)
 
 
+def eyeball_center_loss(pred_eyeball, gt_eyeball):
+    """
+    L1 loss on predicted vs GT eyeball center (GazeGene Sec 4.2.2, loss 1).
+
+    Both in CCS, centimeters.
+
+    Args:
+        pred_eyeball: (B, 3) predicted eyeball center
+        gt_eyeball: (B, 3) GT eyeball center
+
+    Returns:
+        loss: scalar L1
+    """
+    return F.l1_loss(pred_eyeball, gt_eyeball)
+
+
+def pupil_center_loss(pred_pupil, gt_pupil):
+    """
+    L1 loss on predicted vs GT pupil center (GazeGene Sec 4.2.2, loss 2).
+
+    Both in CCS, centimeters.
+
+    Args:
+        pred_pupil: (B, 3) predicted pupil center
+        gt_pupil: (B, 3) GT pupil center
+
+    Returns:
+        loss: scalar L1
+    """
+    return F.l1_loss(pred_pupil, gt_pupil)
+
+
+def geometric_angular_loss(pred_eyeball, pred_pupil, gt_optical_axis):
+    """
+    Angular error between optical axis derived from predicted 3D geometry
+    and GT optical axis (GazeGene Sec 4.2.2, loss 4).
+
+    optical_axis_pred = normalize(pupil_center - eyeball_center)
+
+    This loss ensures that the predicted 3D structure is GEOMETRICALLY
+    CONSISTENT with the gaze direction — the model can't cheat by
+    predicting correct eyeball/pupil positions but wrong relative
+    direction.
+
+    Uses atan2 for numerical stability.
+
+    Args:
+        pred_eyeball: (B, 3) predicted eyeball center
+        pred_pupil: (B, 3) predicted pupil center
+        gt_optical_axis: (B, 3) GT optical axis (unit vector)
+
+    Returns:
+        loss: scalar angular error in radians
+    """
+    pred_axis = F.normalize(pred_pupil - pred_eyeball, dim=-1)
+    cross = torch.cross(pred_axis, gt_optical_axis, dim=-1)
+    dot = (pred_axis * gt_optical_axis).sum(dim=-1)
+    angle = torch.atan2(cross.norm(dim=-1), dot)
+    return angle.mean()
+
+
 def angular_error(pred_gaze, gt_gaze):
     """
     Angular error in radians between predicted and GT gaze vectors.
@@ -314,6 +383,115 @@ def total_loss(pred_hm, pred_coords, pred_gaze,
         components['pose_loss'] = pose.detach()
         components['pose_loss_deg'] = torch.rad2deg(pose.detach())
 
+    if lam_trans > 0 and pred_pose_t is not None and gt_head_t is not None:
+        trans = translation_loss(pred_pose_t, gt_head_t)
+        total = total + lam_trans * trans
+        components['translation_loss'] = trans.detach()
+
+    components['landmark_loss'] *= 1.0 / (feat_H * feat_W)
+    components['total_loss'] = total.detach()
+
+    return total, components
+
+
+def total_loss_v5(
+    pred_hm, pred_coords, pred_gaze,
+    gt_coords, gt_gaze,
+    feat_H, feat_W,
+    lam_lm=1.0, lam_gaze=0.5, sigma=2.0,
+    # GazeGene 3D eyeball structure (Sec 4.2.2)
+    lam_eyeball=0.0,
+    pred_eyeball=None, gt_eyeball=None,
+    lam_pupil=0.0,
+    pred_pupil=None, gt_pupil=None,
+    lam_geom_angular=0.0,
+    # Ray-to-target
+    lam_ray=0.0,
+    eyeball_center=None, gaze_target=None, gaze_depth=None,
+    # Pose
+    lam_pose=0.0,
+    pred_pose_6d=None, gt_head_R=None,
+    lam_trans=0.0,
+    pred_pose_t=None, gt_head_t=None,
+):
+    """
+    Total training loss for RayNet v5: landmarks + gaze + GazeGene 3D structure + pose.
+
+    GazeGene 4 losses (Sec 4.2.2):
+      1. lam_eyeball * L1(pred_eyeball, gt_eyeball)    — eyeball center
+      2. lam_pupil * L1(pred_pupil, gt_pupil)           — pupil center
+      3. lam_lm (iris subset) — iris contour L1 (handled within landmark_loss)
+      4. lam_geom_angular * angular_error(normalize(pupil-eyeball), gt_gaze)
+
+    Args:
+        pred_hm: (B, N, H, W) predicted logit heatmaps
+        pred_coords: (B, N, 2) predicted landmark coordinates
+        pred_gaze: (B, 3) predicted optical axis (unit vector, derived from geometry)
+        gt_coords: (B, N, 2) GT landmark coordinates in feature map space
+        gt_gaze: (B, 3) GT optical axis (unit vector)
+        feat_H, feat_W: feature map spatial dims
+        lam_lm, lam_gaze, sigma: standard loss config
+        lam_eyeball: weight for eyeball center L1 (0 = disabled)
+        pred_eyeball: (B, 3) predicted eyeball center
+        gt_eyeball: (B, 3) GT eyeball center
+        lam_pupil: weight for pupil center L1 (0 = disabled)
+        pred_pupil: (B, 3) predicted pupil center
+        gt_pupil: (B, 3) GT pupil center
+        lam_geom_angular: weight for geometric angular error (0 = disabled)
+        lam_ray, lam_pose, lam_trans: existing loss weights
+
+    Returns:
+        total: scalar loss
+        components: dict of individual loss values (detached, for logging)
+    """
+    lm = landmark_loss(pred_hm, pred_coords, gt_coords, feat_H, feat_W, sigma)
+    gz = gaze_loss(pred_gaze, gt_gaze)
+    total = lam_lm * lm + lam_gaze * gz
+
+    with torch.no_grad():
+        ang_err = angular_error(pred_gaze, gt_gaze)
+
+    components = {
+        'landmark_loss': lm.detach(),
+        'gaze_loss': gz.detach(),
+        'angular_loss': ang_err,
+        'angular_loss_deg': torch.rad2deg(ang_err),
+        'total_loss': total.detach(),
+    }
+
+    # GazeGene loss 1: eyeball center L1
+    if lam_eyeball > 0 and pred_eyeball is not None and gt_eyeball is not None:
+        eb_loss = eyeball_center_loss(pred_eyeball, gt_eyeball)
+        total = total + lam_eyeball * eb_loss
+        components['eyeball_center_loss'] = eb_loss.detach()
+
+    # GazeGene loss 2: pupil center L1
+    if lam_pupil > 0 and pred_pupil is not None and gt_pupil is not None:
+        pc_loss = pupil_center_loss(pred_pupil, gt_pupil)
+        total = total + lam_pupil * pc_loss
+        components['pupil_center_loss'] = pc_loss.detach()
+
+    # GazeGene loss 4: geometric angular error (from predicted structure)
+    if lam_geom_angular > 0 and pred_eyeball is not None and pred_pupil is not None:
+        ga_loss = geometric_angular_loss(pred_eyeball, pred_pupil, gt_gaze)
+        total = total + lam_geom_angular * ga_loss
+        components['geometric_angular_loss'] = ga_loss.detach()
+        components['geometric_angular_loss_deg'] = torch.rad2deg(ga_loss.detach())
+
+    # Ray-to-target constraint
+    if lam_ray > 0 and eyeball_center is not None and gaze_target is not None and gaze_depth is not None:
+        ray = ray_target_loss(pred_gaze, eyeball_center, gaze_target, gaze_depth)
+        total = total + lam_ray * ray
+        components['ray_target_loss'] = ray.detach()
+
+    # Pose rotation loss
+    if lam_pose > 0 and pred_pose_6d is not None and gt_head_R is not None:
+        pose = pose_prediction_loss(pred_pose_6d, gt_head_R)
+        total = total + lam_pose * pose
+        components['pose_loss'] = pose.detach()
+        components['pose_loss_deg'] = torch.rad2deg(pose.detach())
+
+    # Pose translation loss
     if lam_trans > 0 and pred_pose_t is not None and gt_head_t is not None:
         trans = translation_loss(pred_pose_t, gt_head_t)
         total = total + lam_trans * trans
