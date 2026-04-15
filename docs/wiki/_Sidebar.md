@@ -1,4 +1,4 @@
-**RayNet v4.1 Wiki**
+**RayNet v5 Wiki**
 
 - [[Home]]
 - [[Architecture]]
@@ -6,8 +6,6 @@
 - [[Training Guide]]
 - [[Loss Functions]]
 - [[Multi-View Consistency]]
-- **Data Streaming**
-  - [[WebDataset Streaming]]
-  - [[MosaicML Streaming]]
+- [[MosaicML Streaming]]
 - [[Geometry and Kappa]]
 - [[API Reference]]

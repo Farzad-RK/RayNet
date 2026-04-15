@@ -319,82 +319,7 @@ def angular_error(pred_gaze, gt_gaze):
     return angle.mean()
 
 
-def total_loss(pred_hm, pred_coords, pred_gaze,
-               gt_coords, gt_gaze,
-               feat_H, feat_W,
-               lam_lm=1.0, lam_gaze=0.5, sigma=2.0,
-               lam_ray=0.0,
-               eyeball_center=None, gaze_target=None, gaze_depth=None,
-               lam_pose=0.0,
-               pred_pose_6d=None, gt_head_R=None,
-               lam_trans=0.0,
-               pred_pose_t=None, gt_head_t=None
-               ):
-    """
-    Total training loss combining landmarks, gaze, ray-to-target, and pose.
-
-    Args:
-        pred_hm: (B, N, H, W) predicted logit heatmaps
-        pred_coords: (B, N, 2) predicted landmark coordinates
-        pred_gaze: (B, 3) predicted optical axis (unit vector)
-        gt_coords: (B, N, 2) GT landmark coordinates in feature map space
-        gt_gaze: (B, 3) GT optical axis (unit vector)
-        feat_H, feat_W: feature map spatial dims
-        lam_lm: landmark loss weight
-        lam_gaze: gaze loss weight
-        sigma: heatmap Gaussian sigma
-        lam_ray: ray-to-target loss weight (0 = disabled)
-        eyeball_center: (B, 3) eyeball center in CCS (for ray loss)
-        gaze_target: (B, 3) GT 3D gaze target in CCS (for ray loss)
-        gaze_depth: (B,) GT depth along gaze ray (for ray loss)
-        lam_pose: pose prediction auxiliary loss weight (0 = disabled)
-        pred_pose_6d: (B, 6) predicted 6D rotation from PoseEncoder
-        gt_head_R: (B, 3, 3) GT head rotation matrix
-
-    Returns:
-        total: scalar loss
-        components: dict of individual loss values (detached, for logging)
-    """
-    lm = landmark_loss(pred_hm, pred_coords, gt_coords, feat_H, feat_W, sigma)
-    gz = gaze_loss(pred_gaze, gt_gaze)
-    total = lam_lm * lm + lam_gaze * gz
-
-    # Angular error for metrics only (detached, not in computation graph)
-    with torch.no_grad():
-        ang_err = angular_error(pred_gaze, gt_gaze)
-
-    components = {
-        'landmark_loss': lm.detach(),
-        'angular_loss': ang_err,
-        'angular_loss_deg': torch.rad2deg(ang_err),
-        'total_loss': total.detach(),
-    }
-
-    # Ray-to-target constraint (v4)
-    if lam_ray > 0 and eyeball_center is not None and gaze_target is not None and gaze_depth is not None:
-        ray = ray_target_loss(pred_gaze, eyeball_center, gaze_target, gaze_depth)
-        total = total + lam_ray * ray
-        components['ray_target_loss'] = ray.detach()
-
-    # Auxiliary pose prediction loss (v4.1, 6D repr + geodesic)
-    if lam_pose > 0 and pred_pose_6d is not None and gt_head_R is not None:
-        pose = pose_prediction_loss(pred_pose_6d, gt_head_R)
-        total = total + lam_pose * pose
-        components['pose_loss'] = pose.detach()
-        components['pose_loss_deg'] = torch.rad2deg(pose.detach())
-
-    if lam_trans > 0 and pred_pose_t is not None and gt_head_t is not None:
-        trans = translation_loss(pred_pose_t, gt_head_t)
-        total = total + lam_trans * trans
-        components['translation_loss'] = trans.detach()
-
-    components['landmark_loss'] *= 1.0 / (feat_H * feat_W)
-    components['total_loss'] = total.detach()
-
-    return total, components
-
-
-def total_loss_v5(
+def total_loss(
     pred_hm, pred_coords, pred_gaze,
     gt_coords, gt_gaze,
     feat_H, feat_W,
@@ -415,7 +340,7 @@ def total_loss_v5(
     pred_pose_t=None, gt_head_t=None,
 ):
     """
-    Total training loss for RayNet v5: landmarks + gaze + GazeGene 3D structure + pose.
+    Total training loss: landmarks + gaze + GazeGene 3D structure + pose.
 
     GazeGene 4 losses (Sec 4.2.2):
       1. lam_eyeball * L1(pred_eyeball, gt_eyeball)    — eyeball center

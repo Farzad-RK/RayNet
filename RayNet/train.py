@@ -1,9 +1,7 @@
 """
 RayNet v5 Training Script (Triple-M1 architecture).
 
-Supports both v4.1 and v5 architectures via --architecture flag.
-
-v5 Staged training strategy:
+Staged training strategy:
 
   Stage 1 — Landmark + Pose baseline (no gaze, no bridges):
     Phase 1 (epochs 1-8):   λ_lm=1.0, λ_pose=0.5, λ_trans=0.5
@@ -24,17 +22,8 @@ v5 Staged training strategy:
     Phase 2+: max_norm=2.0 (conservative, prevents gaze/pose interference)
 
 Usage:
-    # v5 Stage 1: Landmark + Pose baseline
-    python -m RayNet.train --architecture v5 --stage 1 --profile t4 ...
-
-    # v5 Stage 2: Add gaze with GazeGene losses
-    python -m RayNet.train --architecture v5 --stage 2 --profile t4 ...
-
-    # v5 Stage 3: Full pipeline
-    python -m RayNet.train --architecture v5 --stage 3 --profile t4 ...
-
-    # Legacy v4.1 (unchanged)
-    python -m RayNet.train --architecture v4 --stage 3 --profile t4 ...
+    python -m RayNet.train --stage 1 --profile t4 --mds_streaming \
+        --mds_train s3://gazegene/train --mds_val s3://gazegene/val ...
 """
 
 import argparse
@@ -48,10 +37,10 @@ from torch.amp import GradScaler, autocast
 import numpy as np
 from datetime import datetime
 
-from RayNet.raynet import create_raynet
 from RayNet.dataset import create_dataloaders
-from RayNet.losses import total_loss, total_loss_v5
+from RayNet.losses import total_loss
 from RayNet.multiview_loss import multiview_consistency_loss
+from RayNet.raynet_v5 import create_raynet_v5
 
 log = logging.getLogger(__name__)
 
@@ -173,27 +162,6 @@ HARDWARE_PROFILES = {
 
 # ============== Staged Training Configuration ==============
 #
-# Stage 1: Landmark + Pose baseline (no gaze, no bridge, no cross-view)
-#   Purpose: Validate both backbones learn useful features independently.
-#   Expect:  Landmark px error < 5px by epoch 10, pose geodesic < 10° by epoch 15.
-#   Anomaly: Pose loss stuck > 30° = backbone not learning face geometry.
-#            Landmark loss diverging = PANet/CoordAtt issue (check BN float32).
-#
-# Stage 2: Add gaze, no bridge
-#   Purpose: Test gaze learning without crop-poisoned LandmarkGazeBridge.
-#   Expect:  Gaze angular error improving on BOTH train and val (no divergence).
-#            Val gaze < 20° by epoch 15 = gaze learns from appearance alone.
-#   Anomaly: Train gaze improving but val worsening = still adversarial.
-#            If this happens WITHOUT bridge, problem is in shared backbone,
-#            not the bridge — would need backbone freezing strategy.
-#
-# Stage 3: Full pipeline with bridge
-#   Purpose: Test if bridge helps or hurts. Compare val gaze to Stage 2.
-#   Expect:  If bridge helps: val gaze improves over Stage 2 baseline.
-#            If bridge hurts: val gaze worse than Stage 2 → remove bridge.
-#   Anomaly: Bridge loss oscillating wildly = crop augmentation poisoning.
-
-#
 # -----------------------------------------------------------------------------
 # IMPORTANT — meaning of the `multiview` flag in phase configs below:
 #
@@ -219,158 +187,6 @@ HARDWARE_PROFILES = {
 # -----------------------------------------------------------------------------
 
 STAGE_CONFIGS = {
-    # ---- Stage 1: Landmark + Pose baseline ----
-    1: {
-        1: {
-            'epochs': (1, 10),
-            'lam_lm': 1.0,
-            'lam_gaze': 0.0,
-            'lam_reproj': 0.0,
-            'lam_mask': 0.0,
-            'lam_ray': 0.0,
-            'lam_pose': 0.5,
-            'lam_trans': 0.5,
-            'lr': 1e-3,
-            'sigma': 2.0,
-            'multiview': False,
-            'no_bridge': True,
-            'description': 'S1P1: Landmark warmup + pose learning',
-        },
-        2: {
-            'epochs': (11, 20),
-            'lam_lm': 1.0,
-            'lam_gaze': 0.0,
-            'lam_reproj': 0.0,
-            'lam_mask': 0.0,
-            'lam_ray': 0.0,
-            'lam_pose': 1.0,
-            'lam_trans': 1.0,
-            'lr': 3e-4,
-            'sigma': 1.5,
-            'multiview': False,
-            'no_bridge': True,
-            'description': 'S1P2: Landmark refinement + pose emphasis',
-        },
-    },
-
-    # ---- Stage 2: Add gaze, NO bridge ----
-    # Revised to address warmstart shock from Stage 1:
-    #  - S2P1 LR is now 3e-4 (not 1e-3) to avoid disrupting converged weights.
-    #  - Sigma is monotonically tightened 1.5 → 1.3 → 1.0 (no 1.5 → 2.0 reset).
-    #  - S2P3 keeps lam_lm=1.0 instead of halving it (don't weaken landmark
-    #    supervision at the same time the target sharpens).
-    2: {
-        1: {
-            'epochs': (1, 5),
-            'lam_lm': 1.0,
-            'lam_gaze': 0.1,
-            'lam_reproj': 0.0,
-            'lam_mask': 0.0,
-            'lam_ray': 0.0,
-            'lam_pose': 0.5,
-            'lam_trans': 0.5,
-            'lr': 3e-4,                 # continuation LR, not cold-start 1e-3
-            'sigma': 1.5,               # continue from Stage-1 endpoint
-            'multiview': False,         # aux MV losses off (CVA still active)
-            'no_bridge': True,
-            'description': 'S2P1: Gaze warmup from Stage-1 weights (no bridge)',
-        },
-        2: {
-            'epochs': (6, 15),
-            'lam_lm': 1.0,
-            'lam_gaze': 0.5,
-            'lam_reproj': 0.05,
-            'lam_mask': 0.02,
-            'lam_ray': 0.1,
-            'lam_pose': 0.5,
-            'lam_trans': 0.5,
-            'lr': 3e-4,                 # smoother continuation from P1
-            'sigma': 1.3,               # monotonic tightening
-            'multiview': True,          # aux MV consistency losses on
-            'no_bridge': True,
-            'description': 'S2P2: Balanced + ray + MV aux losses (no bridge)',
-        },
-        3: {
-            'epochs': (16, 25),
-            'lam_lm': 1.0,              # keep landmark strong (was 0.5)
-            'lam_gaze': 1.0,
-            'lam_reproj': 0.1,
-            'lam_mask': 0.05,
-            'lam_ray': 0.3,
-            'lam_pose': 0.5,
-            'lam_trans': 0.5,
-            'lr': 1e-4,
-            'sigma': 1.0,               # tightest landmark target
-            'multiview': True,
-            'no_bridge': True,
-            'description': 'S2P3: Gaze fine-tuning, landmark weight preserved',
-        },
-    },
-
-    # ---- Stage 3: Full pipeline WITH bridge ----
-    3: {
-        1: {
-            'epochs': (1, 5),
-            'lam_lm': 1.0,
-            'lam_gaze': 0.3,           # was 0.1 — too weak, couldn't protect gaze
-            'lam_reproj': 0.0,
-            'lam_mask': 0.0,
-            'lam_ray': 0.0,
-            'lam_pose': 0.5,
-            'lam_trans': 0.5,
-            'lr': 3e-4,                # was 1e-3 — too aggressive for warmed weights
-            'sigma': 2.0,
-            'multiview': False,
-            'no_bridge': False,
-            'description': 'S3P1: Bridge warmup (zero-init out_proj, gentle LR)',
-        },
-        2: {
-            'epochs': (6, 15),
-            'lam_lm': 1.0,
-            'lam_gaze': 0.5,
-            'lam_reproj': 0.05,
-            'lam_mask': 0.02,
-            'lam_ray': 0.1,
-            'lam_pose': 0.5,
-            'lam_trans': 0.5,
-            'lr': 3e-4,                # was 5e-4 — aligned with S2 proven LR
-            'sigma': 1.5,
-            'multiview': True,
-            'no_bridge': False,
-            'description': 'S3P2: Balanced + multi-view + ray + bridge',
-        },
-        3: {
-            'epochs': (16, 25),
-            'lam_lm': 0.5,
-            'lam_gaze': 1.0,
-            'lam_reproj': 0.1,
-            'lam_mask': 0.05,
-            'lam_ray': 0.3,
-            'lam_pose': 0.5,
-            'lam_trans': 0.5,
-            'lr': 1e-4,
-            'sigma': 1.0,
-            'multiview': True,
-            'no_bridge': False,
-            'description': 'S3P3: Gaze-focused fine-tuning (with bridge)',
-        },
-    },
-}
-
-# ============== V5 Triple-M1 Staged Training Configuration ==============
-#
-# V5 has three branches (landmark, gaze, pose) with shared stem.
-# GazeGene 3D eyeball structure losses (eyeball L1, pupil L1, geometric angular)
-# are added progressively. MAGE-style BoxEncoder fuses with pose in Stage 3.
-#
-# Key differences from v4.1 config:
-#   - No separate `no_bridge` flag — V5 bridges are always present (zero-init)
-#     controlled by `use_landmark_bridge` and `use_pose_bridge`
-#   - GazeGene losses: lam_eyeball, lam_pupil, lam_geom_angular
-#   - lam_reproj / lam_mask (multi-view aux) still supported
-#
-
-STAGE_CONFIGS_V5 = {
     # ---- Stage 1: Landmark + Pose baseline (no gaze) ----
     # Purpose: Validate shared stem + branch encoders learn useful features.
     # Expect: Landmark px error < 4px by epoch 8, pose geodesic < 10° by epoch 12.
@@ -609,12 +425,10 @@ def setup_hardware(hw, device):
 def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                     scaler=None, grad_accum_steps=1, amp_enabled=False,
                     amp_dtype=torch.float16, batch_csv_writer=None,
-                    n_views=1, is_v5=False):
+                    n_views=1):
     """Run one training epoch with AMP and gradient accumulation support."""
     model.train()
     use_multiview = cfg.get('multiview', False)
-    # v4.1: no_bridge flag; v5: always has bridges, controlled by use_*_bridge
-    use_bridge = not cfg.get('no_bridge', False)
     use_landmark_bridge = cfg.get('use_landmark_bridge', True)
     use_pose_bridge = cfg.get('use_pose_bridge', True)
     if not amp_enabled:
@@ -666,16 +480,11 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
         mv_components = None
         # Forward pass with AMP autocast
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            if is_v5:
-                predictions = model(images, n_views=n_views,
-                                    R_cam=R_cam, T_cam=T_cam,
-                                    face_bbox=face_bbox_gt,
-                                    use_landmark_bridge=use_landmark_bridge,
-                                    use_pose_bridge=use_pose_bridge)
-            else:
-                predictions = model(images, n_views=n_views,
-                                    R_cam=R_cam, T_cam=T_cam,
-                                    use_bridge=use_bridge)
+            predictions = model(images, n_views=n_views,
+                                R_cam=R_cam, T_cam=T_cam,
+                                face_bbox=face_bbox_gt,
+                                use_landmark_bridge=use_landmark_bridge,
+                                use_pose_bridge=use_pose_bridge)
 
             pred_hm = predictions['landmark_heatmaps']
             pred_coords = predictions['landmark_coords']
@@ -683,63 +492,36 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
 
             feat_H, feat_W = pred_hm.shape[2], pred_hm.shape[3]
 
-            if is_v5:
-                # V5: use total_loss_v5 with GazeGene 3D eyeball losses
-                gt_eyeball = batch['eyeball_center_3d'].to(device, non_blocking=True)
-                gt_pupil = batch.get('pupil_center_3d')
-                if gt_pupil is not None:
-                    gt_pupil = gt_pupil.to(device, non_blocking=True)
+            gt_eyeball = batch['eyeball_center_3d'].to(device, non_blocking=True)
+            gt_pupil = batch.get('pupil_center_3d')
+            if gt_pupil is not None:
+                gt_pupil = gt_pupil.to(device, non_blocking=True)
 
-                loss, components = total_loss_v5(
-                    pred_hm, pred_coords, pred_gaze,
-                    gt_landmarks, gt_optical_axis,
-                    feat_H, feat_W,
-                    lam_lm=cfg['lam_lm'],
-                    lam_gaze=cfg['lam_gaze'],
-                    sigma=cfg['sigma'],
-                    # GazeGene 3D eyeball structure losses
-                    lam_eyeball=cfg.get('lam_eyeball', 0.0),
-                    pred_eyeball=predictions.get('eyeball_center'),
-                    gt_eyeball=gt_eyeball,
-                    lam_pupil=cfg.get('lam_pupil', 0.0),
-                    pred_pupil=predictions.get('pupil_center'),
-                    gt_pupil=gt_pupil,
-                    lam_geom_angular=cfg.get('lam_geom_angular', 0.0),
-                    # Ray-to-target
-                    lam_ray=cfg.get('lam_ray', 0.0),
-                    eyeball_center=gt_eyeball,
-                    gaze_target=batch['gaze_target'].to(device, non_blocking=True),
-                    gaze_depth=batch['gaze_depth'].to(device, non_blocking=True),
-                    # Pose
-                    lam_pose=cfg.get('lam_pose', 0.0),
-                    pred_pose_6d=predictions.get('pred_pose_6d'),
-                    gt_head_R=gt_head_R,
-                    lam_trans=cfg.get('lam_trans', 0.0),
-                    pred_pose_t=predictions.get('pred_pose_t'),
-                    gt_head_t=gt_head_t,
-                )
-            else:
-                loss, components = total_loss(
-                    pred_hm, pred_coords, pred_gaze,
-                    gt_landmarks, gt_optical_axis,
-                    feat_H, feat_W,
-                    lam_lm=cfg['lam_lm'],
-                    lam_gaze=cfg['lam_gaze'],
-                    sigma=cfg['sigma'],
-                    lam_ray=cfg.get('lam_ray', 0.0),
-                    eyeball_center=batch['eyeball_center_3d'].to(
-                        device, non_blocking=True),
-                    gaze_target=batch['gaze_target'].to(
-                        device, non_blocking=True),
-                    gaze_depth=batch['gaze_depth'].to(
-                        device, non_blocking=True),
-                    lam_pose=cfg.get('lam_pose', 0.0),
-                    pred_pose_6d=predictions.get('pred_pose_6d'),
-                    gt_head_R=gt_head_R,
-                    lam_trans=cfg.get('lam_trans', 0.0),
-                    pred_pose_t=predictions.get('pred_pose_t'),
-                    gt_head_t=gt_head_t,
-                )
+            loss, components = total_loss(
+                pred_hm, pred_coords, pred_gaze,
+                gt_landmarks, gt_optical_axis,
+                feat_H, feat_W,
+                lam_lm=cfg['lam_lm'],
+                lam_gaze=cfg['lam_gaze'],
+                sigma=cfg['sigma'],
+                lam_eyeball=cfg.get('lam_eyeball', 0.0),
+                pred_eyeball=predictions.get('eyeball_center'),
+                gt_eyeball=gt_eyeball,
+                lam_pupil=cfg.get('lam_pupil', 0.0),
+                pred_pupil=predictions.get('pupil_center'),
+                gt_pupil=gt_pupil,
+                lam_geom_angular=cfg.get('lam_geom_angular', 0.0),
+                lam_ray=cfg.get('lam_ray', 0.0),
+                eyeball_center=gt_eyeball,
+                gaze_target=batch['gaze_target'].to(device, non_blocking=True),
+                gaze_depth=batch['gaze_depth'].to(device, non_blocking=True),
+                lam_pose=cfg.get('lam_pose', 0.0),
+                pred_pose_6d=predictions.get('pred_pose_6d'),
+                gt_head_R=gt_head_R,
+                lam_trans=cfg.get('lam_trans', 0.0),
+                pred_pose_t=predictions.get('pred_pose_t'),
+                gt_head_t=gt_head_t,
+            )
 
             # Multi-view consistency loss (Phase 2+)
             # Ray-based: works with unit gaze vectors, numerically stable.
@@ -870,10 +652,9 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
 
 @torch.no_grad()
 def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
-             amp_dtype=torch.float16, n_views=1, is_v5=False):
+             amp_dtype=torch.float16, n_views=1):
     """Run validation."""
     model.eval()
-    use_bridge = not cfg.get('no_bridge', False)
     use_landmark_bridge = cfg.get('use_landmark_bridge', True)
     use_pose_bridge = cfg.get('use_pose_bridge', True)
     if not amp_enabled:
@@ -904,16 +685,11 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
             face_bbox_gt = face_bbox_gt.to(device, non_blocking=True)
 
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            if is_v5:
-                predictions = model(images, n_views=n_views,
-                                    R_cam=R_cam, T_cam=T_cam,
-                                    face_bbox=face_bbox_gt,
-                                    use_landmark_bridge=use_landmark_bridge,
-                                    use_pose_bridge=use_pose_bridge)
-            else:
-                predictions = model(images, n_views=n_views,
-                                    R_cam=R_cam, T_cam=T_cam,
-                                    use_bridge=use_bridge)
+            predictions = model(images, n_views=n_views,
+                                R_cam=R_cam, T_cam=T_cam,
+                                face_bbox=face_bbox_gt,
+                                use_landmark_bridge=use_landmark_bridge,
+                                use_pose_bridge=use_pose_bridge)
 
             pred_hm = predictions['landmark_heatmaps']
             pred_coords = predictions['landmark_coords']
@@ -967,8 +743,6 @@ def _build_run_config(args, hw):
     return {
         'stage': args.stage,
         'profile': args.profile,
-        'core_backbone': args.core_backbone,
-        'pose_backbone': args.pose_backbone,
         'epochs': args.epochs,
         'eye': args.eye,
         'hardware': hw,
@@ -976,11 +750,8 @@ def _build_run_config(args, hw):
             str(k): {kk: vv for kk, vv in v.items() if kk != 'description'}
             for k, v in PHASE_CONFIG.items()
         },
-        'streaming': args.streaming,
-        'dataset_url': getattr(args, 'dataset_url', None),
         'data_dir': getattr(args, 'data_dir', None),
         'core_backbone_weight_path': args.core_backbone_weight_path,
-        'pose_backbone_weight_path': args.pose_backbone_weight_path,
         'started_at': datetime.now().isoformat(),
     }
 
@@ -1004,11 +775,7 @@ def train(args):
     """Main training function."""
     # Select stage config — updates module-level PHASE_CONFIG for get_phase/get_phase_config
     global PHASE_CONFIG
-    is_v5 = getattr(args, 'architecture', 'v4') == 'v5'
-    if is_v5:
-        PHASE_CONFIG = STAGE_CONFIGS_V5[args.stage]
-    else:
-        PHASE_CONFIG = STAGE_CONFIGS[args.stage]
+    PHASE_CONFIG = STAGE_CONFIGS[args.stage]
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
@@ -1042,20 +809,10 @@ def train(args):
     os.makedirs(output_dir, exist_ok=True)
 
     # Create model
-    if is_v5:
-        from RayNet.raynet_v5 import create_raynet_v5
-        model = create_raynet_v5(
-            backbone_weight_path=args.core_backbone_weight_path,
-            n_landmarks=14,
-        )
-    else:
-        model = create_raynet(
-            core_backbone_name=args.core_backbone,
-            core_backbone_weight_path=args.core_backbone_weight_path,
-            pose_backbone_name=args.pose_backbone,
-            pose_backbone_weight_path=args.pose_backbone_weight_path,
-            n_landmarks=14,
-        )
+    model = create_raynet_v5(
+        backbone_weight_path=args.core_backbone_weight_path,
+        n_landmarks=14,
+    )
 
     if hw['compile_model'] and hasattr(torch, 'compile'):
         print("  Compiling model with torch.compile...")
@@ -1068,24 +825,13 @@ def train(args):
     scaler = GradScaler('cuda', enabled=True) if use_scaler else None
 
     # --- Data loading ---
-    # v3: multi-view is always active, so we create MV loader upfront.
-    # Three modes: local disk, MDS streaming (MosaicML + MinIO), WebDataset streaming
+    # Multi-view is always active. Train + val both use 9-grouped batches so
+    # CrossViewAttention, cam_embed, and PoseEncoder fusion are exercised at
+    # validation (without this, val gaze metrics are an uninformative
+    # single-view lower bound).
     if args.mds_streaming:
-        # Build MV loaders for BOTH train and val. The single-view val loader
-        # from _create_mds_loaders was previously used here, which forced
-        # validation to run with n_views=1 — bypassing CrossViewAttention,
-        # cam_embed, and PoseEncoder fusion. That made val gaze metrics
-        # uninformative. We now validate under the same multi-view topology
-        # the model is trained with.
         train_loader_mv, val_loader = _create_mds_mv_loader(args, hw)
-        streaming_mode = False
-    elif args.streaming:
-        _create_streaming_loaders(args, hw)
-        train_loader_mv = None
-        val_loader = None
-        streaming_mode = True
     else:
-        streaming_mode = False
         _, train_loader_mv, val_loader = _create_local_loaders(args, hw)
 
     # Record config in checkpoint metadata
@@ -1197,18 +943,6 @@ def train(args):
             print("  [warmstart] Reset pose_head translation rows (6:9) "
                   "to zero — translation loss reformulated to direct "
                   "cm→m SmoothL1. Rotation rows (0:6) preserved.")
-        # Zero-init LandmarkGazeBridge out_proj so it starts as an identity
-        # (skip connection). The bridge was disabled in earlier stages, so its
-        # weights in the checkpoint are untrained random init. Loading them
-        # overwrites the zero-init from __init__ — we must re-apply it here.
-        if (args.reset_bridge and hasattr(target, 'landmark_gaze_bridge')
-                and hasattr(target.landmark_gaze_bridge, 'cross_attn')):
-            with torch.no_grad():
-                target.landmark_gaze_bridge.cross_attn.out_proj.weight.zero_()
-                target.landmark_gaze_bridge.cross_attn.out_proj.bias.zero_()
-            print("  [warmstart] Zero-init bridge out_proj — bridge starts "
-                  "as identity (skip connection), learns gradually.")
-
         # start_epoch stays at 1, optimizer/scheduler stay None — they will
         # be created in the phase-transition block below exactly like a
         # from-scratch run.
@@ -1267,13 +1001,8 @@ def train(args):
                 T_max=phase_end - phase_start + 1,
             )
 
-        # Select dataloader — v3 always uses multi-view for training
-        if streaming_mode:
-            active_train_loader, active_val_loader = _get_streaming_loaders(
-                args, hw, cfg)
-        else:
-            active_train_loader = train_loader_mv
-            active_val_loader = val_loader
+        active_train_loader = train_loader_mv
+        active_val_loader = val_loader
 
         # n_views for CrossViewAttention during TRAINING.
         # NOTE: this is independent of cfg['multiview']. CrossViewAttention
@@ -1306,7 +1035,6 @@ def train(args):
             amp_enabled=hw['amp'],
             amp_dtype=amp_dtype,
             n_views=active_n_views,
-            is_v5=is_v5,
         )
 
         # Step scheduler
@@ -1470,53 +1198,6 @@ def _create_local_loaders(args, hw):
     return train_loader_standard, train_loader_mv, val_loader
 
 
-def _create_mds_loaders(args, hw):
-    """Create MosaicML MDS streaming dataloaders from MinIO / S3."""
-    from RayNet.streaming import create_streaming_dataloaders
-    from RayNet.streaming.minio_utils import configure_minio_env
-
-    # Configure MinIO env vars if endpoint is provided
-    if args.minio_endpoint:
-        configure_minio_env(
-            args.minio_endpoint,
-            os.environ.get('AWS_ACCESS_KEY_ID', 'minioadmin'),
-            os.environ.get('AWS_SECRET_ACCESS_KEY', 'minioadmin'),
-        )
-
-    print(f"MDS streaming: train={args.mds_train}, val={args.mds_val}")
-
-    # Data augmentation matching GazeGene paper (Sec 4.1.3):
-    # random translation + color jitter
-    from torchvision import transforms as T
-    train_transform = T.Compose([
-        T.ColorJitter(brightness=0.4, contrast=0.4,
-                      saturation=0.2, hue=0.1),
-        T.RandomAffine(degrees=0, translate=(0.05, 0.05)),
-    ])
-
-    train_loader, val_loader = create_streaming_dataloaders(
-        remote_train=args.mds_train,
-        remote_val=args.mds_val,
-        local_cache=os.path.join(args.output_dir, 'mds_cache'),
-        batch_size=hw['batch_size'],
-        num_workers=hw['num_workers'],
-        transform=train_transform,
-        pin_memory=hw['pin_memory'],
-        prefetch_factor=hw['prefetch_factor'],
-        persistent_workers=hw['persistent_workers'],
-        download_timeout=120,
-        samples_per_subject=args.samples_per_subject
-    )
-
-    print(f"  Samples per subject: {args.samples_per_subject} samples")
-    print(f"  Train dataset: {len(train_loader.dataset)} samples, "
-          f"{len(train_loader)} batches")
-    print(f"  Val dataset:   {len(val_loader.dataset)} samples, "
-          f"{len(val_loader)} batches")
-
-    return train_loader, val_loader
-
-
 def _create_mds_mv_loader(args, hw):
     """Create multi-view MDS loaders (both train and val).
 
@@ -1553,50 +1234,10 @@ def _create_mds_mv_loader(args, hw):
     return train_loader_mv, val_loader_mv
 
 
-def _create_streaming_loaders(args, hw):
-    """Validate streaming args at startup (WebDataset mode)."""
-    if not args.dataset_url:
-        raise ValueError("--dataset_url required when --streaming is set")
-    print(f"WebDataset streaming mode: {args.dataset_url}")
-
-
-def _get_streaming_loaders(args, hw, cfg):
-    """Create streaming dataloaders for the current phase."""
-    from RayNet.webdataset_utils import (
-        create_streaming_dataloader,
-        create_multiview_streaming_dataloader,
-    )
-
-    if cfg.get('multiview'):
-        train_loader = create_multiview_streaming_dataloader(
-            urls=args.dataset_url,
-            mv_groups=hw['mv_groups'],
-            num_workers=hw['num_workers'],
-            shuffle=True,
-        )
-    else:
-        train_loader = create_streaming_dataloader(
-            urls=args.dataset_url,
-            batch_size=hw['batch_size'],
-            num_workers=hw['num_workers'],
-            shuffle=True,
-        )
-
-    val_url = args.val_dataset_url or args.dataset_url
-    val_loader = create_streaming_dataloader(
-        urls=val_url,
-        batch_size=hw['batch_size'],
-        num_workers=hw['num_workers'],
-        shuffle=False,
-    )
-
-    return train_loader, val_loader
-
-
 # ============== CLI ==============
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='RayNet v3 Training')
+    parser = argparse.ArgumentParser(description='RayNet v5 Training')
 
     # Data
     parser.add_argument('--data_dir', type=str, default=None,
@@ -1614,27 +1255,10 @@ def parse_args():
     parser.add_argument('--mds_val', type=str, default=None,
                         help='MDS shard URL for validation (e.g. s3://gazegene/val)')
 
-    # WebDataset streaming (legacy)
-    parser.add_argument('--streaming', action='store_true',
-                        help='Use WebDataset streaming instead of local disk')
-    parser.add_argument('--dataset_url', type=str, default=None,
-                        help='WebDataset shard URL pattern for training')
-    parser.add_argument('--val_dataset_url', type=str, default=None,
-                        help='WebDataset shard URL pattern for validation')
-
-    # Model
-    parser.add_argument('--core_backbone', type=str, default='repnext_m3',
-                        choices=['repnext_m0', 'repnext_m1', 'repnext_m2',
-                                 'repnext_m3', 'repnext_m4', 'repnext_m5'])
-    parser.add_argument('--pose_backbone', type=str, default='repnext_m1',
-                        choices=['repnext_m0', 'repnext_m1', 'repnext_m2',
-                                 'none'],
-                        help='Pose encoder backbone (separate from main). '
-                             '"none" disables pose encoder.')
+    # Model — v5 uses RepNeXt-M1 for all branches (shared stem + 3 branches)
     parser.add_argument('--core_backbone_weight_path', type=str, default=None,
-                        help='Path to pretrained core backbone  weights(not fused)')
-    parser.add_argument('--pose_backbone_weight_path', type=str, default=None,
-                        help='Path to pretrained head pose  weights(not fused)')
+                        help='Path to pretrained RepNeXt-M1 weights '
+                             '(loaded into all 4 M1 instances: shared + landmark + gaze + pose)')
 
     # Hardware profile
     parser.add_argument('--profile', type=str, default='default',
@@ -1692,17 +1316,10 @@ def parse_args():
                              'formulation changed between the source run and '
                              'the current code (e.g. tanh/exp → direct '
                              'cm→m SmoothL1). Rotation rows 0:6 are preserved.')
-    parser.add_argument('--reset_bridge', action='store_true',
-                        help='After warmstart, zero-init LandmarkGazeBridge '
-                             'out_proj so the bridge starts as a pure identity '
-                             '(skip connection). Required when transitioning '
-                             'to a stage with bridge enabled from a stage '
-                             'where bridge was disabled (e.g. Stage 2 → 3).')
-
     args = parser.parse_args()
 
-    if not args.streaming and not args.mds_streaming and args.data_dir is None:
-        parser.error("--data_dir is required when not using --streaming or --mds_streaming")
+    if not args.mds_streaming and args.data_dir is None:
+        parser.error("--data_dir is required when not using --mds_streaming")
 
     if args.mds_streaming and (not args.mds_train or not args.mds_val):
         parser.error("--mds_streaming requires both --mds_train and --mds_val")
