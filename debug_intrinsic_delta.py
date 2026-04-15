@@ -126,6 +126,39 @@ def project_point(K, P_ccs):
     return u[0] / u[2], u[1] / u[2]
 
 
+def project_candidates(K_crop, P, R_cam, T_cam, head_R, head_t):
+    """
+    Try several frame conventions and return {name: (u, v, Z)}.
+    Whichever one lands on the eye reveals the ground-truth frame for P.
+    """
+    P = np.asarray(P, dtype=np.float64).reshape(3)
+    R_cam = np.asarray(R_cam, dtype=np.float64)
+    T_cam = np.asarray(T_cam, dtype=np.float64).reshape(3)
+    head_R = np.asarray(head_R, dtype=np.float64)
+    head_t = np.asarray(head_t, dtype=np.float64).reshape(3)
+
+    variants = {
+        'ccs_raw':              P,
+        'ccs_y_flip':           P * np.array([1., -1., 1.]),
+        'ccs_yz_flip':          P * np.array([1., -1., -1.]),
+        'wcs_to_ccs(R,T)':      R_cam @ P + T_cam,
+        'wcs_to_ccs(Rt,T)':     R_cam.T @ P + T_cam,
+        'wcs_to_ccs(R,-RT)':    R_cam @ (P - T_cam),
+        'wcs_to_ccs(Rt,-RtT)':  R_cam.T @ (P - T_cam),
+        'hcs_to_ccs(hR,ht)':    head_R @ P + head_t,
+        'hcs_to_ccs(hRt,ht)':   head_R.T @ P + head_t,
+    }
+    out = {}
+    for name, Q in variants.items():
+        Z = Q[2]
+        if abs(Z) < 1e-6:
+            out[name] = (float('nan'), float('nan'), Z)
+            continue
+        u = K_crop @ Q
+        out[name] = (u[0] / u[2], u[1] / u[2], Z)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('base_dir', help='Path to GazeGene_FaceCrops root')
@@ -177,6 +210,13 @@ def main():
         # Reprojection test: project 3D eyeball center with K_crop.
         u_c, v_c = project_point(K_crop, eye_3d)
 
+        # Try candidate frames to find the one that puts the eye in bounds.
+        R_cam = sample['R_cam'].numpy().astype(np.float64)
+        T_cam = sample['T_cam'].numpy().astype(np.float64)
+        head_R = sample['head_R'].numpy().astype(np.float64)
+        head_t = sample['head_t'].numpy().astype(np.float64)
+        cands = project_candidates(K_crop, eye_3d, R_cam, T_cam, head_R, head_t)
+
         print(f"\n--- sample {i} subj={sample['subject']} cam={sample['cam_id']} "
               f"frame={sample['frame_idx']} ---")
         print(f"  W_o x H_o = {W_o:.1f} x {H_o:.1f}")
@@ -186,13 +226,23 @@ def main():
         print(f"  recrop vs crop MAE (0-255): {mae:.2f}")
         print(f"  eyeball_3d projected to crop: ({u_c:.1f}, {v_c:.1f})  "
               f"[in-bounds: {0 <= u_c < 224 and 0 <= v_c < 224}]")
+        print(f"  candidate frames (→ crop pixels, Z):")
+        for name, (uu, vv, Z) in cands.items():
+            inb = (0 <= uu < 224 and 0 <= vv < 224)
+            mark = '  <-- IN BOUNDS' if inb else ''
+            print(f"    {name:22s}: ({uu:7.1f}, {vv:7.1f})  Z={Z:+.3f}{mark}")
 
         fig, axes = plt.subplots(1, 4, figsize=(16, 4))
         axes[0].imshow(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
-        axes[0].scatter([u_c], [v_c], c='lime', s=60, marker='x',
-                        label=f'K_crop·eye_3d\n({u_c:.1f},{v_c:.1f})')
-        axes[0].legend(loc='lower right', fontsize=8)
-        axes[0].set_title('input 224 crop + reprojected eye')
+        # Overlay every candidate; the one landing on the eye is the right frame.
+        colors = plt.cm.tab10(np.linspace(0, 1, len(cands)))
+        for (name, (uu, vv, _)), c in zip(cands.items(), colors):
+            if not (np.isfinite(uu) and np.isfinite(vv)):
+                continue
+            axes[0].scatter([uu], [vv], s=60, marker='x', color=c, label=name)
+        axes[0].set_xlim(-20, 244); axes[0].set_ylim(244, -20)
+        axes[0].legend(loc='upper right', fontsize=6, framealpha=0.7)
+        axes[0].set_title('crop + candidate reprojections')
 
         axes[1].imshow(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
         rect = plt.Rectangle((x1, y1), x2 - x1, y2 - y1,
