@@ -33,7 +33,9 @@ MDS_COLUMNS = {
     'landmark_coords_px': 'ndarray',
     'optical_axis': 'ndarray',
     'R_kappa': 'ndarray',
-    'K': 'ndarray',
+    'K': 'ndarray',                   # K_cropped rescaled to 224
+    'intrinsic_original': 'ndarray',  # K_orig (full camera) — for BoxEncoder GT / rederivation
+    'face_bbox_gt': 'ndarray',        # (3,) [x_p, y_p, L_x] from Intrinsic Delta
     'R_cam': 'ndarray',
     'T_cam': 'ndarray',
     'eyeball_center_3d': 'ndarray',
@@ -46,6 +48,31 @@ MDS_COLUMNS = {
     'cam_id': 'int',
     'frame_idx': 'int',
 }
+
+
+def _sample_to_mds(sample):
+    """Assemble the MDS record for one GazeGeneDataset sample."""
+    return {
+        'image': image_to_jpeg_bytes(sample['image']),
+        'landmark_coords': sample['landmark_coords'].numpy(),
+        'landmark_coords_px': sample['landmark_coords_px'].numpy(),
+        'optical_axis': sample['optical_axis'].numpy(),
+        'R_kappa': sample['R_kappa'].numpy(),
+        'K': sample['K'].numpy(),
+        'intrinsic_original': sample['intrinsic_original'].numpy(),
+        'face_bbox_gt': sample['face_bbox_gt'].numpy().astype(np.float32),
+        'R_cam': sample['R_cam'].numpy(),
+        'T_cam': sample['T_cam'].numpy(),
+        'eyeball_center_3d': sample['eyeball_center_3d'].numpy(),
+        'pupil_center_3d': sample['pupil_center_3d'].numpy(),
+        'head_R': sample['head_R'].numpy(),
+        'head_t': sample['head_t'].numpy(),
+        'gaze_target': sample['gaze_target'].numpy(),
+        'gaze_depth': float(sample['gaze_depth']),
+        'subject': sample['subject'],
+        'cam_id': sample['cam_id'],
+        'frame_idx': sample['frame_idx'],
+    }
 
 
 def image_to_jpeg_bytes(img_tensor, quality=90):
@@ -97,29 +124,7 @@ def convert_to_mds(dataset, output_dir, split='train',
         size_limit=1 << 28,  # 256 mb
     ) as writer:
         for count, idx in enumerate(tqdm(indices, desc=f'MDS {split}')):
-            sample = dataset[idx]
-
-            mds_sample = {
-                'image': image_to_jpeg_bytes(sample['image']),
-                'landmark_coords': sample['landmark_coords'].numpy(),
-                'landmark_coords_px': sample['landmark_coords_px'].numpy(),
-                'optical_axis': sample['optical_axis'].numpy(),
-                'R_kappa': sample['R_kappa'].numpy(),
-                'K': sample['K'].numpy(),
-                'R_cam': sample['R_cam'].numpy(),
-                'T_cam': sample['T_cam'].numpy(),
-                'eyeball_center_3d': sample['eyeball_center_3d'].numpy(),
-                'pupil_center_3d': sample['pupil_center_3d'].numpy(),
-                'head_R': sample['head_R'].numpy(),
-                'head_t': sample['head_t'].numpy(),
-                'gaze_target': sample['gaze_target'].numpy(),
-                'gaze_depth': float(sample['gaze_depth']),
-                'subject': sample['subject'],
-                'cam_id': sample['cam_id'],
-                'frame_idx': sample['frame_idx'],
-            }
-
-            writer.write(mds_sample)
+            writer.write(_sample_to_mds(dataset[idx]))
 
     print(f"Done. {len(indices)} samples written to {output_dir}")
     return len(indices)
@@ -208,29 +213,7 @@ def convert_to_mds_chunked(data_dir, output_dir, subject_ids,
 
             for idx in tqdm(indices,
                             desc=f'MDS {split} chunk {ci + 1}'):
-                sample = ds[idx]
-                mds_sample = {
-                    'image': image_to_jpeg_bytes(sample['image']),
-                    'landmark_coords':
-                        sample['landmark_coords'].numpy(),
-                    'landmark_coords_px':
-                        sample['landmark_coords_px'].numpy(),
-                    'optical_axis': sample['optical_axis'].numpy(),
-                    'R_kappa': sample['R_kappa'].numpy(),
-                    'K': sample['K'].numpy(),
-                    'R_cam': sample['R_cam'].numpy(),
-                    'T_cam': sample['T_cam'].numpy(),
-                    'eyeball_center_3d':
-                        sample['eyeball_center_3d'].numpy(),
-                    'head_R': sample['head_R'].numpy(),
-                    'head_t': sample['head_t'].numpy(),
-                    'gaze_target': sample['gaze_target'].numpy(),
-                    'gaze_depth': float(sample['gaze_depth']),
-                    'subject': sample['subject'],
-                    'cam_id': sample['cam_id'],
-                    'frame_idx': sample['frame_idx'],
-                }
-                writer.write(mds_sample)
+                writer.write(_sample_to_mds(ds[idx]))
 
             total_written += len(indices)
 

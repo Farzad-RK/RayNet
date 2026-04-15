@@ -32,6 +32,37 @@ from RayNet.kappa import build_R_kappa
 IRIS_SUBSAMPLE_IDX = list(range(0, 100, 10))  # [0, 10, 20, ..., 90]
 
 
+def _intrinsic_delta_bbox(K_orig, K_crop_native, crop_w, crop_h):
+    """
+    Intrinsic Delta → BoxEncoder GT (x_p, y_p, L_x).
+
+    Given K_orig for the full camera and K_crop calibrated for a raw
+    (crop_w, crop_h) face crop, derive the face bounding box in original
+    image pixels and normalise to BoxEncoder inputs:
+        x_p ∈ [-1, 1]   face center x, normalised by W_o/2
+        y_p ∈ [-1, 1]   face center y, normalised by H_o/2
+        L_x >  0         face width / W_o  (focal-ratio proxy for depth)
+    where W_o = 2 * cx_o, H_o = 2 * cy_o (principal point assumed central).
+    """
+    f_ox, f_oy = K_orig[0, 0], K_orig[1, 1]
+    cx_o, cy_o = K_orig[0, 2], K_orig[1, 2]
+    f_cx, f_cy = K_crop_native[0, 0], K_crop_native[1, 1]
+    cx_c, cy_c = K_crop_native[0, 2], K_crop_native[1, 2]
+
+    s_x = f_cx / f_ox
+    s_y = f_cy / f_oy
+    x1 = cx_o - cx_c / s_x
+    y1 = cy_o - cy_c / s_y
+    x2 = x1 + crop_w / s_x
+    y2 = y1 + crop_h / s_y
+
+    W_o, H_o = 2.0 * cx_o, 2.0 * cy_o
+    x_p = float(((x1 + x2) * 0.5 - W_o * 0.5) / (W_o * 0.5))
+    y_p = float(((y1 + y2) * 0.5 - H_o * 0.5) / (H_o * 0.5))
+    L_x = float((x2 - x1) / W_o)
+    return np.array([x_p, y_p, L_x], dtype=np.float32)
+
+
 class GazeGeneDataset(Dataset):
     """
     GazeGene dataset for RayNet v4.
@@ -234,16 +265,22 @@ class GazeGeneDataset(Dataset):
         cam_info = self.camera_params.get(subj_num, {}).get(s['cam_id'], None)
         if cam_info is not None:
             intrinsic_original = np.array(cam_info['intrinsic_matrix'], dtype=np.float64)
-            intrinsic_cropped = np.array(s['K_cropped'], dtype=np.float64)
+            intrinsic_cropped_raw = np.array(s['K_cropped'], dtype=np.float64)
             # GazeGene K_cropped is calibrated for the raw jpg resolution
             # (typically 448x448). Rescale it into self.img_size pixel space
             # so reprojection (K_crop @ P_ccs) matches the resized tensor.
+            intrinsic_cropped = intrinsic_cropped_raw.copy()
             if orig_w != self.img_size or orig_h != self.img_size:
-                intrinsic_cropped = intrinsic_cropped.copy()
                 intrinsic_cropped[0, :] *= (self.img_size / orig_w)
                 intrinsic_cropped[1, :] *= (self.img_size / orig_h)
             R_cam = np.array(cam_info['R_mat'], dtype=np.float64)
             T_cam = np.array(cam_info['T_vec'], dtype=np.float64).flatten()
+
+            # --- Intrinsic Delta: derive BoxEncoder GT (x_p, y_p, L_x) ---
+            # Uses raw K_cropped + raw crop dims (orig_w/orig_h) so the result
+            # is independent of self.img_size resizing. Scale-invariant.
+            face_bbox_gt = _intrinsic_delta_bbox(
+                intrinsic_original, intrinsic_cropped_raw, orig_w, orig_h)
         else:
             raise FileNotFoundError(f"Camera info not found")
 
@@ -318,7 +355,8 @@ class GazeGeneDataset(Dataset):
             'R_kappa': torch.from_numpy(R_kappa).float(),                   # (3, 3)
             # Camera parameters for multi-view consistency
             'intrinsic_original': torch.from_numpy(intrinsic_original).float(),                               # (3, 3) intrinsics
-            'K':torch.from_numpy(intrinsic_cropped).float(),
+            'K':torch.from_numpy(intrinsic_cropped).float(),                # (3, 3) rescaled to self.img_size
+            'face_bbox_gt': torch.from_numpy(face_bbox_gt),                 # (3,) [x_p, y_p, L_x]
             'R_cam': torch.from_numpy(R_cam).float(),                       # (3, 3) extrinsic rotation
             'T_cam': torch.from_numpy(T_cam).float(),                       # (3,) extrinsic translation
             'head_R': torch.from_numpy(head_R).float(),                     # (3, 3) head pose rotation
@@ -395,7 +433,9 @@ def gazegene_collate_fn(batch):
     collated = {}
     tensor_keys = ['image', 'landmark_coords', 'landmark_coords_px',
                    'optical_axis', 'R_kappa',
-                   'K', 'R_cam', 'T_cam', 'head_R', 'head_t', 'eyeball_center_3d',
+                   'K', 'intrinsic_original', 'face_bbox_gt',
+                   'R_cam', 'T_cam', 'head_R', 'head_t',
+                   'eyeball_center_3d', 'pupil_center_3d',
                    'gaze_target', 'gaze_depth']
     scalar_keys = ['subject', 'cam_id', 'frame_idx']
 

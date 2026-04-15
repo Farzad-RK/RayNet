@@ -657,12 +657,19 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
         if gt_head_t is not None:
             gt_head_t = gt_head_t.to(device, non_blocking=True)
 
+        # Intrinsic-Delta face bbox GT for the MAGE BoxEncoder (v5 only).
+        # Shape (B, 3) = [x_p ∈ [-1,1], y_p ∈ [-1,1], L_x > 0].
+        face_bbox_gt = batch.get('face_bbox_gt')
+        if face_bbox_gt is not None:
+            face_bbox_gt = face_bbox_gt.to(device, non_blocking=True)
+
         mv_components = None
         # Forward pass with AMP autocast
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             if is_v5:
                 predictions = model(images, n_views=n_views,
                                     R_cam=R_cam, T_cam=T_cam,
+                                    face_bbox=face_bbox_gt,
                                     use_landmark_bridge=use_landmark_bridge,
                                     use_pose_bridge=use_pose_bridge)
             else:
@@ -863,10 +870,12 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
 
 @torch.no_grad()
 def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
-             amp_dtype=torch.float16, n_views=1):
+             amp_dtype=torch.float16, n_views=1, is_v5=False):
     """Run validation."""
     model.eval()
     use_bridge = not cfg.get('no_bridge', False)
+    use_landmark_bridge = cfg.get('use_landmark_bridge', True)
+    use_pose_bridge = cfg.get('use_pose_bridge', True)
     if not amp_enabled:
         amp_dtype = torch.float32
 
@@ -890,10 +899,21 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
         R_cam = batch['R_cam'].to(device, non_blocking=True)
         T_cam = batch['T_cam'].to(device, non_blocking=True)
 
+        face_bbox_gt = batch.get('face_bbox_gt')
+        if face_bbox_gt is not None:
+            face_bbox_gt = face_bbox_gt.to(device, non_blocking=True)
+
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            predictions = model(images, n_views=n_views,
-                                R_cam=R_cam, T_cam=T_cam,
-                                use_bridge=use_bridge)
+            if is_v5:
+                predictions = model(images, n_views=n_views,
+                                    R_cam=R_cam, T_cam=T_cam,
+                                    face_bbox=face_bbox_gt,
+                                    use_landmark_bridge=use_landmark_bridge,
+                                    use_pose_bridge=use_pose_bridge)
+            else:
+                predictions = model(images, n_views=n_views,
+                                    R_cam=R_cam, T_cam=T_cam,
+                                    use_bridge=use_bridge)
 
             pred_hm = predictions['landmark_heatmaps']
             pred_coords = predictions['landmark_coords']
@@ -1286,6 +1306,7 @@ def train(args):
             amp_enabled=hw['amp'],
             amp_dtype=amp_dtype,
             n_views=active_n_views,
+            is_v5=is_v5,
         )
 
         # Step scheduler
