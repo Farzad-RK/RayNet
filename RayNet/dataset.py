@@ -235,6 +235,13 @@ class GazeGeneDataset(Dataset):
         if cam_info is not None:
             intrinsic_original = np.array(cam_info['intrinsic_matrix'], dtype=np.float64)
             intrinsic_cropped = np.array(s['K_cropped'], dtype=np.float64)
+            # GazeGene K_cropped is calibrated for the raw jpg resolution
+            # (typically 448x448). Rescale it into self.img_size pixel space
+            # so reprojection (K_crop @ P_ccs) matches the resized tensor.
+            if orig_w != self.img_size or orig_h != self.img_size:
+                intrinsic_cropped = intrinsic_cropped.copy()
+                intrinsic_cropped[0, :] *= (self.img_size / orig_w)
+                intrinsic_cropped[1, :] *= (self.img_size / orig_h)
             R_cam = np.array(cam_info['R_mat'], dtype=np.float64)
             T_cam = np.array(cam_info['T_vec'], dtype=np.float64).flatten()
         else:

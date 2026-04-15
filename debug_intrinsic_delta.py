@@ -183,20 +183,28 @@ def main():
     for i in range(n):
         sample = ds[i]
         K_orig = sample['intrinsic_original'].numpy().astype(np.float64)
-        K_crop = sample['K'].numpy().astype(np.float64)
+        K_crop_native = sample['K'].numpy().astype(np.float64)  # calibrated for raw jpg
         eye_3d = sample['eyeball_center_3d'].numpy().astype(np.float64)
 
-        # Tensor -> BGR uint8 image.
-        img_t = sample['image']
-        if img_t.dtype != np.uint8 and hasattr(img_t, 'dtype'):
-            arr = img_t.numpy()
-        else:
-            arr = img_t.numpy()
-        if arr.dtype != np.uint8:
-            arr = (arr.astype(np.float32)).clip(0, 255).astype(np.uint8)
-        crop_rgb = np.transpose(arr, (1, 2, 0))
-        crop_bgr = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR)
+        # Read the RAW face crop from disk (GazeGene's K_crop is native-resolution).
+        raw_path = ds.samples[i]['img_path']
+        raw_bgr = cv2.imread(raw_path)
+        raw_h, raw_w = raw_bgr.shape[:2]
 
+        # Rescale K_crop into the 224 tensor space for BoxEncoder / losses.
+        sx_224 = 224.0 / raw_w
+        sy_224 = 224.0 / raw_h
+        K_crop = K_crop_native.copy()
+        K_crop[0, :] *= sx_224
+        K_crop[1, :] *= sy_224
+
+        # Also build the 224 tensor view for consistency.
+        crop_bgr = cv2.resize(raw_bgr, (224, 224), interpolation=cv2.INTER_LINEAR)
+
+        # Note: derive_crop_box is scale-invariant under proportional K_crop
+        # rescaling, so using K_crop (224-space) + crop_size=224 yields the
+        # same (x1,y1,x2,y2) in the ORIGINAL camera frame as K_crop_native +
+        # crop_size=raw_w would.
         x_p, y_p, L_x, extras = box_encoder_params(K_orig, K_crop, 224)
         x1, y1, x2, y2, W_o, H_o = extras
 
@@ -207,8 +215,10 @@ def main():
         diff = cv2.absdiff(crop_bgr, recrop)
         mae = float(diff.mean())
 
-        # Reprojection test: project 3D eyeball center with K_crop.
+        # Reprojection test: project 3D eyeball center with K_crop (224-space).
         u_c, v_c = project_point(K_crop, eye_3d)
+        # Also project against raw K_crop (GazeGene visualizer convention).
+        u_raw, v_raw = project_point(K_crop_native, eye_3d)
 
         # Try candidate frames to find the one that puts the eye in bounds.
         R_cam = sample['R_cam'].numpy().astype(np.float64)
@@ -224,8 +234,11 @@ def main():
               f"   [w={x2 - x1:.2f}, h={y2 - y1:.2f}]")
         print(f"  BoxEncoder GT: x_p={x_p:+.4f}  y_p={y_p:+.4f}  L_x={L_x:.4f}")
         print(f"  recrop vs crop MAE (0-255): {mae:.2f}")
-        print(f"  eyeball_3d projected to crop: ({u_c:.1f}, {v_c:.1f})  "
+        print(f"  raw jpg size: {raw_w}x{raw_h} (rescale K by {sx_224:.4f}, {sy_224:.4f})")
+        print(f"  eyeball_3d  @ K_crop (224): ({u_c:.1f}, {v_c:.1f})  "
               f"[in-bounds: {0 <= u_c < 224 and 0 <= v_c < 224}]")
+        print(f"  eyeball_3d  @ K_crop (raw): ({u_raw:.1f}, {v_raw:.1f})  "
+              f"[in-bounds: {0 <= u_raw < raw_w and 0 <= v_raw < raw_h}]")
         print(f"  candidate frames (→ crop pixels, Z):")
         for name, (uu, vv, Z) in cands.items():
             inb = (0 <= uu < 224 and 0 <= vv < 224)
