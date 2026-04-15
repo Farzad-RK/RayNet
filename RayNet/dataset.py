@@ -20,6 +20,7 @@ import os
 import pickle
 import numpy as np
 import torch
+from torch.ao.nn import intrinsic
 from torch.utils.data import Dataset, DataLoader, Sampler
 import cv2
 from collections import defaultdict
@@ -230,14 +231,14 @@ class GazeGeneDataset(Dataset):
                                      interpolation=cv2.INTER_LINEAR)
 
         # Get camera extrinsics (for multi-view world-frame transform)
-        K = np.array(s['K_cropped'], dtype=np.float64)
         cam_info = self.camera_params.get(subj_num, {}).get(s['cam_id'], None)
         if cam_info is not None:
+            intrinsic_original = np.array(cam_info['intrinsic_matrix'], dtype=np.float64)
+            intrinsic_cropped = np.array(s['K_cropped'], dtype=np.float64)
             R_cam = np.array(cam_info['R_mat'], dtype=np.float64)
             T_cam = np.array(cam_info['T_vec'], dtype=np.float64).flatten()
         else:
-            R_cam = np.eye(3, dtype=np.float64)
-            T_cam = np.zeros(3, dtype=np.float64)
+            raise FileNotFoundError(f"Camera info not found")
 
         # Subject attributes
         subject_attrs = self.attr_dict.get(subj_num, {})
@@ -309,7 +310,8 @@ class GazeGeneDataset(Dataset):
             'optical_axis': torch.from_numpy(optical_axis_ccs).float(),     # (3,) CCS unit vector
             'R_kappa': torch.from_numpy(R_kappa).float(),                   # (3, 3)
             # Camera parameters for multi-view consistency
-            'K': torch.from_numpy(K).float(),                               # (3, 3) intrinsics
+            'intrinsic_original': torch.from_numpy(intrinsic_original).float(),                               # (3, 3) intrinsics
+            'K':torch.from_numpy(intrinsic_cropped).float(),
             'R_cam': torch.from_numpy(R_cam).float(),                       # (3, 3) extrinsic rotation
             'T_cam': torch.from_numpy(T_cam).float(),                       # (3,) extrinsic translation
             'head_R': torch.from_numpy(head_R).float(),                     # (3, 3) head pose rotation
