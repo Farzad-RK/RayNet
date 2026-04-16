@@ -5,6 +5,7 @@
 - [[Dataset]]
 - [[Training Guide]]
 - [[Loss Functions]]
+- [[Normalization]]
 - [[Multi-View Consistency]]
 - [[MosaicML Streaming]]
 - [[Geometry and Kappa]]

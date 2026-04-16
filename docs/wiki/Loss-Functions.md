@@ -1,15 +1,18 @@
 # Loss Functions
 
-All loss functions used in RayNet v4.1 training.
+All loss functions used in RayNet v5 training.
 
 ## Overview
 
 ```
-Total Loss = lam_lm    * Landmark_Loss
-           + lam_gaze  * Gaze_Loss
-           + lam_pose  * Pose_Rotation_Loss (geodesic)
-           + lam_trans  * Pose_Translation_Loss (log-depth SmoothL1)
-           + lam_ray   * Ray_Target_Loss
+Total Loss = lam_lm           * Landmark_Loss
+           + lam_gaze         * Gaze_Loss
+           + lam_eyeball      * Eyeball_Center_Loss
+           + lam_pupil        * Pupil_Center_Loss
+           + lam_geom_angular * Geometric_Angular_Loss
+           + lam_pose         * Pose_Rotation_Loss (geodesic)
+           + lam_trans        * Pose_Translation_Loss (log-depth SmoothL1)
+           + lam_ray          * Ray_Target_Loss
            + mv_weight * (lam_reproj * Gaze_Ray_Consistency
                         + lam_mask  * Landmark_Shape_Consistency)
 ```
@@ -88,7 +91,52 @@ angle = atan2(||cross||, dot)       # stable everywhere
 
 ---
 
-## 3. Pose Rotation Loss (Geodesic)
+## 3. Eyeball Center Loss
+
+**Source**: `RayNet/losses.py:eyeball_center_loss`
+
+L1 loss on predicted vs GT eyeball center in camera coordinate space (CCS, centimeters). From GazeGene Sec 4.2.2, loss 1.
+
+```
+L_eyeball = L1(pred_eyeball_3d, gt_eyeball_3d)     (both in CCS, cm)
+```
+
+Active in Stage 2+ (off in Stage 1 where gaze is disabled).
+
+---
+
+## 4. Pupil Center Loss
+
+**Source**: `RayNet/losses.py:pupil_center_loss`
+
+L1 loss on predicted vs GT pupil center in CCS (centimeters). From GazeGene Sec 4.2.2, loss 2.
+
+```
+L_pupil = L1(pred_pupil_3d, gt_pupil_3d)     (both in CCS, cm)
+```
+
+Active in Stage 2+ (off in Stage 1).
+
+---
+
+## 5. Geometric Angular Loss
+
+**Source**: `RayNet/losses.py:geometric_angular_loss`
+
+Angular error between the optical axis derived from predicted 3D geometry and the GT optical axis (GazeGene Sec 4.2.2, loss 4).
+
+```
+pred_optical_axis = normalize(pred_pupil - pred_eyeball)
+L_geom_angular = angular_error(pred_optical_axis, gt_optical_axis)
+```
+
+This ensures geometric consistency — the model cannot cheat by predicting correct eyeball/pupil positions but wrong relative direction. Uses `atan2` for numerical stability.
+
+Delayed until Phase 3 in Stage 2 (geometry must converge first). Active earlier in Stage 3 where bridges provide additional structure.
+
+---
+
+## 6. Pose Rotation Loss (Geodesic)
 
 **Source**: `RayNet/losses.py:pose_prediction_loss`, `RayNet/losses.py:geodesic_loss`
 
@@ -106,7 +154,7 @@ This measures the actual rotation angle needed to go from predicted to GT orient
 
 ---
 
-## 4. Pose Translation Loss (Log-Depth SmoothL1)
+## 7. Pose Translation Loss (Log-Depth SmoothL1)
 
 **Source**: `RayNet/losses.py:translation_loss`
 
@@ -127,7 +175,7 @@ Log-space comparison for depth makes the loss **scale-invariant**: a 10% depth e
 
 ---
 
-## 5. Ray-to-Target Loss
+## 8. Ray-to-Target Loss
 
 **Source**: `RayNet/losses.py:ray_target_loss`
 
@@ -144,7 +192,7 @@ Active in Stage 2 Phase 2+ and Stage 3 Phase 2+.
 
 ---
 
-## 6. Gaze Ray Consistency Loss
+## 9. Gaze Ray Consistency Loss
 
 **Source**: `RayNet/multiview_loss.py:gaze_ray_consistency_loss`
 
@@ -162,7 +210,7 @@ See [[Multi-View Consistency]] for details.
 
 ---
 
-## 7. Landmark Shape Consistency Loss
+## 10. Landmark Shape Consistency Loss
 
 **Source**: `RayNet/multiview_loss.py:landmark_shape_consistency_loss`
 
@@ -184,6 +232,11 @@ See [[Multi-View Consistency]] for details.
 
 ```python
 total = lam_lm * landmark_loss + lam_gaze * gaze_loss
+
+# 3D eyeball structure (active when lam_eyeball/pupil/geom_angular > 0)
+total += lam_eyeball * eyeball_center_loss
+total += lam_pupil * pupil_center_loss
+total += lam_geom_angular * geometric_angular_loss
 
 # Ray-to-target (active when lam_ray > 0 and GT available)
 total += lam_ray * ray_target_loss
@@ -207,6 +260,9 @@ The `mv_weight` ramps linearly from 0 to 1 over the first 10 epochs to smooth mu
 | Total loss | `loss` / `train_total` | Weighted sum of all active losses |
 | Landmark | `landmark` / `train_landmark` | Heatmap MSE + coord L1 (normalized by feat area) |
 | Angular error | `angular_deg` / `train_angular_deg` | Degrees (metric only, not in loss) |
+| Eyeball center | `eyeball` | L1 on 3D eyeball center (cm) |
+| Pupil center | `pupil` | L1 on 3D pupil center (cm) |
+| Geometric angular | `geom_angular` | Angular error from predicted geometry (rad) |
 | Gaze consistency | `gaze_consist` / `train_reproj` | Multi-view gaze ray agreement |
 | Shape consistency | `shape` / `train_mask` | Multi-view landmark shape agreement |
 | Ray-to-target | `ray_target` / `train_ray_target` | Gaze ray geometric constraint |
@@ -219,22 +275,26 @@ The `mv_weight` ramps linearly from 0 to 1 over the first 10 epochs to smooth mu
 
 ### Stage 1: Landmark + Pose Baseline
 
-| Phase | Epochs | lam_lm | lam_gaze | lam_pose | lam_trans | lam_ray | Multi-view |
-|-------|--------|--------|----------|----------|-----------|---------|------------|
-| 1 | 1-10 | 1.0 | 0.0 | 0.5 | 0.5 | 0.0 | Off |
-| 2 | 11-20 | 1.0 | 0.0 | 1.0 | 1.0 | 0.0 | Off |
+| Phase | Epochs | lam_lm | lam_gaze | lam_eyeball | lam_pupil | lam_geom_angular | lam_pose | lam_trans | lam_ray | Multi-view |
+|-------|--------|--------|----------|-------------|-----------|-----------------|----------|-----------|---------|------------|
+| 1 | 1-8 | 1.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.5 | 0.5 | 0.0 | Off |
+| 2 | 9-15 | 1.0 | 0.0 | 0.0 | 0.0 | 0.0 | 1.0 | 1.0 | 0.0 | Off |
 
-### Stage 2: Add Gaze, No Bridge
+### Stage 2: Add Gaze + 3D Eyeball (No Bridge)
 
-| Phase | Epochs | lam_lm | lam_gaze | lam_pose | lam_trans | lam_ray | lam_reproj | lam_mask |
-|-------|--------|--------|----------|----------|-----------|---------|------------|----------|
-| 1 | 1-5 | 1.0 | 0.1 | 0.5 | 0.5 | 0.0 | 0.0 | 0.0 |
-| 2 | 6-15 | 1.0 | 0.5 | 0.5 | 0.5 | 0.1 | 0.05 | 0.02 |
-| 3 | 16-25 | 0.5 | 1.0 | 0.5 | 0.5 | 0.3 | 0.1 | 0.05 |
+| Phase | Epochs | lam_lm | lam_gaze | lam_eyeball | lam_pupil | lam_geom_angular | lam_pose | lam_trans | lam_ray | lam_reproj | lam_mask |
+|-------|--------|--------|----------|-------------|-----------|-----------------|----------|-----------|---------|------------|----------|
+| 1 | 1-5 | 1.0 | 0.1 | 0.1 | 0.1 | 0.0 | 0.5 | 0.5 | 0.0 | 0.0 | 0.0 |
+| 2 | 6-15 | 1.0 | 0.5 | 0.3 | 0.3 | 0.0 | 0.5 | 0.5 | 0.1 | 0.05 | 0.02 |
+| 3 | 16-25 | 1.0 | 1.0 | 0.5 | 0.5 | 0.2 | 0.5 | 0.5 | 0.3 | 0.1 | 0.05 |
 
-### Stage 3: Full Pipeline with Bridge
+### Stage 3: Full Pipeline with Bridges
 
-Same weights as Stage 2, but with `use_bridge=True` (LandmarkGazeBridge enabled).
+| Phase | Epochs | lam_lm | lam_gaze | lam_eyeball | lam_pupil | lam_geom_angular | lam_pose | lam_trans | lam_ray | lam_reproj | lam_mask |
+|-------|--------|--------|----------|-------------|-----------|-----------------|----------|-----------|---------|------------|----------|
+| 1 | 1-5 | 1.0 | 0.3 | 0.3 | 0.3 | 0.1 | 0.5 | 0.5 | 0.0 | 0.0 | 0.0 |
+| 2 | 6-15 | 1.0 | 0.5 | 0.5 | 0.5 | 0.2 | 0.5 | 0.5 | 0.1 | 0.05 | 0.02 |
+| 3 | 16-25 | 0.5 | 1.0 | 0.5 | 0.5 | 0.3 | 0.5 | 0.5 | 0.3 | 0.1 | 0.05 |
 
 ---
 

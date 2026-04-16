@@ -35,8 +35,8 @@ python -m RayNet.train \
     --data_dir /path/to/GazeGene_FaceCrops \
     --stage 1 \
     --core_backbone_weight_path /path/to/repnext_m1_distill_300e.pth \
-    --profile default \
-    --epochs 20
+    --pose_backbone_weight_path /path/to/repnext_m1_distill_300e.pth \
+    --profile default
 ```
 
 ### 3. Train on A100 (MDS streaming from MinIO)
@@ -53,6 +53,7 @@ python -m RayNet.train \
     --stage 3 \
     --profile a100 \
     --core_backbone_weight_path /path/to/repnext_m1_distill_300e.pth \
+    --pose_backbone_weight_path /path/to/repnext_m1_distill_300e.pth \
     --ckpt_bucket raynet-checkpoints \
     --minio_endpoint http://YOUR_SERVER_IP:9000
 ```
@@ -115,6 +116,7 @@ RayNet/
 | [[Dataset]] | GazeGene format, pickle files, data loading, MDS shard schema |
 | [[Training Guide]] | Staged training, phases, loss weights, hardware profiles, CLI |
 | [[Loss Functions]] | Landmark, gaze, 3D eyeball structure, pose, multi-view consistency |
+| [[Normalization]] | Easy-Norm (MAGE), split pipeline, coordinate spaces |
 | [[Multi-View Consistency]] | Gaze ray + landmark shape consistency across 9 cameras |
 | [[MosaicML Streaming]] | MDS shards, MinIO deployment, streaming dataloaders |
 | [[Geometry and Kappa]] | Kappa angles, Intrinsic Delta method, pupil diameter, gaze-to-screen |

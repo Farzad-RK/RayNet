@@ -56,6 +56,10 @@ def landmark_loss(pred_hm, pred_coords, gt_coords, feat_H, feat_W, sigma=2.0) ->
 def gaze_loss(pred_gaze, gt_gaze) -> Tensor         # L1 on unit vectors
 def angular_error(pred_gaze, gt_gaze) -> Tensor     # metrics only
 
+def eyeball_center_loss(pred_eyeball, gt_eyeball) -> Tensor   # L1 on 3D centers (cm)
+def pupil_center_loss(pred_pupil, gt_pupil) -> Tensor         # L1 on 3D centers (cm)
+def geometric_angular_loss(pred_eyeball, pred_pupil, gt_optical_axis) -> Tensor  # atan2-stable
+
 def rotation_6d_to_matrix(r6d) -> Tensor            # (B, 6) -> (B, 3, 3)
 def matrix_to_rotation_6d(R) -> Tensor              # (B, 3, 3) -> (B, 6)
 def geodesic_loss(pred_R, gt_R) -> Tensor

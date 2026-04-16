@@ -1,6 +1,6 @@
 # Multi-View Consistency
 
-RayNet v4.1 exploits the 9 synchronized cameras in GazeGene to impose geometric constraints during training. This provides "free" supervision that enforces anatomically consistent predictions across viewpoints.
+RayNet v5 exploits the 9 synchronized cameras in GazeGene to impose geometric constraints during training. This provides "free" supervision that enforces anatomically consistent predictions across viewpoints.
 
 **Source**: `RayNet/multiview_loss.py`
 
@@ -74,7 +74,7 @@ For the same subject looking at the same target, all 9 camera views should predi
 
 ### Why R_cam (not R_norm)?
 
-v4.1 uses camera extrinsics (`R_cam` from `camera_info.pkl`) rather than per-frame normalization rotation (`R_norm`). `R_cam` is **static per camera** -- it never changes across frames for the same camera. This provides more stable consistency targets than frame-dependent normalization rotations.
+RayNet uses camera extrinsics (`R_cam` from `camera_info.pkl`) rather than per-frame normalization rotation (`R_norm`). `R_cam` is **static per camera** -- it never changes across frames for the same camera. This provides more stable consistency targets than frame-dependent normalization rotations.
 
 ### Gradient Flow
 

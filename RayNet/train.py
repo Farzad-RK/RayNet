@@ -371,7 +371,8 @@ def get_phase(epoch):
         start, end = cfg['epochs']
         if start <= epoch <= end:
             return phase
-    return 3
+    # Fallback: return the last defined phase (not hardcoded 3)
+    return max(PHASE_CONFIG.keys())
 
 
 def get_phase_config(epoch):
@@ -776,6 +777,13 @@ def train(args):
     # Select stage config — updates module-level PHASE_CONFIG for get_phase/get_phase_config
     global PHASE_CONFIG
     PHASE_CONFIG = STAGE_CONFIGS[args.stage]
+
+    # Auto-cap --epochs to the last epoch defined in this stage's phase config
+    stage_max_epoch = max(cfg['epochs'][1] for cfg in PHASE_CONFIG.values())
+    if args.epochs > stage_max_epoch:
+        print(f"[auto-cap] --epochs={args.epochs} exceeds stage {args.stage} "
+              f"max epoch ({stage_max_epoch}). Capping to {stage_max_epoch}.")
+        args.epochs = stage_max_epoch
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
