@@ -1,6 +1,6 @@
 # Dataset
 
-RayNet v4.1 is built for the **GazeGene** multi-camera gaze dataset. This page describes the data format, directory layout, pickle file schemas, and how data flows into the model.
+RayNet v5 is built for the **GazeGene** multi-camera gaze dataset. This page describes the data format, directory layout, pickle file schemas, and how data flows into the model.
 
 ## GazeGene Overview
 

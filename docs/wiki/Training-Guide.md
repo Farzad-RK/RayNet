@@ -1,18 +1,16 @@
 # Training Guide
 
-Complete guide to training RayNet v4.1, covering staged training, hardware profiles, MDS streaming, checkpointing, and resume.
+Complete guide to training RayNet v5, covering staged training, hardware profiles, MDS streaming, checkpointing, and resume.
 
 ## Prerequisites
 
 1. **GazeGene dataset** -- either:
    - Local disk: raw GazeGene_FaceCrops directory
    - MinIO/S3: MDS shards (see [[MosaicML Streaming]])
-   - HuggingFace Hub: WebDataset shards (see [[WebDataset Streaming]])
 2. Python 3.9+ with CUDA-capable GPU
 3. Dependencies installed: `pip install -r requirements.txt`
 4. Pretrained backbone weights (distilled, non-fused `.pth` format):
-   - `repnext_m3_distill_300e.pth` (main backbone)
-   - `repnext_m1_distill_300e.pth` (pose backbone)
+   - `repnext_m1_distill_300e.pth` (used for all branches — shared stem + 3 branch encoders)
 
 ## Data Split
 
@@ -27,66 +25,73 @@ Each subject has up to ~2000 frames across 9 cameras (~18,000 samples/subject).
 
 ## 3-Stage Training Strategy
 
-RayNet v4.1 uses a staged training curriculum to establish baselines before combining tasks. Each stage validates a specific hypothesis before proceeding.
+RayNet v5 uses a staged training curriculum to establish baselines before combining tasks. Each stage validates a specific hypothesis before proceeding.
+
+> **Auto-cap**: `--epochs` is automatically capped to the stage's last configured epoch. You can pass `--epochs 30` (the default) for any stage and it will stop at the right epoch.
 
 ### Stage 1: Landmark + Pose Baseline (no gaze)
 
-**Purpose**: Validate both backbones learn useful representations independently.
+**Purpose**: Validate shared stem + branch encoders learn useful features independently. Gaze head receives no gradient — angular error will be ~120° (random).
 
 **Expectations**:
-- Landmark px error < 5px by epoch 10
-- Pose geodesic < 10 deg by epoch 15
-- Anomaly: pose stuck > 30 deg = backbone not learning face geometry
+- Landmark px error < 4px by epoch 8
+- Pose geodesic < 10° by epoch 12
+- Anomaly: pose stuck > 30° = backbone not learning face geometry
+- Angular error ~120° throughout is **expected** (gaze disabled)
 
 ```bash
 python -m RayNet.train --stage 1 --profile t4 \
-    --core_backbone_weight_path /path/to/repnext_m3_distill_300e.pth \
+    --core_backbone_weight_path /path/to/repnext_m1_distill_300e.pth \
     --pose_backbone_weight_path /path/to/repnext_m1_distill_300e.pth \
-    --data_dir /path/to/GazeGene_FaceCrops \
-    --epochs 20
+    --data_dir /path/to/GazeGene_FaceCrops
 ```
 
 | Phase | Epochs | lam_lm | lam_pose | lam_trans | lam_gaze | Bridge | Multi-view | max_norm |
 |-------|--------|--------|----------|-----------|----------|--------|------------|----------|
-| 1 | 1-10 | 1.0 | 0.5 | 0.5 | 0.0 | Off | Off | 5.0 |
-| 2 | 11-20 | 1.0 | 1.0 | 1.0 | 0.0 | Off | Off | 2.0 |
+| 1 | 1-8 | 1.0 | 0.5 | 0.5 | 0.0 | Off | Off | 5.0 |
+| 2 | 9-15 | 1.0 | 1.0 | 1.0 | 0.0 | Off | Off | 2.0 |
 
-### Stage 2: Add Gaze, No Bridge
+### Stage 2: Add Gaze + 3D Eyeball Structure (no bridges)
 
-**Purpose**: Test gaze learning without the crop-poisoned LandmarkGazeBridge.
+**Purpose**: Test gaze learning with explicit 3D eyeball geometry. Bridges are present but zero-init (identity/skip).
 
 **Expectations**:
 - Gaze angular error improving on BOTH train and val (no divergence)
-- Val gaze < 20 deg by epoch 15 = gaze learns from appearance alone
+- Val gaze < 20° by epoch 15 = gaze learns from appearance alone
+- Eyeball/pupil L1 converging
 - Anomaly: train gaze improving but val worsening = adversarial optimization in shared backbone
 
 ```bash
 python -m RayNet.train --stage 2 --profile t4 \
-    --core_backbone_weight_path /path/to/repnext_m3_distill_300e.pth \
+    --core_backbone_weight_path /path/to/repnext_m1_distill_300e.pth \
     --pose_backbone_weight_path /path/to/repnext_m1_distill_300e.pth \
-    --data_dir /path/to/GazeGene_FaceCrops \
-    --epochs 25
+    --data_dir /path/to/GazeGene_FaceCrops
 ```
 
-| Phase | Epochs | lam_lm | lam_gaze | lam_pose | lam_trans | lam_ray | Bridge | Multi-view | max_norm |
-|-------|--------|--------|----------|----------|-----------|---------|--------|------------|----------|
-| 1 | 1-5 | 1.0 | 0.1 | 0.5 | 0.5 | 0.0 | Off | Off | 5.0 |
-| 2 | 6-15 | 1.0 | 0.5 | 0.5 | 0.5 | 0.1 | Off | On | 2.0 |
-| 3 | 16-25 | 0.5 | 1.0 | 0.5 | 0.5 | 0.3 | Off | On | 2.0 |
+| Phase | Epochs | lam_lm | lam_gaze | lam_eyeball | lam_pupil | lam_geom_angular | lam_pose | lam_trans | lam_ray | Bridge | Multi-view |
+|-------|--------|--------|----------|-------------|-----------|-----------------|----------|-----------|---------|--------|------------|
+| 1 | 1-5 | 1.0 | 0.1 | 0.1 | 0.1 | 0.0 | 0.5 | 0.5 | 0.0 | Off | Off |
+| 2 | 6-15 | 1.0 | 0.5 | 0.3 | 0.3 | 0.0 | 0.5 | 0.5 | 0.1 | Off | On |
+| 3 | 16-25 | 1.0 | 1.0 | 0.5 | 0.5 | 0.2 | 0.5 | 0.5 | 0.3 | Off | On |
 
-### Stage 3: Full Pipeline with Bridge
+### Stage 3: Full Pipeline with Bridges + MAGE BoxEncoder
 
-**Purpose**: Test if LandmarkGazeBridge helps or hurts. Compare val gaze to Stage 2.
+**Purpose**: Activate inter-branch bridges (landmark cross-attention + pose SHMA modulation) and BoxEncoder fusion. Compare val gaze to Stage 2.
 
-Only run after Stage 2 shows gaze converging on validation. Same loss weights as Stage 2, but with `use_bridge=True`.
+Only run after Stage 2 shows gaze converging on validation. Bridges are zero-init from checkpoint (never trained in S1/S2) — they start as identity and learn gradually.
 
 ```bash
 python -m RayNet.train --stage 3 --profile t4 \
-    --core_backbone_weight_path /path/to/repnext_m3_distill_300e.pth \
+    --core_backbone_weight_path /path/to/repnext_m1_distill_300e.pth \
     --pose_backbone_weight_path /path/to/repnext_m1_distill_300e.pth \
-    --data_dir /path/to/GazeGene_FaceCrops \
-    --epochs 25
+    --data_dir /path/to/GazeGene_FaceCrops
 ```
+
+| Phase | Epochs | lam_lm | lam_gaze | lam_eyeball | lam_pupil | lam_geom_angular | lam_pose | lam_trans | lam_ray | Bridge | Multi-view |
+|-------|--------|--------|----------|-------------|-----------|-----------------|----------|-----------|---------|--------|------------|
+| 1 | 1-5 | 1.0 | 0.3 | 0.3 | 0.3 | 0.1 | 0.5 | 0.5 | 0.0 | On | Off |
+| 2 | 6-15 | 1.0 | 0.5 | 0.5 | 0.5 | 0.2 | 0.5 | 0.5 | 0.1 | On | On |
+| 3 | 16-25 | 0.5 | 1.0 | 0.5 | 0.5 | 0.3 | 0.5 | 0.5 | 0.3 | On | On |
 
 **Decision rule**: If bridge helps (val gaze improves over Stage 2), keep it. If bridge hurts (val gaze worse than Stage 2), remove it.
 
@@ -213,7 +218,7 @@ Model:
 
 Training:
   --stage {1,2,3}               Training stage (default: 3)
-  --epochs INT                  Total epochs (default: 30)
+  --epochs INT                  Total epochs (default: 30, auto-capped to stage max)
   --no_multiview                Disable multi-view (ablation)
   --gaze_only                   Disable landmark loss (ablation)
 
@@ -287,7 +292,9 @@ Per-batch granularity: `epoch, batch, loss, landmark, angular_deg, gaze_consist,
 | NaN loss | Check data pipeline. Geodesic loss is clamped; gaze uses L1 (no singularity) |
 | Slow first epoch with torch.compile | Normal (~60s compilation on first forward pass) |
 | Phase 2 low GPU utilization | Increase `--mv_groups` |
-| Gaze error ~42 deg in Stage 1 | Expected -- gaze head receives no gradients |
-| Pose loss stuck > 30 deg | Pose backbone not learning face geometry; check weights |
+| Gaze error ~120° in Stage 1 | Expected -- gaze head receives no gradients (`lam_gaze=0.0`) |
+| Pose loss stuck > 30° | Pose backbone not learning face geometry; check pretrained weights |
 | Train gaze improves, val worsens | Adversarial optimization -- try Stage 2 (no bridge) first |
 | MDS streaming hangs | Check MinIO connectivity; ensure `S3_ENDPOINT_URL` is set |
+| Landmark > 4px at Stage 1 end | Try more `--samples_per_subject` or more epochs (default auto-caps to 15 for Stage 1) |
+| `KeyError: N` in `get_phase_config` | Epochs exceed the stage's configured range; `--epochs` should be auto-capped but check your `--stage` flag |

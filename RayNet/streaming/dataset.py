@@ -89,12 +89,21 @@ class StreamingGazeGeneDataset(_Base):
                 raw['R_kappa'].astype(np.float32)),
             'K': torch.from_numpy(
                 raw['K'].astype(np.float32)),
+            'intrinsic_original': torch.from_numpy(
+                raw['intrinsic_original'].astype(np.float32))
+                if 'intrinsic_original' in raw else torch.zeros(3, 3),
+            'face_bbox_gt': torch.from_numpy(
+                raw['face_bbox_gt'].astype(np.float32))
+                if 'face_bbox_gt' in raw else torch.zeros(3),
             'R_cam': torch.from_numpy(
                 raw['R_cam'].astype(np.float32)),
             'T_cam': torch.from_numpy(
                 raw['T_cam'].astype(np.float32)),
             'eyeball_center_3d': torch.from_numpy(
                 raw['eyeball_center_3d'].astype(np.float32)),
+            'pupil_center_3d': torch.from_numpy(
+                raw['pupil_center_3d'].astype(np.float32))
+                if 'pupil_center_3d' in raw else torch.zeros(3),
             'head_R': torch.from_numpy(
                 raw['head_R'].astype(np.float32))
                 if 'head_R' in raw else torch.eye(3),
@@ -155,8 +164,9 @@ def _collate_fn(batch):
     tensor_keys = [
         'image', 'landmark_coords', 'landmark_coords_px',
         'optical_axis', 'R_kappa',
-        'K', 'R_cam', 'T_cam', 'eyeball_center_3d', 'head_R', 'head_t',
-        'gaze_target', 'gaze_depth',
+        'K', 'intrinsic_original', 'face_bbox_gt',
+        'R_cam', 'T_cam', 'eyeball_center_3d', 'pupil_center_3d',
+        'head_R', 'head_t', 'gaze_target', 'gaze_depth',
     ]
     scalar_keys = ['subject', 'cam_id', 'frame_idx']
 

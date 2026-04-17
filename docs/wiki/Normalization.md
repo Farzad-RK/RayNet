@@ -1,6 +1,6 @@
 # Normalization
 
-RayNet v4 uses **Easy-Norm** (MAGE, Bao et al. CVPR 2025) for image normalization. Unlike the previous Zhang et al. 2018 approach, Easy-Norm requires only the face center (from bounding box or landmarks) — no head pose needed.
+RayNet v5 uses **Easy-Norm** (MAGE, Bao et al. CVPR 2025) for image normalization. Unlike the previous Zhang et al. 2018 approach, Easy-Norm requires only the face center (from bounding box or landmarks) — no head pose needed.
 
 This is critical for the GazeGene dataset, where random translation and scaling augmentation during face cropping breaks camera intrinsics, making traditional Zhang normalization invalid.
 
@@ -25,7 +25,7 @@ This is critical for the GazeGene dataset, where random translation and scaling 
 
 ## Split Pipeline
 
-RayNet v4 uses task-specific normalization:
+RayNet v5 uses task-specific normalization:
 
 | Task | Normalization | Reason |
 |------|--------------|--------|
