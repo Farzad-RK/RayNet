@@ -881,39 +881,79 @@ def train(args):
                 print(f"  [fork] unexpected keys: {len(unexpected)} "
                       f"(first: {unexpected[:3]})")
 
+        # Detect cross-stage fork by looking at the source run's metadata.
+        # Stage number is recorded in config (see _build_run_config) and
+        # is not embedded in individual checkpoint files.
+        src_metadata = ckpt_mgr.get_metadata(run_id=args.fork_from) or {}
+        src_stage = src_metadata.get('config', {}).get('stage')
+        cross_stage = src_stage is not None and src_stage != args.stage
+
         src_epoch = fork_state['epoch']
-        start_epoch = src_epoch + 1
-        current_phase = get_phase(src_epoch)
-        fork_phase_cfg = get_phase_config(src_epoch)
-        phase_start, phase_end = fork_phase_cfg['epochs']
 
-        # Build optimizer/scheduler matching the saved phase so state_dict
-        # shapes line up, then overwrite with the checkpoint's state.
-        optimizer = optim.AdamW(model.parameters(), lr=fork_phase_cfg['lr'],
-                                betas=(0.5, 0.95), weight_decay=1e-4)
-        scheduler = CosineAnnealingLR(
-            optimizer, T_max=phase_end - phase_start + 1)
+        if cross_stage or args.fork_reset_epoch:
+            # Cross-stage fork (or explicit reset): the epoch counter and
+            # phase structure of the source run don't map onto the target
+            # stage's phase boundaries, so restart from epoch 1 under the
+            # new stage. Optimizer m/v state is preserved (the whole
+            # point of fork vs warmstart); scheduler is rebuilt fresh by
+            # the phase-transition block on the first loop iteration
+            # (current_phase=0 forces that transition to fire).
+            start_epoch = 1
+            current_phase = 0
+            phase1_cfg = get_phase_config(1)
+            optimizer = optim.AdamW(model.parameters(),
+                                    lr=phase1_cfg['lr'],
+                                    betas=(0.5, 0.95), weight_decay=1e-4)
+            optimizer.load_state_dict(fork_state['optimizer_state_dict'])
+            # Scheduler intentionally left None; rebuilt in-loop.
+            scheduler = None
+            if scaler is not None and 'scaler_state_dict' in fork_state:
+                scaler.load_state_dict(fork_state['scaler_state_dict'])
+            # Don't inherit src best_val_loss — it was measured under a
+            # different loss composition and isn't comparable.
+            reason = (f"cross-stage (source stage {src_stage} → "
+                      f"target stage {args.stage})"
+                      if cross_stage else "--fork_reset_epoch set")
+            if is_main:
+                print(f"  Epoch counter reset to 1 ({reason}). "
+                      f"Optimizer momentum + scaler preserved; scheduler "
+                      f"and best_val_loss rebuilt for stage {args.stage} "
+                      f"phase 1.")
+        else:
+            # Same-stage fork: continue from src_epoch under the same
+            # phase map, restoring full state.
+            start_epoch = src_epoch + 1
+            current_phase = get_phase(src_epoch)
+            fork_phase_cfg = get_phase_config(src_epoch)
+            phase_start, phase_end = fork_phase_cfg['epochs']
 
-        optimizer.load_state_dict(fork_state['optimizer_state_dict'])
-        if 'scheduler_state_dict' in fork_state:
-            scheduler.load_state_dict(fork_state['scheduler_state_dict'])
-        if scaler is not None and 'scaler_state_dict' in fork_state:
-            scaler.load_state_dict(fork_state['scaler_state_dict'])
+            optimizer = optim.AdamW(model.parameters(),
+                                    lr=fork_phase_cfg['lr'],
+                                    betas=(0.5, 0.95), weight_decay=1e-4)
+            scheduler = CosineAnnealingLR(
+                optimizer, T_max=phase_end - phase_start + 1)
 
-        best_val_loss = fork_state.get(
-            'val_metrics', {}).get('total', best_val_loss)
-        if is_main:
-            print(f"  Loaded full state from epoch {src_epoch} "
-                  f"(phase {current_phase}). New run continues at epoch "
-                  f"{start_epoch}, best_val_loss={best_val_loss:.4f}")
+            optimizer.load_state_dict(fork_state['optimizer_state_dict'])
+            if 'scheduler_state_dict' in fork_state:
+                scheduler.load_state_dict(fork_state['scheduler_state_dict'])
+            if scaler is not None and 'scaler_state_dict' in fork_state:
+                scaler.load_state_dict(fork_state['scaler_state_dict'])
 
-        if start_epoch > args.epochs:
-            raise RuntimeError(
-                f"Cannot fork: source checkpoint is at epoch {src_epoch}, "
-                f"so training would start at epoch {start_epoch}, but "
-                f"--epochs={args.epochs}. Increase --epochs to extend "
-                f"training past the fork point."
-            )
+            best_val_loss = fork_state.get(
+                'val_metrics', {}).get('total', best_val_loss)
+            if is_main:
+                print(f"  Same-stage fork: loaded full state from epoch "
+                      f"{src_epoch} (phase {current_phase}). New run "
+                      f"continues at epoch {start_epoch}, "
+                      f"best_val_loss={best_val_loss:.4f}")
+
+            if start_epoch > args.epochs:
+                raise RuntimeError(
+                    f"Cannot fork: source checkpoint is at epoch "
+                    f"{src_epoch}, so training would start at epoch "
+                    f"{start_epoch}, but --epochs={args.epochs}. Increase "
+                    f"--epochs to extend training past the fork point."
+                )
 
     # --- Warmstart from a different run (e.g. Stage 1 -> Stage 2) ---
     # Loads ONLY model weights. Optimizer, scheduler, epoch counter, and
@@ -1358,6 +1398,15 @@ def parse_args():
                              '(default: latest.pt — has full optimizer/'
                              'scheduler state). best_model.pt also works if '
                              'it was saved with optimizer state.')
+    parser.add_argument('--fork_reset_epoch', action='store_true',
+                        help='Force fork to reset epoch counter to 1 under '
+                             "the target stage's phase map. Normally this "
+                             'happens automatically when a cross-stage fork '
+                             'is detected from the source run metadata; use '
+                             'this flag when the metadata is missing or when '
+                             'you want to restart Stage N even though the '
+                             'source was also Stage N. Optimizer momentum '
+                             'and scaler state are still preserved.')
     parser.add_argument('--reset_pose_translation', action='store_true',
                         help='After warmstart, zero-init pose_head rows 6:9 '
                              '(translation). Use when the translation loss '
