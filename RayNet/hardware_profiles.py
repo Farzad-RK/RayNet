@@ -228,8 +228,20 @@ def build_accelerator():
     here purely for DDP / multi-node orchestration, dataloader sharding,
     and main-process gating of I/O.
 
+    `find_unused_parameters=True` is required by the Stage 2 eye-crop
+    curriculum: phases 1-2 freeze the shared stem + landmark branch +
+    pose branch (requires_grad=False on their params), so those
+    parameters never receive gradients and DDP's default reducer —
+    which expects every parameter to get a gradient every step —
+    raises "Expected to have finished reduction in the prior iteration
+    before starting a new one". The flag enables graph-aware reduction
+    that tolerates subsets of params being unused per step. The
+    runtime cost is a single extra graph traversal per step, which is
+    negligible next to a backbone forward.
+
     On a single machine with no `accelerate launch`, the returned
     Accelerator transparently falls back to single-process mode.
     """
-    from accelerate import Accelerator
-    return Accelerator(mixed_precision='no')
+    from accelerate import Accelerator, DistributedDataParallelKwargs
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    return Accelerator(mixed_precision='no', kwargs_handlers=[ddp_kwargs])
