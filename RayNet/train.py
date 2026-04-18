@@ -7,10 +7,10 @@ Staged training strategy:
     Phase 1 (epochs 1-8):   λ_lm=1.0, λ_pose=0.5, λ_trans=0.5
     Phase 2 (epochs 9-15):  λ_lm=1.0, λ_pose=1.0, λ_trans=1.0
 
-  Stage 2 — Add gaze with GazeGene 3D eyeball losses (bridges zero-init):
-    Phase 1 (epochs 1-5):   λ_gaze=0.1, λ_eyeball=0.1, λ_pupil=0.1
-    Phase 2 (epochs 6-15):  λ_gaze=0.5, λ_eyeball=0.3, λ_pupil=0.3, λ_ray=0.1
-    Phase 3 (epochs 16-25): λ_gaze=1.0, λ_eyeball=0.5, λ_pupil=0.5, λ_geom=0.2, λ_ray=0.3
+  Stage 2 — Eye-crop gaze encoder on frozen face path (curriculum unfreezes at P3):
+    Phase 1 (epochs 1-8):   Face FROZEN, gaze warmup on 112x112 eye crops
+    Phase 2 (epochs 9-15):  Face FROZEN, + multi-view + geometric angular
+    Phase 3 (epochs 16-25): Face UNFROZEN, gentle joint fine-tuning (lr 5e-5)
 
   Stage 3 — Full pipeline with bridges + MAGE box encoder:
     Phase 1 (epochs 1-5):   Bridge warmup, geometric angular active
@@ -133,67 +133,78 @@ STAGE_CONFIGS = {
         },
     },
 
-    # ---- Stage 2: Add gaze + GazeGene 3D eyeball losses (bridges zero-init) ----
-    # Purpose: Test gaze learning with explicit 3D eyeball structure.
-    # Bridges are present but zero-init — they start as identity (skip).
-    # Expect: Angular error improving steadily; eyeball/pupil L1 converging.
+    # ---- Stage 2: Eye-crop gaze encoder, face path frozen then released ----
+    # Purpose: The Stage 1 baseline already has solid landmarks + pose; in
+    # Stage 2 we train ONLY the dedicated eye-crop gaze branch on top of
+    # those frozen predictions, then unfreeze for joint refinement.
+    # This breaks the 42° val_angular ceiling observed when the gaze
+    # branch shared low-level features with landmark/pose.
+    #
+    # Phases 1-2: freeze_face=True — shared_stem, landmark_branch, and
+    # pose_branch are in .eval() mode with requires_grad=False (so BN
+    # running stats also freeze). The gaze branch (EyeCropModule +
+    # EyeBackbone + fusion + head) is the only trainable path.
+    # Phase 3: unfreeze everything for gentle joint fine-tuning.
     2: {
         1: {
-            'epochs': (1, 5),
-            'lam_lm': 1.0,
-            'lam_gaze': 0.1,
-            'lam_eyeball': 0.1,
-            'lam_pupil': 0.1,
-            'lam_geom_angular': 0.0,  # too early — geometry not converged
+            'epochs': (1, 8),
+            'lam_lm': 0.0,          # landmark branch frozen
+            'lam_gaze': 1.0,
+            'lam_eyeball': 0.3,
+            'lam_pupil': 0.3,
+            'lam_geom_angular': 0.0,  # geometry not converged yet
             'lam_ray': 0.0,
             'lam_reproj': 0.0,
             'lam_mask': 0.0,
-            'lam_pose': 0.5,
-            'lam_trans': 0.5,
+            'lam_pose': 0.0,        # pose branch frozen
+            'lam_trans': 0.0,
             'lr': 3e-4,
             'sigma': 1.5,
             'multiview': False,
             'use_landmark_bridge': False,
-            'use_pose_bridge': False,
-            'description': 'V5-S2P1: Gaze warmup + 3D eyeball structure learning',
+            'use_pose_bridge': True,
+            'freeze_face': True,
+            'description': 'V5-S2P1: Eye-crop gaze warmup (face frozen)',
         },
         2: {
-            'epochs': (6, 15),
-            'lam_lm': 1.0,
-            'lam_gaze': 0.5,
-            'lam_eyeball': 0.3,
-            'lam_pupil': 0.3,
-            'lam_geom_angular': 0.0,  # still off — let eyeball/pupil stabilize
-            'lam_ray': 0.1,
-            'lam_reproj': 0.05,
-            'lam_mask': 0.02,
-            'lam_pose': 0.5,
-            'lam_trans': 0.5,
-            'lr': 3e-4,
-            'sigma': 1.3,
-            'multiview': True,
-            'use_landmark_bridge': False,
-            'use_pose_bridge': False,
-            'description': 'V5-S2P2: Balanced gaze + eyeball/pupil + ray + MV',
-        },
-        3: {
-            'epochs': (16, 25),
-            'lam_lm': 1.0,
+            'epochs': (9, 15),
+            'lam_lm': 0.0,
             'lam_gaze': 1.0,
             'lam_eyeball': 0.5,
             'lam_pupil': 0.5,
-            'lam_geom_angular': 0.2,  # NOW turn on — geometry should be close
+            'lam_geom_angular': 0.2,
+            'lam_ray': 0.2,
+            'lam_reproj': 0.1,
+            'lam_mask': 0.05,
+            'lam_pose': 0.0,
+            'lam_trans': 0.0,
+            'lr': 1e-4,
+            'sigma': 1.3,
+            'multiview': True,
+            'use_landmark_bridge': False,
+            'use_pose_bridge': True,
+            'freeze_face': True,
+            'description': 'V5-S2P2: + multi-view + geom angular (face frozen)',
+        },
+        3: {
+            'epochs': (16, 25),
+            'lam_lm': 0.5,          # gentle resume of landmark supervision
+            'lam_gaze': 1.0,
+            'lam_eyeball': 0.5,
+            'lam_pupil': 0.5,
+            'lam_geom_angular': 0.3,
             'lam_ray': 0.3,
             'lam_reproj': 0.1,
             'lam_mask': 0.05,
-            'lam_pose': 0.5,
-            'lam_trans': 0.5,
-            'lr': 1e-4,
+            'lam_pose': 0.3,        # face unfrozen — keep pose/trans light
+            'lam_trans': 0.3,
+            'lr': 5e-5,
             'sigma': 1.0,
             'multiview': True,
             'use_landmark_bridge': False,
-            'use_pose_bridge': False,
-            'description': 'V5-S2P3: Gaze fine-tuning + geometric angular loss',
+            'use_pose_bridge': True,
+            'freeze_face': False,
+            'description': 'V5-S2P3: Joint fine-tuning (face unfrozen)',
         },
     },
 
@@ -283,6 +294,57 @@ def get_phase_config(epoch):
     return dict(PHASE_CONFIG[phase])
 
 
+def _unwrap_raynet(model):
+    """Unwrap DDP / torch.compile to reach the underlying RayNetV5."""
+    m = model
+    if hasattr(m, 'module'):
+        m = m.module
+    if hasattr(m, '_orig_mod'):
+        m = m._orig_mod
+    return m
+
+
+def set_face_frozen(model, frozen):
+    """
+    Freeze/unfreeze shared_stem + landmark_branch + pose_branch.
+
+    Used by the Stage 2 eye-crop curriculum: phases 1-2 train only the
+    gaze branch on top of the (already-trained) face path. Combines
+    requires_grad=False with .eval() so BatchNorm running stats also
+    freeze — otherwise BN drift on the frozen submodules would quietly
+    corrupt the fixed landmark/pose distribution the gaze branch is
+    learning against.
+    """
+    raynet = _unwrap_raynet(model)
+    for submodule in (raynet.shared_stem,
+                      raynet.landmark_branch,
+                      raynet.pose_branch):
+        for p in submodule.parameters():
+            p.requires_grad_(not frozen)
+        if frozen:
+            submodule.eval()
+        else:
+            submodule.train()
+
+
+def _filter_compatible_state(src_sd, target_sd):
+    """
+    Keep only (key, tensor) pairs from src_sd that have matching shape
+    in target_sd. Returns (filtered_sd, dropped_keys). Used to bridge
+    cross-stage forks where the model architecture changed between
+    runs (e.g. old Stage 1 checkpoint into new eye-crop Stage 2 code).
+    """
+    filtered = {}
+    dropped = []
+    for k, v in src_sd.items():
+        tgt = target_sd.get(k)
+        if tgt is not None and hasattr(tgt, 'shape') and tgt.shape == v.shape:
+            filtered[k] = v
+        else:
+            dropped.append(k)
+    return filtered, dropped
+
+
 # ============== Training Loop ==============
 
 def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
@@ -291,6 +353,11 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                     n_views=1):
     """Run one training epoch with AMP and gradient accumulation support."""
     model.train()
+    # model.train() recursively flips every submodule to train mode,
+    # which would un-do the Stage 2 face-freeze .eval() state. Re-apply
+    # after switching modes so BN running stats stay frozen.
+    if cfg.get('freeze_face', False):
+        set_face_frozen(model, True)
     use_multiview = cfg.get('multiview', False)
     use_landmark_bridge = cfg.get('use_landmark_bridge', True)
     use_pose_bridge = cfg.get('use_pose_bridge', True)
@@ -871,8 +938,16 @@ def train(args):
             )
 
         target = accelerator.unwrap_model(model)
+        # Drop any tensors whose shape changed between the source run
+        # and the current architecture (e.g. an old Stage 1 checkpoint
+        # carries a 2-input FusionBlock — the new 3-input GazeFusionBlock
+        # has a larger first linear layer). strict=False alone doesn't
+        # handle shape mismatches; we filter by shape here so the fork
+        # survives architecture migrations.
+        filtered_sd, shape_dropped = _filter_compatible_state(
+            fork_state['model_state_dict'], target.state_dict())
         missing, unexpected = target.load_state_dict(
-            fork_state['model_state_dict'], strict=False)
+            filtered_sd, strict=False)
         if is_main:
             if missing:
                 print(f"  [fork] missing keys: {len(missing)} "
@@ -880,6 +955,9 @@ def train(args):
             if unexpected:
                 print(f"  [fork] unexpected keys: {len(unexpected)} "
                       f"(first: {unexpected[:3]})")
+            if shape_dropped:
+                print(f"  [fork] shape-mismatch keys dropped: "
+                      f"{len(shape_dropped)} (first: {shape_dropped[:3]})")
 
         # Detect cross-stage fork by looking at the source run's metadata.
         # Stage number is recorded in config (see _build_run_config) and
@@ -972,8 +1050,11 @@ def train(args):
                 map_location=device,
             )
         target = accelerator.unwrap_model(model)
+        # Filter by shape to survive architecture migrations (see fork block).
+        filtered_sd, shape_dropped = _filter_compatible_state(
+            ws_state['model_state_dict'], target.state_dict())
         missing, unexpected = target.load_state_dict(
-            ws_state['model_state_dict'], strict=False)
+            filtered_sd, strict=False)
         if is_main:
             if missing:
                 print(f"  [warmstart] missing keys: {len(missing)} "
@@ -981,6 +1062,9 @@ def train(args):
             if unexpected:
                 print(f"  [warmstart] unexpected keys: {len(unexpected)} "
                       f"(first: {unexpected[:3]})")
+            if shape_dropped:
+                print(f"  [warmstart] shape-mismatch keys dropped: "
+                      f"{len(shape_dropped)} (first: {shape_dropped[:3]})")
             src_stage = ws_state.get('config', {}).get('stage', '?')
             src_epoch = ws_state.get('epoch', '?')
             print(f"  Loaded weights from stage {src_stage} epoch {src_epoch}. "
@@ -1062,6 +1146,17 @@ def train(args):
                 optimizer,
                 T_max=phase_end - phase_start + 1,
             )
+
+            # Stage 2 eye-crop curriculum: freeze or release the face
+            # path (shared_stem + landmark_branch + pose_branch) as the
+            # phase demands. Re-apply every phase transition so switching
+            # from frozen → unfrozen (phase 2 → 3) also takes effect.
+            freeze_face = cfg.get('freeze_face', False)
+            set_face_frozen(model, freeze_face)
+            if is_main:
+                status = 'FROZEN (gaze-only training)' if freeze_face \
+                    else 'trainable (joint training)'
+                print(f"  Face path (shared_stem+landmark+pose): {status}")
 
         active_train_loader = train_loader_mv
         active_val_loader = val_loader
