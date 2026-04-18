@@ -685,15 +685,18 @@ def train(args):
         print(f"  Gradient accumulation: {hw['grad_accum_steps']} steps")
         print(f"  torch.compile: {hw['compile_model']}")
 
-    # Multi-process runs need an explicit run_id — otherwise each rank
-    # would auto-generate its own timestamp and ckpt_mgr.run_id would
-    # differ across ranks, breaking checkpoint/log paths.
+    # In distributed mode, each rank would otherwise auto-generate its own
+    # timestamp inside CheckpointManager and the paths would diverge.
+    # Generate on rank 0 and broadcast so every rank writes to the same
+    # checkpoint directory.
     if (accelerator.num_processes > 1 and args.ckpt_bucket
             and not args.run_id):
-        raise RuntimeError(
-            "Distributed training with --ckpt_bucket requires --run_id "
-            "so all ranks agree on the checkpoint directory."
-        )
+        from accelerate.utils import broadcast_object_list
+        run_id_holder = [
+            datetime.now().strftime('run_%Y%m%d_%H%M%S') if is_main else None
+        ]
+        broadcast_object_list(run_id_holder, from_process=0)
+        args.run_id = run_id_holder[0]
 
     # Checkpoint manager (MinIO) — created on every rank so that resume
     # loads identical optimizer state across ranks. Save/upload calls are
