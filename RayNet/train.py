@@ -345,6 +345,25 @@ def _filter_compatible_state(src_sd, target_sd):
     return filtered, dropped
 
 
+def _optimizer_state_compatible(saved_state, new_optimizer):
+    """
+    Check whether a saved optimizer state_dict can be loaded into
+    `new_optimizer`. PyTorch validates that every param_group has the
+    same number of parameters as the saved group; if the model changed
+    shape (e.g. new branches added) that assertion fails.
+
+    Returns True iff groups match in count AND in per-group param count.
+    """
+    saved_groups = saved_state.get('param_groups', [])
+    new_groups = new_optimizer.state_dict()['param_groups']
+    if len(saved_groups) != len(new_groups):
+        return False
+    for sg, ng in zip(saved_groups, new_groups):
+        if len(sg.get('params', [])) != len(ng.get('params', [])):
+            return False
+    return True
+
+
 # ============== Training Loop ==============
 
 def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
@@ -982,7 +1001,16 @@ def train(args):
             optimizer = optim.AdamW(model.parameters(),
                                     lr=phase1_cfg['lr'],
                                     betas=(0.5, 0.95), weight_decay=1e-4)
-            optimizer.load_state_dict(fork_state['optimizer_state_dict'])
+            # The param count may not match after an architecture change
+            # (e.g. GazeBranch rearchitected — eye-crop encoder added,
+            # old bridges removed). PyTorch's optimizer.load_state_dict
+            # asserts per-group param count equality, so we check first
+            # and fall back to a fresh optimizer when the shapes diverge.
+            optimizer_preserved = _optimizer_state_compatible(
+                fork_state['optimizer_state_dict'], optimizer)
+            if optimizer_preserved:
+                optimizer.load_state_dict(
+                    fork_state['optimizer_state_dict'])
             # Scheduler intentionally left None; rebuilt in-loop.
             scheduler = None
             if scaler is not None and 'scaler_state_dict' in fork_state:
@@ -993,8 +1021,12 @@ def train(args):
                       f"target stage {args.stage})"
                       if cross_stage else "--fork_reset_epoch set")
             if is_main:
+                opt_status = ("preserved"
+                              if optimizer_preserved
+                              else "RESET (param count mismatch — "
+                                   "architecture changed)")
                 print(f"  Epoch counter reset to 1 ({reason}). "
-                      f"Optimizer momentum + scaler preserved; scheduler "
+                      f"Optimizer momentum: {opt_status}; scheduler "
                       f"and best_val_loss rebuilt for stage {args.stage} "
                       f"phase 1.")
         else:
@@ -1011,7 +1043,15 @@ def train(args):
             scheduler = CosineAnnealingLR(
                 optimizer, T_max=phase_end - phase_start + 1)
 
-            optimizer.load_state_dict(fork_state['optimizer_state_dict'])
+            # Same guard as the cross-stage path — if the model changed
+            # shape the saved optimizer state can't load.
+            if _optimizer_state_compatible(
+                    fork_state['optimizer_state_dict'], optimizer):
+                optimizer.load_state_dict(
+                    fork_state['optimizer_state_dict'])
+            elif is_main:
+                print("  [fork] optimizer param count mismatch — "
+                      "starting with fresh AdamW state.")
             if 'scheduler_state_dict' in fork_state:
                 scheduler.load_state_dict(fork_state['scheduler_state_dict'])
             if scaler is not None and 'scaler_state_dict' in fork_state:
