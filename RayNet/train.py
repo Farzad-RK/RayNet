@@ -815,10 +815,14 @@ def train(args):
         # resume_state loads into the unwrapped model so DDP wrapping
         # doesn't interfere with state_dict key names.
         unwrapped = accelerator.unwrap_model(model)
-        start_epoch, resume_ckpt = ckpt_mgr.resume_state(
-            unwrapped, optimizer, scheduler=scheduler, scaler=scaler,
-            map_location=device, filename=resume_file,
-        )
+        # Serialize the MinIO download: rank 0 downloads the checkpoint
+        # to the local cache first, then non-main ranks cache-hit. Doing
+        # this concurrently races on MinIO's .part.minio temp file.
+        with accelerator.main_process_first():
+            start_epoch, resume_ckpt = ckpt_mgr.resume_state(
+                unwrapped, optimizer, scheduler=scheduler, scaler=scaler,
+                map_location=device, filename=resume_file,
+            )
         current_phase = get_phase(resume_ckpt['epoch'])
         best_val_loss = resume_ckpt.get('val_metrics', {}).get('total', best_val_loss)
         if is_main:
@@ -848,11 +852,14 @@ def train(args):
         if is_main:
             print(f"Forking from run {args.fork_from} "
                   f"({args.fork_checkpoint}) into new run {ckpt_mgr.run_id} ...")
-        fork_state = ckpt_mgr.load_from_run(
-            source_run_id=args.fork_from,
-            filename=args.fork_checkpoint,
-            map_location=device,
-        )
+        # Serialize MinIO download across ranks — see note at the resume
+        # site above for the race condition this avoids.
+        with accelerator.main_process_first():
+            fork_state = ckpt_mgr.load_from_run(
+                source_run_id=args.fork_from,
+                filename=args.fork_checkpoint,
+                map_location=device,
+            )
 
         if 'optimizer_state_dict' not in fork_state:
             raise RuntimeError(
@@ -916,11 +923,14 @@ def train(args):
         if is_main:
             print(f"Warmstarting from run {args.warmstart_from} "
                   f"({args.warmstart_checkpoint}) into new run {ckpt_mgr.run_id} ...")
-        ws_state = ckpt_mgr.load_from_run(
-            source_run_id=args.warmstart_from,
-            filename=args.warmstart_checkpoint,
-            map_location=device,
-        )
+        # Serialize MinIO download across ranks — see note at the resume
+        # site above for the race condition this avoids.
+        with accelerator.main_process_first():
+            ws_state = ckpt_mgr.load_from_run(
+                source_run_id=args.warmstart_from,
+                filename=args.warmstart_checkpoint,
+                map_location=device,
+            )
         target = accelerator.unwrap_model(model)
         missing, unexpected = target.load_state_dict(
             ws_state['model_state_dict'], strict=False)

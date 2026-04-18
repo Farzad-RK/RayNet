@@ -285,6 +285,14 @@ class CheckpointManager:
         """
         Download and load a specific checkpoint.
 
+        If the file is already cached in the local run dir, skip the
+        MinIO download and read it directly. This avoids a race when
+        multiple ranks call into this method concurrently (two ranks
+        writing the same .part.minio temp file corrupts the rename).
+        Combine with ``accelerator.main_process_first()`` at the call
+        site so rank 0 populates the cache first, and all other ranks
+        cache-hit.
+
         Args:
             filename: Checkpoint filename (e.g. 'best_model.pt', 'latest.pt').
             map_location: torch.load map_location argument.
@@ -295,7 +303,8 @@ class CheckpointManager:
         key = self._object_key(filename)
         local_path = os.path.join(self._local_dir, filename)
 
-        self._client.fget_object(self.bucket, key, local_path)
+        if not os.path.exists(local_path):
+            self._client.fget_object(self.bucket, key, local_path)
         state = torch.load(local_path, map_location=map_location, weights_only=False)
         log.info("Loaded checkpoint: %s (epoch %d)", key, state.get('epoch', -1))
         return state
@@ -328,7 +337,10 @@ class CheckpointManager:
         local_path = os.path.join(
             self._local_dir, f"__warmstart_{source_run_id}_{filename}")
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        self._client.fget_object(self.bucket, key, local_path)
+        # Skip re-download if already cached — see load() for the race
+        # condition this avoids when multiple ranks call concurrently.
+        if not os.path.exists(local_path):
+            self._client.fget_object(self.bucket, key, local_path)
         state = torch.load(
             local_path, map_location=map_location, weights_only=False)
         log.info("Loaded warmstart weights from run %s (%s, epoch %d)",
