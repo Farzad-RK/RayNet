@@ -22,8 +22,18 @@ Staged training strategy:
     Phase 2+: max_norm=2.0 (conservative, prevents gaze/pose interference)
 
 Usage:
+    # Single GPU
     python -m RayNet.train --stage 1 --profile t4 --mds_streaming \
         --mds_train s3://gazegene/train --mds_val s3://gazegene/val ...
+
+    # Kaggle 2× Tesla T4 (single node, multi-GPU)
+    accelerate launch --multi_gpu --num_processes 2 \
+        -m RayNet.train --stage 1 --profile kaggle_t4x2 --mds_streaming ...
+
+    # Two machines on the same network (see RayNet/hardware_profiles.py)
+    accelerate launch --multi_gpu --num_machines 2 --num_processes 2 \
+        --machine_rank <0|1> --main_process_ip $MAIN_IP --main_process_port 29500 \
+        -m RayNet.train --stage 1 --profile multi_node_t4 --mds_streaming ...
 """
 
 import argparse
@@ -38,126 +48,18 @@ import numpy as np
 from datetime import datetime
 
 from RayNet.dataset import create_dataloaders
+from RayNet.hardware_profiles import (
+    HARDWARE_PROFILES,
+    AMP_DTYPE_MAP,
+    apply_hardware_profile,
+    setup_hardware,
+    build_accelerator,
+)
 from RayNet.losses import total_loss
 from RayNet.multiview_loss import multiview_consistency_loss
 from RayNet.raynet_v5 import create_raynet_v5
 
 log = logging.getLogger(__name__)
-
-
-# ============== Hardware Profiles ==============
-
-HARDWARE_PROFILES = {
-    # ---- CPU / low-end GPU (testing, debugging) ----
-    # v4: 224×224 input. Batch sizes ~4× larger than v3 (448×448).
-    'default': {
-        'batch_size': 504,          # 56 mv_groups × 9 views
-        'mv_groups': 56,
-        'num_workers': 4,
-        'pin_memory': True,
-        'amp': False,
-        'amp_dtype': 'float32',
-        'grad_accum_steps': 1,
-        'compile_model': False,
-        'tf32': False,
-        'prefetch_factor': 2,
-        'persistent_workers': False,
-    },
-    # ---- NVIDIA T4  (16 GB, Colab free / GCP n1-standard) ----
-    # FP16 is critical — T4 has weak FP32 but decent FP16 (65 TFLOPS).
-    # 16 GB VRAM comfortable at 224×224: ~16 mv_groups (144 samples).
-    't4': {
-        'batch_size': 144,          # 16 mv_groups × 9 views
-        'mv_groups': 16,
-        'num_workers': 2,
-        'pin_memory': True,
-        'amp': True,
-        'amp_dtype': 'float16',
-        'grad_accum_steps': 2,      # effective batch = 288
-        'compile_model': False,     # T4 doesn't benefit much from compile
-        'tf32': False,              # T4 doesn't support TF32
-        'prefetch_factor': 2,
-        'persistent_workers': True,
-    },
-    # ---- NVIDIA L4  (24 GB, GCP g2-standard) ----
-    # Ada Lovelace arch: good FP16/BF16 (121 TFLOPS FP16).
-    # 24 GB comfortable at 224×224: ~32 mv_groups.
-    'l4': {
-        'batch_size': 288,          # 32 mv_groups × 9 views
-        'mv_groups': 32,
-        'num_workers': 4,
-        'pin_memory': True,
-        'amp': True,
-        'amp_dtype': 'bfloat16',    # BF16: same range as FP32 → no exp/log overflow
-        'grad_accum_steps': 1,      # effective batch = 288
-        'compile_model': False,     # disabled: interacts badly with grad checkpointing
-        'tf32': True,               # Ada supports TF32
-        'prefetch_factor': 2,
-        'persistent_workers': True,
-    },
-    # ---- NVIDIA A10G  (24 GB, AWS g5) ----
-    # Ampere arch, similar to L4 in VRAM but different compute profile.
-    'a10g': {
-        'batch_size': 288,          # 32 mv_groups × 9 views
-        'mv_groups': 32,
-        'num_workers': 4,
-        'pin_memory': True,
-        'amp': True,
-        'amp_dtype': 'bfloat16',    # BF16: same range as FP32 → no exp/log overflow
-        'grad_accum_steps': 1,      # effective batch = 288
-        'compile_model': False,     # disabled: interacts badly with grad checkpointing
-        'tf32': True,
-        'prefetch_factor': 2,
-        'persistent_workers': True,
-    },
-    # ---- NVIDIA V100  (16 GB / 32 GB, GCP / AWS p3) ----
-    # Volta: no TF32, no torch.compile benefit. Good FP16 via Tensor Cores.
-    'v100': {
-        'batch_size': 144,          # 16 mv_groups × 9 views
-        'mv_groups': 16,
-        'num_workers': 4,
-        'pin_memory': True,
-        'amp': True,
-        'amp_dtype': 'float16',
-        'grad_accum_steps': 2,      # effective batch = 288
-        'compile_model': False,     # Volta doesn't benefit from compile
-        'tf32': False,              # Volta doesn't support TF32
-        'prefetch_factor': 2,
-        'persistent_workers': True,
-    },
-    # ---- NVIDIA A100  (40 GB / 80 GB, GCP a2, Colab Pro+) ----
-    # Ampere flagship: TF32, BF16, huge memory bandwidth (2 TB/s).
-    # At 224×224: fits large batches comfortably.
-    'a100': {
-        'batch_size': 1152,         # 128 mv_groups × 9 views
-        'mv_groups': 128,
-        'num_workers': 8,
-        'pin_memory': True,
-        'amp': True,
-        'amp_dtype': 'bfloat16',
-        'grad_accum_steps': 1,      # effective batch = 1152
-        'compile_model': True,
-        'tf32': True,
-        'prefetch_factor': 10,
-        'persistent_workers': True,
-    },
-    # ---- NVIDIA H100  (80 GB, GCP a3, Lambda Labs) ----
-    # Hopper: FP8 support, Transformer Engine, 3.4 TB/s bandwidth.
-    # BF16 preferred (less overflow risk than FP16 at similar speed).
-    'h100': {
-        'batch_size': 2304,         # 256 mv_groups × 9 views
-        'mv_groups': 256,
-        'num_workers': 8,
-        'pin_memory': True,
-        'amp': True,
-        'amp_dtype': 'bfloat16',
-        'grad_accum_steps': 1,      # effective batch = 2304
-        'compile_model': True,
-        'tf32': True,
-        'prefetch_factor': 4,
-        'persistent_workers': True,
-    },
-}
 
 
 # ============== Staged Training Configuration ==============
@@ -379,46 +281,6 @@ def get_phase_config(epoch):
     """Get loss weights and hyperparams for the current epoch (returns a copy)."""
     phase = get_phase(epoch)
     return dict(PHASE_CONFIG[phase])
-
-
-AMP_DTYPE_MAP = {
-    'float16': torch.float16,
-    'bfloat16': torch.bfloat16,
-    'float32': torch.float32,
-}
-
-
-def apply_hardware_profile(args):
-    """Apply hardware profile settings, allowing CLI overrides."""
-    hw = HARDWARE_PROFILES[args.profile].copy()
-
-    # CLI flags override profile defaults
-    if args.batch_size is not None:
-        hw['batch_size'] = args.batch_size
-    if args.mv_groups is not None:
-        hw['mv_groups'] = args.mv_groups
-    if args.num_workers is not None:
-        hw['num_workers'] = args.num_workers
-    if args.grad_accum_steps is not None:
-        hw['grad_accum_steps'] = args.grad_accum_steps
-    if args.no_compile:
-        hw['compile_model'] = False
-
-    return hw
-
-
-def setup_hardware(hw, device):
-    """Configure hardware-specific optimizations."""
-    if hw['tf32'] and device.type == 'cuda':
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision('high')
-        print("  TF32 enabled for matmul and cuDNN")
-
-    if device.type == 'cuda':
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
-        print(f"  GPU: {gpu_name} ({gpu_mem:.1f} GB)")
 
 
 # ============== Training Loop ==============
@@ -785,36 +647,73 @@ def train(args):
               f"max epoch ({stage_max_epoch}). Capping to {stage_max_epoch}.")
         args.epochs = stage_max_epoch
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
-    print(f"Training stage: {args.stage}")
+    # HuggingFace Accelerate — handles DDP wrapping, rank-aware dataloaders,
+    # and multi-node orchestration. AMP (autocast + GradScaler) is still
+    # managed manually below; Accelerator is configured with
+    # mixed_precision='no' so it does not interfere.
+    accelerator = build_accelerator()
+    device = accelerator.device
+    is_main = accelerator.is_main_process
+
+    if is_main:
+        print(f"Device: {device}")
+        print(f"Training stage: {args.stage}")
+        print(f"Distributed: num_processes={accelerator.num_processes}, "
+              f"process_index={accelerator.process_index}")
 
     # Apply hardware profile
     hw = apply_hardware_profile(args)
-    setup_hardware(hw, device)
+    if is_main:
+        setup_hardware(hw, device)
+    else:
+        # Non-main processes still need TF32 flags on their own CUDA context,
+        # but skip the GPU-info print.
+        if hw['tf32'] and device.type == 'cuda':
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision('high')
 
     # Resolve AMP dtype from profile string
     amp_dtype = AMP_DTYPE_MAP.get(hw['amp_dtype'], torch.float16)
 
-    print(f"Profile: {args.profile}")
-    print(f"  Batch size: {hw['batch_size']} (effective: "
-          f"{hw['batch_size'] * hw['grad_accum_steps']})")
-    print(f"  AMP: {hw['amp']} ({hw['amp_dtype']})")
-    print(f"  Gradient accumulation: {hw['grad_accum_steps']} steps")
-    print(f"  torch.compile: {hw['compile_model']}")
+    if is_main:
+        print(f"Profile: {args.profile}")
+        print(f"  Batch size (per-process): {hw['batch_size']} "
+              f"(effective/proc: {hw['batch_size'] * hw['grad_accum_steps']}, "
+              f"global: {hw['batch_size'] * hw['grad_accum_steps'] * accelerator.num_processes})")
+        print(f"  AMP: {hw['amp']} ({hw['amp_dtype']})")
+        print(f"  Gradient accumulation: {hw['grad_accum_steps']} steps")
+        print(f"  torch.compile: {hw['compile_model']}")
 
-    # Checkpoint manager (MinIO)
+    # Multi-process runs need an explicit run_id — otherwise each rank
+    # would auto-generate its own timestamp and ckpt_mgr.run_id would
+    # differ across ranks, breaking checkpoint/log paths.
+    if (accelerator.num_processes > 1 and args.ckpt_bucket
+            and not args.run_id):
+        raise RuntimeError(
+            "Distributed training with --ckpt_bucket requires --run_id "
+            "so all ranks agree on the checkpoint directory."
+        )
+
+    # Checkpoint manager (MinIO) — created on every rank so that resume
+    # loads identical optimizer state across ranks. Save/upload calls are
+    # gated on is_main_process further down.
     ckpt_mgr = _init_checkpoint_manager(args)
-    if ckpt_mgr is not None:
+    if ckpt_mgr is not None and is_main:
         print(f"  MinIO checkpoints: s3://{args.ckpt_bucket}/{args.ckpt_prefix}/{ckpt_mgr.run_id}/")
 
-    # Create output directory
-    if ckpt_mgr is not None:
-        output_dir = os.path.join(args.output_dir, ckpt_mgr.run_id)
+    # Create output directory — main process only. All log and local
+    # checkpoint writes are gated on is_main, so ranks without an
+    # output_dir simply skip those writes.
+    if is_main:
+        if ckpt_mgr is not None:
+            output_dir = os.path.join(args.output_dir, ckpt_mgr.run_id)
+        else:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_dir = os.path.join(args.output_dir, f'run_{timestamp}')
+        os.makedirs(output_dir, exist_ok=True)
     else:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_dir = os.path.join(args.output_dir, f'run_{timestamp}')
-    os.makedirs(output_dir, exist_ok=True)
+        output_dir = None
 
     # Create model
     model = create_raynet_v5(
@@ -823,7 +722,8 @@ def train(args):
     )
 
     if hw['compile_model'] and hasattr(torch, 'compile'):
-        print("  Compiling model with torch.compile...")
+        if is_main:
+            print("  Compiling model with torch.compile...")
         model = torch.compile(model)
 
     # AMP scaler — ONLY for float16. BF16 has FP32 range, so loss scaling is
@@ -832,41 +732,57 @@ def train(args):
     use_scaler = hw['amp'] and hw.get('amp_dtype', 'float16') == 'float16'
     scaler = GradScaler('cuda', enabled=True) if use_scaler else None
 
+    # Wrap model in DDP (no-op on single process). accelerator.prepare
+    # also broadcasts rank-0 weights to all ranks, so after this call all
+    # ranks start from identical parameters.
+    model = accelerator.prepare(model)
+
     # --- Data loading ---
     # Multi-view is always active. Train + val both use 9-grouped batches so
     # CrossViewAttention, cam_embed, and PoseEncoder fusion are exercised at
     # validation (without this, val gaze metrics are an uninformative
     # single-view lower bound).
+    #
+    # For MDS streaming: StreamingDataset shards by RANK/WORLD_SIZE env
+    # vars that `accelerate launch` sets, so we DON'T wrap it.
+    # For local loaders: accelerator.prepare injects a DistributedSampler.
     if args.mds_streaming:
         train_loader_mv, val_loader = _create_mds_mv_loader(args, hw)
     else:
         _, train_loader_mv, val_loader = _create_local_loaders(args, hw)
+        train_loader_mv, val_loader = accelerator.prepare(
+            train_loader_mv, val_loader)
 
-    # Record config in checkpoint metadata
-    run_config = _build_run_config(args, hw)
-    if ckpt_mgr is not None:
-        ckpt_mgr.set_config(run_config)
+    # Record config in checkpoint metadata (main only — no rank divergence).
+    if is_main:
+        run_config = _build_run_config(args, hw)
+        if ckpt_mgr is not None:
+            ckpt_mgr.set_config(run_config)
 
-    # CSV logger (epoch-level)
-    csv_path = os.path.join(output_dir, 'training_log.csv')
-    csv_file = open(csv_path, 'w', newline='')
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow([
-        'epoch', 'stage', 'phase', 'lr',
-        'train_total', 'train_landmark', 'train_angular_deg',
-        'train_reproj', 'train_mask', 'train_ray_target', 'train_pose',
-        'train_translation',
-        'val_total', 'val_landmark', 'val_angular_deg', 'val_landmark_px',
-    ])
+    # CSV loggers — main process only. Non-main ranks keep these as None
+    # and all write sites check `is not None` before writing.
+    csv_path = batch_csv_path = None
+    csv_file = batch_csv_file = None
+    csv_writer = batch_csv_writer = None
+    if is_main:
+        csv_path = os.path.join(output_dir, 'training_log.csv')
+        csv_file = open(csv_path, 'w', newline='')
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow([
+            'epoch', 'stage', 'phase', 'lr',
+            'train_total', 'train_landmark', 'train_angular_deg',
+            'train_reproj', 'train_mask', 'train_ray_target', 'train_pose',
+            'train_translation',
+            'val_total', 'val_landmark', 'val_angular_deg', 'val_landmark_px',
+        ])
 
-    # Batch-level CSV logger (high granularity)
-    batch_csv_path = os.path.join(output_dir, 'batch_log.csv')
-    batch_csv_file = open(batch_csv_path, 'w', newline='')
-    batch_csv_writer = csv.writer(batch_csv_file)
-    batch_csv_writer.writerow([
-        'epoch', 'batch', 'loss', 'landmark', 'angular_deg',
-        'gaze_consist', 'shape', 'ray_target', 'pose', 'translation', 'lr',
-    ])
+        batch_csv_path = os.path.join(output_dir, 'batch_log.csv')
+        batch_csv_file = open(batch_csv_path, 'w', newline='')
+        batch_csv_writer = csv.writer(batch_csv_file)
+        batch_csv_writer.writerow([
+            'epoch', 'batch', 'loss', 'landmark', 'angular_deg',
+            'gaze_consist', 'shape', 'ray_target', 'pose', 'translation', 'lr',
+        ])
 
     # Training loop with phase transitions
     best_val_loss = float('inf')
@@ -880,9 +796,12 @@ def train(args):
     scheduler = None
 
     if args.resume and ckpt_mgr is not None:
-        print(f"Resuming from run {ckpt_mgr.run_id} ...")
+        if is_main:
+            print(f"Resuming from run {ckpt_mgr.run_id} ...")
         # We need optimizer & scheduler to exist before resume_state.
         # Create them for the starting phase; resume will overwrite state.
+        # Each rank runs this independently so all ranks end up with the
+        # same optimizer/scheduler state (they read the same checkpoint).
         resume_phase_cfg = get_phase_config(1)
         optimizer = optim.AdamW(model.parameters(), lr=resume_phase_cfg['lr'],
                                 betas=(0.5, 0.95), weight_decay=1e-4)
@@ -890,14 +809,18 @@ def train(args):
         scheduler = CosineAnnealingLR(optimizer, T_max=phase_end - phase_start + 1)
 
         resume_file = getattr(args, 'resume_from', None)
+        # resume_state loads into the unwrapped model so DDP wrapping
+        # doesn't interfere with state_dict key names.
+        unwrapped = accelerator.unwrap_model(model)
         start_epoch, resume_ckpt = ckpt_mgr.resume_state(
-            model, optimizer, scheduler=scheduler, scaler=scaler,
+            unwrapped, optimizer, scheduler=scheduler, scaler=scaler,
             map_location=device, filename=resume_file,
         )
         current_phase = get_phase(resume_ckpt['epoch'])
         best_val_loss = resume_ckpt.get('val_metrics', {}).get('total', best_val_loss)
-        print(f"  Resumed at epoch {start_epoch} (phase {current_phase}), "
-              f"best_val_loss={best_val_loss:.4f}")
+        if is_main:
+            print(f"  Resumed at epoch {start_epoch} (phase {current_phase}), "
+                  f"best_val_loss={best_val_loss:.4f}")
 
         # Guard: empty training range. Happens when resuming a completed run
         # without extending --epochs. Fail loudly instead of silently exiting.
@@ -915,26 +838,28 @@ def train(args):
     # scaler stay fresh. A new run_id has already been generated by the
     # checkpoint manager (since --run_id is forbidden with --warmstart_from).
     if args.warmstart_from and ckpt_mgr is not None:
-        print(f"Warmstarting from run {args.warmstart_from} "
-              f"({args.warmstart_checkpoint}) into new run {ckpt_mgr.run_id} ...")
+        if is_main:
+            print(f"Warmstarting from run {args.warmstart_from} "
+                  f"({args.warmstart_checkpoint}) into new run {ckpt_mgr.run_id} ...")
         ws_state = ckpt_mgr.load_from_run(
             source_run_id=args.warmstart_from,
             filename=args.warmstart_checkpoint,
             map_location=device,
         )
-        target = model._orig_mod if hasattr(model, '_orig_mod') else model
+        target = accelerator.unwrap_model(model)
         missing, unexpected = target.load_state_dict(
             ws_state['model_state_dict'], strict=False)
-        if missing:
-            print(f"  [warmstart] missing keys: {len(missing)} "
-                  f"(first: {missing[:3]})")
-        if unexpected:
-            print(f"  [warmstart] unexpected keys: {len(unexpected)} "
-                  f"(first: {unexpected[:3]})")
-        src_stage = ws_state.get('config', {}).get('stage', '?')
-        src_epoch = ws_state.get('epoch', '?')
-        print(f"  Loaded weights from stage {src_stage} epoch {src_epoch}. "
-              f"Starting fresh optimizer at epoch 1 of stage {args.stage}.")
+        if is_main:
+            if missing:
+                print(f"  [warmstart] missing keys: {len(missing)} "
+                      f"(first: {missing[:3]})")
+            if unexpected:
+                print(f"  [warmstart] unexpected keys: {len(unexpected)} "
+                      f"(first: {unexpected[:3]})")
+            src_stage = ws_state.get('config', {}).get('stage', '?')
+            src_epoch = ws_state.get('epoch', '?')
+            print(f"  Loaded weights from stage {src_stage} epoch {src_epoch}. "
+                  f"Starting fresh optimizer at epoch 1 of stage {args.stage}.")
 
         # Translation loss formulation changed (tanh/exp → direct linear
         # meters). The old pose_head rows 6:9 were trained for the prior
@@ -948,9 +873,10 @@ def train(args):
             with torch.no_grad():
                 target.pose_encoder.pose_head.weight[6:].zero_()
                 target.pose_encoder.pose_head.bias[6:].zero_()
-            print("  [warmstart] Reset pose_head translation rows (6:9) "
-                  "to zero — translation loss reformulated to direct "
-                  "cm→m SmoothL1. Rotation rows (0:6) preserved.")
+            if is_main:
+                print("  [warmstart] Reset pose_head translation rows (6:9) "
+                      "to zero — translation loss reformulated to direct "
+                      "cm→m SmoothL1. Rotation rows (0:6) preserved.")
         # start_epoch stays at 1, optimizer/scheduler stay None — they will
         # be created in the phase-transition block below exactly like a
         # from-scratch run.
@@ -970,16 +896,17 @@ def train(args):
         # Phase transition: update LR schedule, keep optimizer state
         if phase != current_phase:
             current_phase = phase
-            print(f"\n{'='*60}")
-            print(f"Phase {phase}: {cfg['description']}")
-            print(f"  lr={cfg['lr']}, lam_lm={cfg['lam_lm']}, "
-                  f"lam_gaze={cfg['lam_gaze']}, lam_ray={cfg.get('lam_ray', 0)}, "
-                  f"lam_pose={cfg.get('lam_pose', 0)}, lam_trans={cfg.get('lam_trans', 0)}, "
-                  f"sigma={cfg['sigma']}")
-            if cfg.get('multiview'):
-                print(f"  Multi-view: lam_gaze_consist={cfg['lam_reproj']}, "
-                      f"lam_shape={cfg['lam_mask']}")
-            print(f"{'='*60}")
+            if is_main:
+                print(f"\n{'='*60}")
+                print(f"Phase {phase}: {cfg['description']}")
+                print(f"  lr={cfg['lr']}, lam_lm={cfg['lam_lm']}, "
+                      f"lam_gaze={cfg['lam_gaze']}, lam_ray={cfg.get('lam_ray', 0)}, "
+                      f"lam_pose={cfg.get('lam_pose', 0)}, lam_trans={cfg.get('lam_trans', 0)}, "
+                      f"sigma={cfg['sigma']}")
+                if cfg.get('multiview'):
+                    print(f"  Multi-view: lam_gaze_consist={cfg['lam_reproj']}, "
+                          f"lam_shape={cfg['lam_mask']}")
+                print(f"{'='*60}")
 
             phase_start, phase_end = cfg['epochs']
 
@@ -991,7 +918,8 @@ def train(args):
                     betas=(0.5, 0.95),
                     weight_decay=1e-4,
                 )
-                print(f"  Created new AdamW optimizer (lr={cfg['lr']})")
+                if is_main:
+                    print(f"  Created new AdamW optimizer (lr={cfg['lr']})")
             else:
                 # Subsequent phases: carry over optimizer state (momentum +
                 # adaptive second-moment estimates), only update the LR.
@@ -1002,7 +930,8 @@ def train(args):
                 for pg in optimizer.param_groups:
                     pg['lr'] = cfg['lr']
                     pg['initial_lr'] = cfg['lr']  # CosineAnnealingLR reads this
-                print(f"  Carried over optimizer state, updated LR → {cfg['lr']}")
+                if is_main:
+                    print(f"  Carried over optimizer state, updated LR → {cfg['lr']}")
 
             scheduler = CosineAnnealingLR(
                 optimizer,
@@ -1030,7 +959,8 @@ def train(args):
             batch_csv_writer=batch_csv_writer,
             n_views=active_n_views,
         )
-        batch_csv_file.flush()
+        if batch_csv_file is not None:
+            batch_csv_file.flush()
 
         # Validate with the SAME multi-view topology used in training.
         # Previously hardcoded to n_views=1, which bypassed CrossViewAttention,
@@ -1049,127 +979,137 @@ def train(args):
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
 
-        # Log
-        mv_str = ""
-        if cfg.get('multiview'):
-            mv_str = (f" gaze_mv={train_losses['reproj']:.4f}"
-                      f" shape={train_losses['mask']:.4f}")
-        if train_losses.get('ray_target', 0) > 0:
-            mv_str += f" ray={train_losses['ray_target']:.4f}"
-        if train_losses.get('pose', 0) > 0:
-            mv_str += f" pose={train_losses['pose']:.4f}"
-        if train_losses.get('translation', 0) > 0:
-            mv_str += f" trans={train_losses['translation']:.4f}"
-        print(f"Epoch {epoch:3d} | Phase {phase} | lr {current_lr:.2e} | "
-              f"Train: loss={train_losses['total']:.4f} lm={train_losses['landmark']:.4f} "
-              f"ang={train_losses['angular_deg']:.2f}deg{mv_str} | "
-              f"Val: loss={val_losses['total']:.4f} lm_px={val_losses['landmark_px']:.2f}px "
-              f"ang={val_losses['angular_deg']:.2f}deg")
+        # All ranks finish the epoch before the main process saves / uploads.
+        accelerator.wait_for_everyone()
 
-        if hw['amp'] and device.type == 'cuda':
-            mem_gb = torch.cuda.max_memory_allocated() / 1e9
-            print(f"  GPU memory peak: {mem_gb:.1f} GB")
+        if is_main:
+            mv_str = ""
+            if cfg.get('multiview'):
+                mv_str = (f" gaze_mv={train_losses['reproj']:.4f}"
+                          f" shape={train_losses['mask']:.4f}")
+            if train_losses.get('ray_target', 0) > 0:
+                mv_str += f" ray={train_losses['ray_target']:.4f}"
+            if train_losses.get('pose', 0) > 0:
+                mv_str += f" pose={train_losses['pose']:.4f}"
+            if train_losses.get('translation', 0) > 0:
+                mv_str += f" trans={train_losses['translation']:.4f}"
+            print(f"Epoch {epoch:3d} | Phase {phase} | lr {current_lr:.2e} | "
+                  f"Train: loss={train_losses['total']:.4f} lm={train_losses['landmark']:.4f} "
+                  f"ang={train_losses['angular_deg']:.2f}deg{mv_str} | "
+                  f"Val: loss={val_losses['total']:.4f} lm_px={val_losses['landmark_px']:.2f}px "
+                  f"ang={val_losses['angular_deg']:.2f}deg")
 
-        csv_writer.writerow([
-            epoch, args.stage, phase, f"{current_lr:.2e}",
-            f"{train_losses['total']:.6f}",
-            f"{train_losses['landmark']:.6f}",
-            f"{train_losses['angular_deg']:.4f}",
-            f"{train_losses.get('reproj', 0):.6f}",
-            f"{train_losses.get('mask', 0):.6f}",
-            f"{train_losses.get('ray_target', 0):.6f}",
-            f"{train_losses.get('pose', 0):.6f}",
-            f"{train_losses.get('translation', 0):.6f}",
-            f"{val_losses['total']:.6f}",
-            f"{val_losses['landmark']:.6f}",
-            f"{val_losses['angular_deg']:.4f}",
-            f"{val_losses['landmark_px']:.4f}",
-        ])
-        csv_file.flush()
+            if hw['amp'] and device.type == 'cuda':
+                mem_gb = torch.cuda.max_memory_allocated() / 1e9
+                print(f"  GPU memory peak (rank 0): {mem_gb:.1f} GB")
 
-        # Save best model
-        if val_losses['total'] < best_val_loss:
-            best_val_loss = val_losses['total']
+            csv_writer.writerow([
+                epoch, args.stage, phase, f"{current_lr:.2e}",
+                f"{train_losses['total']:.6f}",
+                f"{train_losses['landmark']:.6f}",
+                f"{train_losses['angular_deg']:.4f}",
+                f"{train_losses.get('reproj', 0):.6f}",
+                f"{train_losses.get('mask', 0):.6f}",
+                f"{train_losses.get('ray_target', 0):.6f}",
+                f"{train_losses.get('pose', 0):.6f}",
+                f"{train_losses.get('translation', 0):.6f}",
+                f"{val_losses['total']:.6f}",
+                f"{val_losses['landmark']:.6f}",
+                f"{val_losses['angular_deg']:.4f}",
+                f"{val_losses['landmark_px']:.4f}",
+            ])
+            csv_file.flush()
 
+            # Unwrap DDP (and torch.compile) before handing the raw module to
+            # the checkpoint code; its state_dict is what's serialised.
+            save_model = accelerator.unwrap_model(model)
+
+            # Save best model
+            if val_losses['total'] < best_val_loss:
+                best_val_loss = val_losses['total']
+
+                if ckpt_mgr is not None:
+                    ckpt_mgr.save_best(
+                        epoch=epoch, model=save_model, val_loss=best_val_loss,
+                        val_metrics=val_losses, optimizer=optimizer,
+                        scheduler=scheduler, scaler=scaler,
+                        extra={'profile': args.profile},
+                    )
+                else:
+                    save_dict = {
+                        'epoch': epoch,
+                        'phase': phase,
+                        'model_state_dict': save_model.state_dict(),
+                        'val_loss': best_val_loss,
+                        'val_landmark_px': val_losses['landmark_px'],
+                        'val_angular_deg': val_losses['angular_deg'],
+                        'profile': args.profile,
+                    }
+                    torch.save(save_dict, os.path.join(output_dir, 'best_model.pt'))
+                print(f"  -> Saved best model (val_loss={best_val_loss:.4f})")
+
+            # Periodic + latest checkpoint
             if ckpt_mgr is not None:
-                ckpt_mgr.save_best(
-                    epoch=epoch, model=model, val_loss=best_val_loss,
-                    val_metrics=val_losses, optimizer=optimizer,
-                    scheduler=scheduler, scaler=scaler,
-                    extra={'profile': args.profile},
-                )
-            else:
-                save_dict = {
-                    'epoch': epoch,
-                    'phase': phase,
-                    'model_state_dict': (model._orig_mod.state_dict()
-                                         if hasattr(model, '_orig_mod')
-                                         else model.state_dict()),
-                    'val_loss': best_val_loss,
-                    'val_landmark_px': val_losses['landmark_px'],
-                    'val_angular_deg': val_losses['angular_deg'],
-                    'profile': args.profile,
-                }
-                torch.save(save_dict, os.path.join(output_dir, 'best_model.pt'))
-            print(f"  -> Saved best model (val_loss={best_val_loss:.4f})")
-
-        # Periodic + latest checkpoint
-        if ckpt_mgr is not None:
-            # Always save latest (for resume)
-            ckpt_mgr.save(
-                epoch=epoch, model=model, optimizer=optimizer,
-                scheduler=scheduler, scaler=scaler, phase=phase,
-                train_metrics=train_losses, val_metrics=val_losses,
-                tag='latest',
-            )
-            # Periodic named checkpoint
-            if epoch % args.ckpt_every == 0:
+                # Always save latest (for resume)
                 ckpt_mgr.save(
-                    epoch=epoch, model=model, optimizer=optimizer,
+                    epoch=epoch, model=save_model, optimizer=optimizer,
                     scheduler=scheduler, scaler=scaler, phase=phase,
                     train_metrics=train_losses, val_metrics=val_losses,
+                    tag='latest',
                 )
-            # Upload logs after each epoch (survives interruption/crash)
-            try:
-                batch_csv_file.flush()
-                csv_file.flush()
-                for local_path in (batch_csv_path, csv_path):
-                    log_key = f"{args.ckpt_prefix}/{ckpt_mgr.run_id}/{os.path.basename(local_path)}"
-                    ckpt_mgr._client.fput_object(args.ckpt_bucket, log_key, local_path)
-            except Exception as e:
-                log.warning("MinIO log upload failed: %s", e)
-        else:
-            if epoch % args.ckpt_every == 0:
-                save_dict = {
-                    'epoch': epoch,
-                    'phase': phase,
-                    'model_state_dict': (model._orig_mod.state_dict()
-                                         if hasattr(model, '_orig_mod')
-                                         else model.state_dict()),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                }
-                if scaler is not None:
-                    save_dict['scaler_state_dict'] = scaler.state_dict()
-                torch.save(save_dict, os.path.join(output_dir, f'checkpoint_epoch{epoch}.pt'))
-
-    csv_file.close()
-    batch_csv_file.close()
-
-    # Upload training logs to MinIO
-    if ckpt_mgr is not None:
-        for log_file in [csv_path, batch_csv_path]:
-            if os.path.exists(log_file):
-                log_key = f"{args.ckpt_prefix}/{ckpt_mgr.run_id}/{os.path.basename(log_file)}"
+                # Periodic named checkpoint
+                if epoch % args.ckpt_every == 0:
+                    ckpt_mgr.save(
+                        epoch=epoch, model=save_model, optimizer=optimizer,
+                        scheduler=scheduler, scaler=scaler, phase=phase,
+                        train_metrics=train_losses, val_metrics=val_losses,
+                    )
+                # Upload logs after each epoch (survives interruption/crash)
                 try:
-                    ckpt_mgr._client.fput_object(args.ckpt_bucket, log_key, log_file)
-                    print(f"  Uploaded {os.path.basename(log_file)} to s3://{args.ckpt_bucket}/{log_key}")
+                    batch_csv_file.flush()
+                    csv_file.flush()
+                    for local_path in (batch_csv_path, csv_path):
+                        log_key = f"{args.ckpt_prefix}/{ckpt_mgr.run_id}/{os.path.basename(local_path)}"
+                        ckpt_mgr._client.fput_object(args.ckpt_bucket, log_key, local_path)
                 except Exception as e:
-                    print(f"  Warning: failed to upload {os.path.basename(log_file)}: {e}")
+                    log.warning("MinIO log upload failed: %s", e)
+            else:
+                if epoch % args.ckpt_every == 0:
+                    save_dict = {
+                        'epoch': epoch,
+                        'phase': phase,
+                        'model_state_dict': save_model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                    }
+                    if scaler is not None:
+                        save_dict['scaler_state_dict'] = scaler.state_dict()
+                    torch.save(save_dict, os.path.join(output_dir, f'checkpoint_epoch{epoch}.pt'))
 
-    print(f"\nTraining complete. Results saved to {output_dir}")
-    print(f"Best val loss: {best_val_loss:.4f}")
-    if ckpt_mgr is not None:
-        print(f"Checkpoints: s3://{args.ckpt_bucket}/{args.ckpt_prefix}/{ckpt_mgr.run_id}/")
+        # Broadcast best_val_loss from main so every rank stays in sync on
+        # the "was this a new best?" question. For DDP this doesn't affect
+        # training state (only main saves), but keeping the value consistent
+        # makes the resume path simpler.
+        accelerator.wait_for_everyone()
+
+    if is_main:
+        csv_file.close()
+        batch_csv_file.close()
+
+        # Upload training logs to MinIO
+        if ckpt_mgr is not None:
+            for log_file in [csv_path, batch_csv_path]:
+                if os.path.exists(log_file):
+                    log_key = f"{args.ckpt_prefix}/{ckpt_mgr.run_id}/{os.path.basename(log_file)}"
+                    try:
+                        ckpt_mgr._client.fput_object(args.ckpt_bucket, log_key, log_file)
+                        print(f"  Uploaded {os.path.basename(log_file)} to s3://{args.ckpt_bucket}/{log_key}")
+                    except Exception as e:
+                        print(f"  Warning: failed to upload {os.path.basename(log_file)}: {e}")
+
+        print(f"\nTraining complete. Results saved to {output_dir}")
+        print(f"Best val loss: {best_val_loss:.4f}")
+        if ckpt_mgr is not None:
+            print(f"Checkpoints: s3://{args.ckpt_bucket}/{args.ckpt_prefix}/{ckpt_mgr.run_id}/")
 
 
 # ============== Data Loader Helpers ==============

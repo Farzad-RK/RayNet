@@ -1,0 +1,3 @@
+epoch,stage,phase,lr,train_total,train_landmark,train_angular_deg,train_reproj,train_mask,train_ray_target,train_pose,train_translation,val_total,val_landmark,val_angular_deg,val_landmark_px
+1,1,1,9.76e-04,22.120674,0.005479,114.2383,0.000000,0.000000,0.000000,2.494265,7.384531,13.940106,0.004445,42.5738,85.1208
+2,1,1,9.05e-04,22.130980,0.005482,114.2218,0.000000,0.000000,0.000000,2.494023,7.384494,13.935538,0.004444,42.5737,85.0921
