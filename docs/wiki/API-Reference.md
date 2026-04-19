@@ -13,29 +13,52 @@ class RayNetV5(nn.Module):
         n_views=1,
         R_cam=None, T_cam=None,
         face_bbox=None,
-        use_landmark_bridge=True,
-        use_pose_bridge=True,
+        use_landmark_bridge=True,      # no-op in Quad-M1 (back-compat)
+        use_pose_bridge=True,          # False → zero pose stream into GazeFusionBlock
     ) -> dict
         # x: (B, 3, 224, 224)  (B = n_views * mv_groups)
         # R_cam: (B, 3, 3)     camera extrinsic rotation, or None
         # T_cam: (B, 3)        camera extrinsic translation, or None
         # face_bbox: (B, 3)    (x_p, y_p, L_x) from Intrinsic Delta
+        # Internally rescales predicted landmark_coords from 56-space to 224-space,
+        # detaches them, and passes them to the gaze branch as the eye-crop anchor.
         # Returns: {
-        #   'landmark_coords':   (B, 14, 2),
+        #   'landmark_coords':   (B, 14, 2),     # 56x56 space
         #   'landmark_heatmaps': (B, 14, 56, 56),
-        #   'eyeball_center_3d': (B, 3),
-        #   'pupil_center_3d':   (B, 3),
-        #   'optical_axis':      (B, 3),
-        #   'pose_6d':           (B, 6),
-        #   'pose_t':            (B, 3),
+        #   'eyeball_center':    (B, 3),         # CCS, cm
+        #   'pupil_center':      (B, 3),         # CCS, cm
+        #   'gaze_vector':       (B, 3),         # unit optical axis
+        #   'gaze_angles':       (B, 2),         # pitch, yaw
+        #   'pred_pose_6d':      (B, 6),
+        #   'pred_pose_t':       (B, 3),
         # }
 
 def create_raynet_v5(
     backbone_weight_path=None,
+    cross_view_cfg=None,
     n_landmarks=14,
 ) -> RayNetV5
-    # Instantiates the Triple-M1 model. `backbone_weight_path` is loaded into
-    # each RepNeXt-M1 instance (shared stem + 3 branch encoders).
+    # Instantiates the Quad-M1 model. Creates FOUR RepNeXt-M1 instances:
+    #   shared    → stem + s0 + s1 feed landmark & pose
+    #   landmark  → s2 + s3 for the landmark branch encoder
+    #   pose      → s2 + s3 for the pose branch encoder
+    #   eye       → full M1 (stem + s0..s3) dedicated to the gaze branch,
+    #               operating on 112x112 landmark-guided eye crops
+    # All four start from the same pretrained backbone_weight_path.
+```
+
+## `RayNet/eye_crop.py` — Differentiable Eye Crop
+
+```python
+class EyeCropModule(nn.Module):
+    def __init__(self, out_size=112, pad_frac=0.25, min_half_size=24.0)
+    def forward(self, image, landmarks_px) -> Tensor
+        # image:         (B, 3, H, W) float
+        # landmarks_px:  (B, N, 2) in pixel space of `image`
+        # Returns:       (B, 3, out_size, out_size)
+        # Implementation: square bbox around landmark centroid with pad_frac
+        # expansion, clamped to min_half_size. Sampled via F.affine_grid +
+        # F.grid_sample (align_corners=True, padding_mode='zeros').
 ```
 
 ## `RayNet/coordatt.py` — Attention
@@ -192,16 +215,41 @@ def convert_to_mds_chunked(data_dir, output_dir, subject_ids,
 
 ---
 
+## `RayNet/hardware_profiles.py` — Hardware Config + Accelerate
+
+```python
+HARDWARE_PROFILES: dict          # 'default', 't4', 'l4', 'a10g', 'v100', 'a100',
+                                  # 'h100', 'kaggle_t4x2', 'multi_node_t4'
+AMP_DTYPE_MAP: dict              # 'float16' | 'bfloat16' | 'float32' → torch dtype
+
+def apply_hardware_profile(args) -> dict
+def setup_hardware(hw: dict, device) -> None
+def build_accelerator() -> Accelerator
+    # Constructs Accelerator(mixed_precision='no') with
+    # DistributedDataParallelKwargs(find_unused_parameters=True).
+    # Required for Stage 2 P1/P2 where the frozen face path has params
+    # with requires_grad=False.
+```
+
 ## `RayNet/train.py` — Training
 
 ```python
-HARDWARE_PROFILES: dict          # 'default', 't4', 'l4', 'a10g', 'v100', 'a100', 'h100'
-STAGE_CONFIGS: dict              # stages 1, 2, 3 with per-phase configs
+STAGE_CONFIGS: dict              # stages 1, 2, 3 with per-phase configs (incl. 'freeze_face')
 
 def get_phase(epoch: int) -> int
 def get_phase_config(epoch: int) -> dict
-def apply_hardware_profile(args) -> dict
-def setup_hardware(hw: dict, device) -> None
+
+def _unwrap_raynet(model) -> RayNetV5                      # strips DDP + torch.compile
+def set_face_frozen(model, frozen: bool) -> None
+    # Freezes / unfreezes shared_stem + landmark_branch + pose_branch.
+    # When frozen: requires_grad_(False) + .eval() on each submodule, so BN
+    # running stats also stop drifting. Re-applied inside train_one_epoch
+    # after model.train() so the freeze survives the per-epoch toggle.
+
+def _filter_compatible_state(src_sd, target_sd) -> tuple[dict, list[str]]
+    # Drops shape-mismatched tensors during cross-stage forks.
+def _optimizer_state_compatible(saved_state, new_optimizer) -> bool
+    # Per-group param count check; guards optimizer.load_state_dict.
 
 def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                     scaler=None, grad_accum_steps=1, amp_enabled=False,

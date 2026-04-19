@@ -280,13 +280,15 @@ The `mv_weight` ramps linearly from 0 to 1 over the first 10 epochs to smooth mu
 | 1 | 1-8 | 1.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.5 | 0.5 | 0.0 | Off |
 | 2 | 9-15 | 1.0 | 0.0 | 0.0 | 0.0 | 0.0 | 1.0 | 1.0 | 0.0 | Off |
 
-### Stage 2: Add Gaze + 3D Eyeball (No Bridge)
+### Stage 2: Eye-Crop Gaze on Frozen Face Path
 
-| Phase | Epochs | lam_lm | lam_gaze | lam_eyeball | lam_pupil | lam_geom_angular | lam_pose | lam_trans | lam_ray | lam_reproj | lam_mask |
-|-------|--------|--------|----------|-------------|-----------|-----------------|----------|-----------|---------|------------|----------|
-| 1 | 1-5 | 1.0 | 0.1 | 0.1 | 0.1 | 0.0 | 0.5 | 0.5 | 0.0 | 0.0 | 0.0 |
-| 2 | 6-15 | 1.0 | 0.5 | 0.3 | 0.3 | 0.0 | 0.5 | 0.5 | 0.1 | 0.05 | 0.02 |
-| 3 | 16-25 | 1.0 | 1.0 | 0.5 | 0.5 | 0.2 | 0.5 | 0.5 | 0.3 | 0.1 | 0.05 |
+The face path (`shared_stem` + `landmark_branch` + `pose_branch`) is frozen in phases 1-2 so `lam_lm = lam_pose = lam_trans = 0` — those losses have no gradient sink. Phase 3 unfreezes everything for gentle joint fine-tuning.
+
+| Phase | Epochs | `freeze_face` | lam_lm | lam_gaze | lam_eyeball | lam_pupil | lam_geom_angular | lam_pose | lam_trans | lam_ray | lam_reproj | lam_mask |
+|-------|--------|---------------|--------|----------|-------------|-----------|-----------------|----------|-----------|---------|------------|----------|
+| 1 | 1-8 | True | 0.0 | 1.0 | 0.3 | 0.3 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| 2 | 9-15 | True | 0.0 | 1.0 | 0.5 | 0.5 | 0.2 | 0.0 | 0.0 | 0.2 | 0.1 | 0.05 |
+| 3 | 16-25 | False | 0.5 | 1.0 | 0.5 | 0.5 | 0.3 | 0.3 | 0.3 | 0.3 | 0.1 | 0.05 |
 
 ### Stage 3: Full Pipeline with Bridges
 

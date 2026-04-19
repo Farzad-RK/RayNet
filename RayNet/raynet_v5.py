@@ -1,44 +1,40 @@
 """
-RayNet v5 — Triple-M1 architecture with shared stem.
+RayNet v5 — Quad-M1 architecture with dedicated eye-crop gaze encoder.
 
-Three task-specific branches split from a shared low-level encoder:
-  1. Landmark Branch: U-Net decoder with attention gates for 14-point
-     iris/pupil landmarks at 56x56 resolution with skip connections.
-  2. Gaze Branch: Explicit 3D eye geometry — predicts eyeball center and
-     gaze direction, derives optical axis via normalization. Geometric
-     constraint: the model MUST predict a physically consistent origin
-     + direction pair. Pose-conditioned modulation (SHMA-style) and
-     landmark cross-attention provide inter-task information flow.
-  3. Pose Branch: 6D rotation + 3D translation from gradient-isolated
-     features. Identical objective to v4.1 PoseEncoder.
+Four task-specific paths:
+  1. SharedStem (M1 stem+s0+s1) — low-level features for landmark + pose
+  2. LandmarkBranch (M1 s2+s3 → U-Net decoder) — 14 iris/pupil landmarks
+     at 56x56 resolution with attention-gated skip connections.
+  3. GazeBranch — dedicated pipeline:
+        predicted landmarks → EyeCropModule (differentiable, 112x112)
+          → full RepNeXt-M1 EyeBackbone (private to gaze)
+          → GazeFusionBlock(eye, pose, bbox) → GeometricGazeHead
+     The gaze branch does NOT share features with landmark/pose; it
+     gets a high-resolution view of the iris through landmark-guided
+     cropping. This breaks the face-level 14x14 bottleneck that was
+     capping val_angular near 42 degrees.
+  4. PoseBranch (M1 s2+s3) — 6D rotation + 3D translation from
+     gradient-isolated shared-stem features.
 
-Backbone: RepNeXt-M1 (4.8M per instance)
-  Shared:  stem + stages[0-1] (48→96ch, stride 8, 28x28)
-  Branch:  stages[2-3] each  (96→192→384ch, stride 32, 7x7)
-
-Key differences from v4.1:
-  - No PANet — each branch has its own dedicated encoder path
-  - U-Net decoder with attention gates replaces heatmap-on-P2
-  - Explicit eyeball center prediction replaces black-box pitch/yaw
-  - Pose branch uses shared stem (gradient-detached) instead of raw image
-  - Zero-init bridges active from epoch 1 (no cold-start problem)
+Backbone: 4 x RepNeXt-M1 (~4.8M each, ~19M total backbone)
+  shared (stem+s0+s1), landmark (s2+s3), pose (s2+s3), eye (all 4 stages).
 
 MAGE integration (Sec 3.2):
-  - BoxEncoder encodes face bounding box (x_p, y_p, L_x) to provide
-    positional/spatial information about the face center and coordinate
-    system rotation during normalization.
-  - FusionBlock combines pose encoder output + box encoding to provide
-    gaze origin information, eliminating external face detection at
-    inference (only a fast face bbox is needed, not 468-point MediaPipe).
+  BoxEncoder(face_bbox) feeds into the gaze fusion block alongside
+  the pose embedding and eye-crop feature, providing gaze-origin
+  information without requiring 468-point MediaPipe at inference.
 
 GazeGene 3D Eyeball Structure Estimation (Sec 4.2.2):
-  - Predict eyeball_center_3d AND pupil_center_3d
-  - Derive optical_axis = normalize(pupil_center - eyeball_center)
-  - 4 losses: eyeball L1, pupil L1, iris contour L1, angular error
-    from estimated geometry
+  Predict eyeball_center_3d AND pupil_center_3d, derive
+  optical_axis = normalize(pupil - eyeball).
+
+Stage 2 curriculum:
+  Phases 1-2 freeze shared_stem + landmark_branch + pose_branch and
+  train only the gaze branch; phase 3 unfreezes for joint refinement.
+  Predicted landmarks are always detached before feeding the eye crop
+  to eliminate train/test distribution gap.
 
 Input:  (3, 224, 224) GazeGene face crop + (3,) face bounding box
-Params: ~16M total (~1.5M shared + 3 x ~3.3M branches + ~2.5M heads/bridges/box)
 """
 
 import torch
@@ -48,6 +44,7 @@ from torch.utils.checkpoint import checkpoint
 
 from backbone.repnext import create_repnext
 from RayNet.coordatt import CoordinateAttention
+from RayNet.eye_crop import EyeCropModule
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -159,43 +156,6 @@ class BoxEncoder(nn.Module):
             (B, d_model) bounding box embedding
         """
         return self.mlp(bbox)
-
-
-class FusionBlock(nn.Module):
-    """
-    MAGE-style Fusion Block (Sec 3.2).
-
-    Combines pose encoder features with bounding box encoding to
-    produce a fused gaze-origin representation. The pose encoder
-    provides implicit head orientation, while the box encoder supplies
-    face position and scale.
-
-    Architecture: concatenate → project → residual add.
-    Zero-init residual for safe cold-start.
-    """
-
-    def __init__(self, d_model=256):
-        super().__init__()
-        self.proj = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, d_model),
-        )
-        # Zero-init last layer for residual safety
-        nn.init.zeros_(self.proj[2].weight)
-        nn.init.zeros_(self.proj[2].bias)
-
-    def forward(self, pose_feat, box_feat):
-        """
-        Args:
-            pose_feat: (B, d_model) from PoseBranch encoder
-            box_feat: (B, d_model) from BoxEncoder
-
-        Returns:
-            (B, d_model) fused gaze-origin embedding
-        """
-        fused = self.proj(torch.cat([pose_feat, box_feat], dim=-1))
-        return pose_feat + fused  # residual connection
 
 
 # ─── U-Net Landmark Branch ──────────────────────────────────────────
@@ -342,84 +302,65 @@ class UNetLandmarkBranch(nn.Module):
 
 # ─── Gaze Branch with Explicit 3D Geometry ──────────────────────────
 
-class PoseGazeModulation(nn.Module):
+class EyeBackbone(nn.Module):
     """
-    SHMA-style pose-conditioned gaze feature modulation.
+    Dedicated full RepNeXt-M1 backbone for the eye-crop branch.
 
-    Pose features generate a sigmoid gating signal that modulates
-    gaze features via element-wise multiplication. This injects head
-    orientation information early in the gaze pipeline, allowing the
-    model to interpret eye textures relative to head pose.
+    Unlike the other branches which share the stem+s0+s1 path, the eye
+    encoder takes a 112x112 landmark-guided eye patch and runs ALL four
+    RepNeXt stages privately. This gives the gaze pathway a high-res
+    view of the iris/pupil, breaking the face-level 14x14 feature-map
+    bottleneck that was capping val_angular near 42 degrees when the
+    gaze branch shared low-level features with landmark/pose.
 
-    Zero-init output projection ensures modulation starts as identity.
+    At 112x112 input the final feature map is 384ch @ ~4x4.
+
+    ~4.8M params.
+    """
+
+    def __init__(self, stem, stage0, stage1, stage2, stage3):
+        super().__init__()
+        self.stem = stem
+        self.stage0 = stage0
+        self.stage1 = stage1
+        self.stage2 = stage2
+        self.stage3 = stage3
+
+    def forward(self, x):
+        x = checkpoint(self.stem, x, use_reentrant=False)
+        x = checkpoint(self.stage0, x, use_reentrant=False)
+        x = checkpoint(self.stage1, x, use_reentrant=False)
+        x = checkpoint(self.stage2, x, use_reentrant=False)
+        x = checkpoint(self.stage3, x, use_reentrant=False)
+        return x
+
+
+class GazeFusionBlock(nn.Module):
+    """
+    Merge three d_model streams into the gaze embedding:
+      - eye_feat:  dedicated eye-crop encoder output (anchor)
+      - pose_feat: head-pose embedding from PoseBranch
+      - box_feat:  face-bbox encoding from MAGE BoxEncoder
+
+    Eye feature is the residual anchor; pose and box add corrective
+    information. Output projection is zero-init, so at start the model
+    predicts purely from the eye crop — pose/box enter gradually
+    through training without disrupting the eye-encoder signal.
     """
 
     def __init__(self, d_model=256):
         super().__init__()
-        self.pose_gate = nn.Sequential(
+        self.proj = nn.Sequential(
+            nn.Linear(d_model * 3, d_model),
+            nn.GELU(),
             nn.Linear(d_model, d_model),
-            nn.Sigmoid(),
         )
-        self.out_proj = nn.Linear(d_model, d_model)
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
+        nn.init.zeros_(self.proj[2].weight)
+        nn.init.zeros_(self.proj[2].bias)
 
-    def forward(self, gaze_feat, pose_feat):
-        """
-        Args:
-            gaze_feat: (B, d_model) pooled gaze features
-            pose_feat: (B, d_model) pose embedding
-
-        Returns:
-            (B, d_model) modulated gaze features (residual)
-        """
-        gate = self.pose_gate(pose_feat)
-        return gaze_feat + self.out_proj(gaze_feat * gate)
-
-
-class LandmarkGazeAttention(nn.Module):
-    """
-    Cross-attention: gaze features attend to landmark spatial features.
-
-    Gaze queries attend to landmark encoder features (s2, 192ch@14x14)
-    to incorporate spatial eye structure into the gaze pathway.
-
-    Zero-init output projection for safe cold-start.
-    """
-
-    def __init__(self, d_model=256, landmark_ch=192, n_heads=4):
-        super().__init__()
-        self.kv_proj = nn.Conv2d(landmark_ch, d_model, 1)
-        self.downsample = nn.AdaptiveAvgPool2d(7)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=d_model, num_heads=n_heads, batch_first=True,
-        )
-        self.norm_q = nn.LayerNorm(d_model)
-        self.norm_kv = nn.LayerNorm(d_model)
-
-        nn.init.zeros_(self.cross_attn.out_proj.weight)
-        nn.init.zeros_(self.cross_attn.out_proj.bias)
-
-    def forward(self, gaze_pooled, lm_s2):
-        """
-        Args:
-            gaze_pooled: (B, D) pooled gaze features
-            lm_s2: (B, 192, 14, 14) landmark branch stage2 features
-
-        Returns:
-            (B, D) gaze features enriched with landmark spatial context
-        """
-        kv = self.kv_proj(lm_s2)                   # (B, D, 14, 14)
-        kv = self.downsample(kv)                    # (B, D, 7, 7)
-        B, D, H, W = kv.shape
-        kv = kv.flatten(2).permute(0, 2, 1)        # (B, 49, D)
-
-        q = gaze_pooled.unsqueeze(1)                # (B, 1, D)
-        q_norm = self.norm_q(q)
-        kv_norm = self.norm_kv(kv)
-        out, _ = self.cross_attn(q_norm, kv_norm, kv_norm)
-
-        return gaze_pooled + out.squeeze(1)
+    def forward(self, eye_feat, pose_feat, box_feat):
+        fused = self.proj(torch.cat([eye_feat, pose_feat, box_feat], dim=-1))
+        return eye_feat + fused
 
 
 class GeometricGazeHead(nn.Module):
@@ -490,47 +431,53 @@ class GeometricGazeHead(nn.Module):
 
 class GazeBranch(nn.Module):
     """
-    Full gaze estimation branch: encoder + pool + bridges + geometric head.
+    Gaze branch with dedicated landmark-guided eye-crop encoder.
 
     Pipeline:
-        s1 → BranchEncoder → (s2_gz, s3_gz)
-        s3_gz → CoordAtt → pool → project to d_model
-        + FusionBlock(pose_feat, box_feat)   [MAGE Sec 3.2]
-        + PoseGazeModulation(fused_feat)
-        + LandmarkGazeAttention(lm_s2)
-        + CrossViewAttention (if n_views > 1)
-        → GeometricGazeHead → eyeball_center + pupil_center + optical_axis
+        image + landmarks_px
+          → EyeCropModule (differentiable, 112x112, 25% pad)
+          → EyeBackbone (full RepNeXt-M1, private to gaze)
+          → CoordAtt + pool + proj → eye_feat (d_model)
+        + BoxEncoder(face_bbox) → box_feat (d_model)
+        + pose_feat (from PoseBranch, can be zeroed via use_pose_bridge)
+          → GazeFusionBlock (eye anchor, zero-init residual for pose/box)
+          → CrossViewAttention (if n_views > 1)
+          → GeometricGazeHead → eyeball_center + pupil_center + optical_axis
+
+    Rationale: the face-level 14x14 feature map was a hard spatial
+    ceiling for gaze — iris occupied 2-3 cells. By cropping to the eye
+    and running a private backbone, the iris gets a native 28x28 stem
+    map with far more spatial detail. The zero-init fusion ensures that
+    pose and bbox add refinement without disrupting the eye signal.
     """
 
-    def __init__(self, d_model=256):
+    def __init__(self, d_model=256, eye_out_size=112, eye_pad_frac=0.25):
         super().__init__()
-        self.encoder = None  # Set by RayNetV5.__init__
+        self.eye_crop = EyeCropModule(
+            out_size=eye_out_size, pad_frac=eye_pad_frac)
+        self.encoder = None  # EyeBackbone, set by factory
         self.coord_att = CoordinateAttention(384)
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.proj = nn.Linear(384, d_model)
 
-        # MAGE-style box encoder + fusion
         self.box_encoder = BoxEncoder(d_model)
-        self.fusion_block = FusionBlock(d_model)
+        self.fusion_block = GazeFusionBlock(d_model)
 
-        # Inter-branch bridges
-        self.pose_modulation = PoseGazeModulation(d_model)
-        self.landmark_attention = LandmarkGazeAttention(
-            d_model=d_model, landmark_ch=192)
-
-        # GazeGene geometric gaze head (predicts eyeball + pupil)
         self.head = GeometricGazeHead(d_model)
 
-    def forward(self, s1, pose_feat, lm_s2, face_bbox=None,
+    def forward(self, image, landmarks_px, pose_feat, face_bbox=None,
                 cross_view_attn=None, n_views=1, cam_embed=None):
         """
         Args:
-            s1: (B, 96, 28, 28) from SharedStem
+            image: (B, 3, H, W) raw face image (H=W=224 expected)
+            landmarks_px: (B, 14, 2) predicted landmarks in PIXEL space
+                          of `image`. Caller should detach to keep
+                          gradients from flowing back to the landmark
+                          branch during Stage 2 (landmark branch frozen).
             pose_feat: (B, d_model) from PoseBranch
-            lm_s2: (B, 192, 14, 14) from landmark BranchEncoder
-            face_bbox: (B, 3) face bounding box [x_p, y_p, L_x] or None
-            cross_view_attn: CrossViewAttention module or None
-            n_views: number of views for cross-view attention
+            face_bbox: (B, 3) MAGE face bbox [x_p, y_p, L_x] or None
+            cross_view_attn: optional CrossViewAttention module
+            n_views: views per group (1=single, 9=multi-view)
             cam_embed: (B, d_model) camera embedding or None
 
         Returns:
@@ -539,23 +486,18 @@ class GazeBranch(nn.Module):
             optical_axis: (B, 3)
             gaze_angles: (B, 2)
         """
-        s2, s3 = self.encoder(s1)
-        s3_att = self.coord_att(s3)
-        pooled = self.pool(s3_att).flatten(1)
-        pooled = self.proj(pooled)
+        eye = self.eye_crop(image, landmarks_px)            # (B, 3, 112, 112)
+        feat = self.encoder(eye)                            # (B, 384, h, w)
+        feat = self.coord_att(feat)
+        eye_feat = self.proj(self.pool(feat).flatten(1))    # (B, d_model)
 
-        # MAGE fusion: combine pose features with bbox encoding
         if face_bbox is not None:
             box_feat = self.box_encoder(face_bbox)
-            fused_pose = self.fusion_block(pose_feat, box_feat)
         else:
-            fused_pose = pose_feat
+            box_feat = torch.zeros_like(eye_feat)
 
-        # Bridges (using fused pose+box features)
-        pooled = self.pose_modulation(pooled, fused_pose)
-        pooled = self.landmark_attention(pooled, lm_s2)
+        pooled = self.fusion_block(eye_feat, pose_feat, box_feat)
 
-        # Cross-view attention (if multi-view)
         if cross_view_attn is not None:
             pooled = cross_view_attn(pooled, n_views, cam_embed)
 
@@ -659,34 +601,39 @@ class CameraEmbedding(nn.Module):
 
 class RayNetV5(nn.Module):
     """
-    RayNet v5: Triple-M1 architecture with shared stem.
+    RayNet v5: Quad-M1 architecture with dedicated eye-crop gaze encoder.
 
     Architecture:
-        Image ─→ SharedStem (M1 stem+s0+s1)
-        BBox ──→ BoxEncoder ─→ FusionBlock ─┐
-                    ├── LandmarkBranch (M1 s2+s3 → U-Net decoder → 14 landmarks)
-                    ├── GazeBranch     (M1 s2+s3 → fusion+bridges → 3D eyeball structure)
-                    │                  predicts eyeball_center + pupil_center (GazeGene)
-                    │                  derives optical_axis = normalize(pupil - eyeball)
-                    └── PoseBranch     (M1 s2+s3 → CoordAtt → 6D rot + translation)
-                                              ↑ gradient detached from shared stem
+        Image (224x224) ─→ SharedStem (M1 stem+s0+s1)
+                            ├── LandmarkBranch (M1 s2+s3 → U-Net → 14 landmarks)
+                            └── PoseBranch     (M1 s2+s3 → 6D rot + translation)
+                                                  ↑ gradient detached from shared stem
 
-    MAGE integration (Sec 3.2):
-        BoxEncoder(face_bbox) + PoseBranch.pose_feat → FusionBlock → gaze modulation
-        Eliminates MediaPipe dependency at inference (only fast bbox needed)
+        Image (224x224) + predicted landmarks (detached)
+            ─→ GazeBranch:
+                EyeCropModule → 112x112 eye patch
+                  → EyeBackbone (full RepNeXt-M1, private to gaze)
+                  → GazeFusionBlock(eye, pose, bbox, zero-init residual)
+                  → GeometricGazeHead (eyeball_center, pupil_center, optical_axis)
 
-    Inter-branch bridges (zero-init, active from epoch 1):
-        FusionBlock(pose+box)  ──→  GazeBranch (SHMA modulation)
-        LandmarkBranch.s2      ──→  GazeBranch (cross-attention)
+    Landmarks are predicted by the landmark branch, detached, rescaled
+    from 56-space to 224-space, and passed to the gaze branch as the
+    eye-crop anchor. During Stage 2 phases 1-2 the landmark/pose/stem
+    path is frozen (.eval() + requires_grad=False) so the gaze branch
+    learns from a stable predicted-landmark distribution — the same
+    distribution it sees at inference.
     """
 
     def __init__(self, shared_stem, landmark_branch, gaze_branch,
-                 pose_branch, cross_view_cfg=None):
+                 pose_branch, cross_view_cfg=None, landmark_feat_size=56):
         super().__init__()
         self.shared_stem = shared_stem
         self.landmark_branch = landmark_branch
         self.gaze_branch = gaze_branch
         self.pose_branch = pose_branch
+        # Feature-map size the landmark branch predicts coords in
+        # (used to rescale coords back to pixel space for eye crop).
+        self.landmark_feat_size = landmark_feat_size
 
         # Cross-view and camera modules
         cv_cfg = cross_view_cfg or {}
@@ -706,13 +653,17 @@ class RayNetV5(nn.Module):
             face_bbox: (B, 3) face bounding box [x_p, y_p, L_x] or None
                        MAGE-style: provides gaze origin info without
                        external face landmark detector at inference
-            use_landmark_bridge: enable landmark→gaze attention
-            use_pose_bridge: enable pose→gaze modulation
+            use_landmark_bridge: no-op in v5 eye-crop design (landmarks
+                are always used to anchor the eye crop). Kept for
+                phase-config backward compatibility.
+            use_pose_bridge: if False, zero the pose stream into the
+                gaze fusion block (gaze predicts from eye crop + bbox
+                only, useful for isolating the pose signal).
 
         Returns:
             dict with all predictions
         """
-        # Shared low-level features
+        # Shared low-level features (landmark + pose consume these)
         s0, s1 = self.shared_stem(x)
 
         # === Pose Branch (gradient-isolated from shared stem) ===
@@ -723,20 +674,29 @@ class RayNetV5(nn.Module):
         landmark_coords, landmark_heatmaps = self.landmark_branch(
             s0, s1, lm_s2, lm_s3)
 
-        # === Gaze Branch (with MAGE fusion + bridges) ===
+        # === Gaze Branch (dedicated eye-crop encoder) ===
         # Camera embedding
         cam_embed = None
         if R_cam is not None and T_cam is not None:
             cam_embed = self.camera_embedding(R_cam, T_cam)
             cam_embed = cam_embed + pose_feat  # fuse camera + pose
 
-        # Disable bridges if requested (for ablation / curriculum)
-        gaze_pose_feat = pose_feat if use_pose_bridge else torch.zeros_like(pose_feat)
-        gaze_lm_s2 = lm_s2 if use_landmark_bridge else torch.zeros_like(lm_s2)
+        # Landmarks live in 56x56 feature space; the eye crop operates
+        # in the 224-pixel image frame of `x`. Detach so gaze gradients
+        # cannot flow back through the landmark branch during Stage 2
+        # (when the landmark branch is frozen).
+        img_size = x.shape[-1]
+        feat_size = landmark_coords.new_tensor(
+            float(self.landmark_feat_size))
+        landmarks_px = landmark_coords.detach() * (img_size / feat_size)
+
+        gaze_pose_feat = (
+            pose_feat if use_pose_bridge else torch.zeros_like(pose_feat)
+        )
 
         eyeball_center, pupil_center, optical_axis, gaze_angles = \
             self.gaze_branch(
-                s1, gaze_pose_feat, gaze_lm_s2,
+                x, landmarks_px, gaze_pose_feat,
                 face_bbox=face_bbox,
                 cross_view_attn=self.cross_view_attn,
                 n_views=n_views,
@@ -792,17 +752,22 @@ def create_raynet_v5(backbone_weight_path=None, cross_view_cfg=None,
             return load_pretrained_repnext('repnext_m1', weight_path)
         return create_repnext('repnext_m1', pretrained=False)
 
-    # 4 M1 instances: shared + landmark + gaze + pose
+    # 4 M1 instances:
+    #   shared   → stem + s0 + s1 feed landmark & pose
+    #   landmark → s2 + s3 for the landmark branch encoder
+    #   pose     → s2 + s3 for the pose branch encoder
+    #   eye      → FULL M1 (stem + s0..s3) dedicated to the gaze branch,
+    #              operating on 112x112 landmark-guided eye crops
     m1_shared = _make_m1(backbone_weight_path)
     m1_landmark = _make_m1(backbone_weight_path)
-    m1_gaze = _make_m1(backbone_weight_path)
     m1_pose = _make_m1(backbone_weight_path)
+    m1_eye = _make_m1(backbone_weight_path)
 
     # Split into components
     stem, s0, s1, _, _ = _split_m1_backbone(m1_shared)
     _, _, _, lm_s2, lm_s3 = _split_m1_backbone(m1_landmark)
-    _, _, _, gz_s2, gz_s3 = _split_m1_backbone(m1_gaze)
     _, _, _, ps_s2, ps_s3 = _split_m1_backbone(m1_pose)
+    eye_stem, eye_s0, eye_s1, eye_s2, eye_s3 = _split_m1_backbone(m1_eye)
 
     # Assemble
     shared_stem = SharedStem(stem, s0, s1)
@@ -811,7 +776,8 @@ def create_raynet_v5(backbone_weight_path=None, cross_view_cfg=None,
     landmark_branch.encoder = BranchEncoder(lm_s2, lm_s3)
 
     gaze_branch = GazeBranch(d_model=256)
-    gaze_branch.encoder = BranchEncoder(gz_s2, gz_s3)
+    gaze_branch.encoder = EyeBackbone(
+        eye_stem, eye_s0, eye_s1, eye_s2, eye_s3)
 
     pose_branch = PoseBranch(d_model=256)
     pose_branch.encoder = BranchEncoder(ps_s2, ps_s3)
@@ -830,13 +796,13 @@ def create_raynet_v5(backbone_weight_path=None, cross_view_cfg=None,
         return sum(p.numel() for p in module.parameters()) / 1e6
 
     total = _count(model)
-    print(f"RayNet v5 (Triple-M1) created:")
+    print(f"RayNet v5 (Quad-M1, eye-crop gaze) created:")
     print(f"  SharedStem:      {_count(shared_stem):.2f}M")
     print(f"  LandmarkBranch:  {_count(landmark_branch):.2f}M "
-          f"(encoder {_count(landmark_branch.encoder):.2f}M + "
-          f"U-Net decoder)")
+          f"(encoder {_count(landmark_branch.encoder):.2f}M + U-Net decoder)")
     print(f"  GazeBranch:      {_count(gaze_branch):.2f}M "
-          f"(encoder + bridges + geometric head)")
+          f"(EyeBackbone {_count(gaze_branch.encoder):.2f}M + CoordAtt + "
+          f"fusion + geometric head)")
     print(f"  PoseBranch:      {_count(pose_branch):.2f}M "
           f"(encoder + CoordAtt + head)")
     print(f"  CrossView+Cam:   {_count(model.cross_view_attn) + _count(model.camera_embedding):.2f}M")
