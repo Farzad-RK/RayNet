@@ -156,7 +156,6 @@ STAGE_CONFIGS = {
         1: {
             'epochs': (1, 8),
             'lam_lm': 0.0,          # landmark branch frozen
-            'lam_lm_refine': 0.5,   # warm up the eye-patch subpixel head
             'lam_gaze': 1.0,
             'lam_eyeball': 0.3,
             'lam_pupil': 0.3,
@@ -172,12 +171,11 @@ STAGE_CONFIGS = {
             'use_landmark_bridge': False,
             'use_pose_bridge': True,
             'freeze_face': True,
-            'description': 'V5-S2P1: Eye-crop gaze + refine warmup (face frozen)',
+            'description': 'V5-S2P1: Eye-crop gaze warmup (face frozen)',
         },
         2: {
             'epochs': (9, 15),
             'lam_lm': 0.0,
-            'lam_lm_refine': 1.0,
             'lam_gaze': 1.0,
             'lam_eyeball': 0.5,
             'lam_pupil': 0.5,
@@ -193,12 +191,11 @@ STAGE_CONFIGS = {
             'use_landmark_bridge': False,
             'use_pose_bridge': True,
             'freeze_face': True,
-            'description': 'V5-S2P2: + multi-view + geom angular + refine (face frozen)',
+            'description': 'V5-S2P2: + multi-view + geom angular (face frozen)',
         },
         3: {
             'epochs': (16, 25),
             'lam_lm': 0.0,          # face permanently frozen
-            'lam_lm_refine': 1.0,
             'lam_gaze': 1.0,
             'lam_eyeball': 0.5,
             'lam_pupil': 0.5,
@@ -214,7 +211,7 @@ STAGE_CONFIGS = {
             'use_landmark_bridge': False,
             'use_pose_bridge': True,
             'freeze_face': True,
-            'description': 'V5-S2P3: Gaze + refine fine-tune (face permanently frozen)',
+            'description': 'V5-S2P3: Gaze fine-tune (face permanently frozen)',
         },
     },
 
@@ -423,7 +420,6 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
         'translation': 0.0,
         # V5-specific
         'eyeball_center': 0.0, 'pupil_center': 0.0, 'geom_angular': 0.0,
-        'landmark_refine': 0.0,
     }
     n_batches = 0
 
@@ -481,33 +477,6 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
             if gt_pupil is not None:
                 gt_pupil = gt_pupil.to(device, non_blocking=True)
 
-            # --- Refined-landmark GT in eye-patch coords ---
-            # GT landmarks arrive in 56-cell face feature space; project
-            # through the eye-crop affine into the refinement head's
-            # output frame. If refinement is disabled (lam_lm_refine=0),
-            # skip this work entirely.
-            refine_kwargs = {}
-            if cfg.get('lam_lm_refine', 0.0) > 0:
-                gt_landmarks_px = batch['landmark_coords_px'].to(
-                    device, non_blocking=True)
-                refine_hm = predictions['landmark_refine_heatmaps']
-                refine_coords_eye = predictions['landmark_refine_coords_eye']
-                refine_affine = predictions['eye_crop_affine']
-                refine_feat_H = refine_hm.shape[2]
-                refine_feat_W = refine_hm.shape[3]
-                from RayNet.eye_crop import EyeCropModule
-                gt_refine_coords = EyeCropModule.face_to_eye_coords(
-                    gt_landmarks_px, refine_affine,
-                    eye_feat_size=refine_feat_H)
-                refine_kwargs = {
-                    'lam_lm_refine': cfg['lam_lm_refine'],
-                    'pred_refine_hm': refine_hm,
-                    'pred_refine_coords': refine_coords_eye,
-                    'gt_refine_coords': gt_refine_coords,
-                    'refine_feat_H': refine_feat_H,
-                    'refine_feat_W': refine_feat_W,
-                }
-
             loss, components = total_loss(
                 pred_hm, pred_coords, pred_gaze,
                 gt_landmarks, gt_optical_axis,
@@ -532,7 +501,6 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                 lam_trans=cfg.get('lam_trans', 0.0),
                 pred_pose_t=predictions.get('pred_pose_t'),
                 gt_head_t=gt_head_t,
-                **refine_kwargs,
             )
 
             # Multi-view consistency loss (Phase 2+)
@@ -618,8 +586,6 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
             running_losses['pose'] += components['pose_loss'].item()
         if 'translation_loss' in components:
             running_losses['translation'] += components['translation_loss'].item()
-        if 'landmark_refine_loss' in components:
-            running_losses['landmark_refine'] += components['landmark_refine_loss'].item()
         n_batches += 1
 
         # Per-batch CSV logging (high granularity)
@@ -691,11 +657,6 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
     running_losses = {
         'total': 0.0, 'landmark': 0.0, 'angular': 0.0, 'angular_deg': 0.0,
         'landmark_px': 0.0, 'pose': 0.0, 'ray': 0.0, 'translation': 0.0,
-        'landmark_refine': 0.0,
-        # face-frame pixel error of the refined head (primary pupillometry
-        # accuracy metric). Reported in face-frame px so it's directly
-        # comparable to `landmark_px` from the coarse head.
-        'landmark_refine_px': 0.0,
     }
     n_batches = 0
 
@@ -730,32 +691,6 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
 
             feat_H, feat_W = pred_hm.shape[2], pred_hm.shape[3]
 
-            # Refined-landmark loss + GT projection (when enabled)
-            refine_kwargs = {}
-            lm_refine_px_error = None
-            if cfg.get('lam_lm_refine', 0.0) > 0:
-                refine_hm = predictions['landmark_refine_heatmaps']
-                refine_coords_eye = predictions['landmark_refine_coords_eye']
-                refine_coords_face = predictions['landmark_refine_coords_face']
-                refine_affine = predictions['eye_crop_affine']
-                refine_feat_H = refine_hm.shape[2]
-                refine_feat_W = refine_hm.shape[3]
-                from RayNet.eye_crop import EyeCropModule
-                gt_refine_coords = EyeCropModule.face_to_eye_coords(
-                    gt_landmarks_px, refine_affine,
-                    eye_feat_size=refine_feat_H)
-                refine_kwargs = {
-                    'lam_lm_refine': cfg['lam_lm_refine'],
-                    'pred_refine_hm': refine_hm,
-                    'pred_refine_coords': refine_coords_eye,
-                    'gt_refine_coords': gt_refine_coords,
-                    'refine_feat_H': refine_feat_H,
-                    'refine_feat_W': refine_feat_W,
-                }
-                # Face-frame px error for pupillometry reporting
-                lm_refine_px_error = torch.mean(
-                    torch.norm(refine_coords_face - gt_landmarks_px, dim=-1))
-
             loss, components = total_loss(
                 pred_hm, pred_coords, pred_gaze,
                 gt_landmarks, gt_optical_axis,
@@ -763,7 +698,6 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
                 lam_lm=cfg['lam_lm'],
                 lam_gaze=cfg['lam_gaze'],
                 sigma=cfg['sigma'],
-                **refine_kwargs,
             )
 
         img_size = images.shape[-1]
@@ -788,11 +722,6 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
         trans_val = components.get('translation_loss')
         if trans_val is not None:
             running_losses['translation'] += trans_val.item()
-        refine_val = components.get('landmark_refine_loss')
-        if refine_val is not None:
-            running_losses['landmark_refine'] += refine_val.item()
-        if lm_refine_px_error is not None:
-            running_losses['landmark_refine_px'] += lm_refine_px_error.item()
         n_batches += 1
 
     for k in running_losses:
@@ -997,9 +926,8 @@ def train(args):
             'epoch', 'stage', 'phase', 'lr',
             'train_total', 'train_landmark', 'train_angular_deg',
             'train_reproj', 'train_mask', 'train_ray_target', 'train_pose',
-            'train_translation', 'train_landmark_refine',
+            'train_translation',
             'val_total', 'val_landmark', 'val_angular_deg', 'val_landmark_px',
-            'val_landmark_refine', 'val_landmark_refine_px',
         ])
 
         batch_csv_path = os.path.join(output_dir, 'batch_log.csv')
@@ -1328,7 +1256,6 @@ def train(args):
                 print(f"\n{'='*60}")
                 print(f"Phase {phase}: {cfg['description']}")
                 print(f"  lr={cfg['lr']}, lam_lm={cfg['lam_lm']}, "
-                      f"lam_lm_refine={cfg.get('lam_lm_refine', 0)}, "
                       f"lam_gaze={cfg['lam_gaze']}, lam_ray={cfg.get('lam_ray', 0)}, "
                       f"lam_pose={cfg.get('lam_pose', 0)}, lam_trans={cfg.get('lam_trans', 0)}, "
                       f"sigma={cfg['sigma']}")
@@ -1439,14 +1366,11 @@ def train(args):
                 mv_str += f" pose={train_losses['pose']:.4f}"
             if train_losses.get('translation', 0) > 0:
                 mv_str += f" trans={train_losses['translation']:.4f}"
-            refine_str = ""
-            if val_losses.get('landmark_refine_px', 0) > 0:
-                refine_str = f" lm_refine_px={val_losses['landmark_refine_px']:.2f}px"
             print(f"Epoch {epoch:3d} | Phase {phase} | lr {current_lr:.2e} | "
                   f"Train: loss={train_losses['total']:.4f} lm={train_losses['landmark']:.4f} "
                   f"ang={train_losses['angular_deg']:.2f}deg{mv_str} | "
                   f"Val: loss={val_losses['total']:.4f} lm_px={val_losses['landmark_px']:.2f}px "
-                  f"ang={val_losses['angular_deg']:.2f}deg{refine_str}")
+                  f"ang={val_losses['angular_deg']:.2f}deg")
 
             if hw['amp'] and device.type == 'cuda':
                 mem_gb = torch.cuda.max_memory_allocated() / 1e9
@@ -1462,13 +1386,10 @@ def train(args):
                 f"{train_losses.get('ray_target', 0):.6f}",
                 f"{train_losses.get('pose', 0):.6f}",
                 f"{train_losses.get('translation', 0):.6f}",
-                f"{train_losses.get('landmark_refine', 0):.6f}",
                 f"{val_losses['total']:.6f}",
                 f"{val_losses['landmark']:.6f}",
                 f"{val_losses['angular_deg']:.4f}",
                 f"{val_losses['landmark_px']:.4f}",
-                f"{val_losses.get('landmark_refine', 0):.6f}",
-                f"{val_losses.get('landmark_refine_px', 0):.4f}",
             ])
             csv_file.flush()
 

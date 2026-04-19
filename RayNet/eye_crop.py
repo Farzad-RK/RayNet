@@ -1,6 +1,5 @@
 """
 Differentiable landmark-guided eye crop.
-
 Extracts a square eye patch from a face image using the 14 iris/pupil
 landmarks as the crop anchor. Implemented with F.affine_grid +
 F.grid_sample so gradients can flow back through the crop coordinates
