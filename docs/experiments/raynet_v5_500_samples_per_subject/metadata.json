@@ -1,0 +1,537 @@
+{
+  "run_id": "raynet_v5_500_samples_per_subject",
+  "created_at": "2026-04-18T01:08:34.062773+00:00",
+  "epochs": {
+    "1": {
+      "epoch": 1,
+      "phase": 1,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-18T01:51:28.204980+00:00",
+      "train_metrics": {
+        "total": 2.2449844338205964,
+        "landmark": 0.0006412818862403815,
+        "angular": 0.758133224897548,
+        "angular_deg": 43.437834617805734,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.37879207398501935,
+        "translation": 0.0890567228406648,
+        "eyeball_center": 0.0,
+        "pupil_center": 0.0,
+        "geom_angular": 0.0
+      },
+      "val_metrics": {
+        "total": 1.2623423764199921,
+        "landmark": 0.00040253263714751513,
+        "angular": 0.7446433732003876,
+        "angular_deg": 42.66492298010624,
+        "landmark_px": 7.923842970530192,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "2": {
+      "epoch": 2,
+      "phase": 1,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-18T02:35:00.912693+00:00",
+      "train_metrics": {
+        "total": 1.042551837419804,
+        "landmark": 0.0003098220414802928,
+        "angular": 0.7565247152633818,
+        "angular_deg": 43.34567375333884,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.13399654898758148,
+        "translation": 0.007903237859792123,
+        "eyeball_center": 0.0,
+        "pupil_center": 0.0,
+        "geom_angular": 0.0
+      },
+      "val_metrics": {
+        "total": 0.7682024240493774,
+        "landmark": 0.0002449625025319895,
+        "angular": 0.7453412341349053,
+        "angular_deg": 42.70490752711441,
+        "landmark_px": 4.802845098033096,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "3": {
+      "epoch": 3,
+      "phase": 1,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-18T03:18:06.337867+00:00",
+      "train_metrics": {
+        "total": 0.7643391599139991,
+        "landmark": 0.00022727406290540784,
+        "angular": 0.7560168062588286,
+        "angular_deg": 43.31657272962085,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.09731336106817398,
+        "translation": 0.005902005328240955,
+        "eyeball_center": 0.0,
+        "pupil_center": 0.0,
+        "geom_angular": 0.0
+      },
+      "val_metrics": {
+        "total": 0.6976515233516694,
+        "landmark": 0.00022246540501135204,
+        "angular": 0.7444422736312404,
+        "angular_deg": 42.65340092976888,
+        "landmark_px": 4.375911342736447,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "4": {
+      "epoch": 4,
+      "phase": 1,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-18T04:01:21.637586+00:00",
+      "train_metrics": {
+        "total": 0.6386411695376687,
+        "landmark": 0.0001906226419881925,
+        "angular": 0.7557121350360011,
+        "angular_deg": 43.2991163482465,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.0772138532957894,
+        "translation": 0.0044832547600638754,
+        "eyeball_center": 0.0,
+        "pupil_center": 0.0,
+        "geom_angular": 0.0
+      },
+      "val_metrics": {
+        "total": 0.6690080218242876,
+        "landmark": 0.0002133316353358554,
+        "angular": 0.7437100475484675,
+        "angular_deg": 42.61144737474846,
+        "landmark_px": 4.174769758455681,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "5": {
+      "epoch": 5,
+      "phase": 1,
+      "filename": "checkpoint_epoch5.pt",
+      "saved_at": "2026-04-18T04:45:21.273194+00:00",
+      "train_metrics": {
+        "total": 0.5559310520433468,
+        "landmark": 0.000166879697232409,
+        "angular": 0.7553335803613676,
+        "angular_deg": 43.27742681390212,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.06176885424306977,
+        "translation": 0.0034237665247554955,
+        "eyeball_center": 0.0,
+        "pupil_center": 0.0,
+        "geom_angular": 0.0
+      },
+      "val_metrics": {
+        "total": 0.5384527298537167,
+        "landmark": 0.0001717004847843341,
+        "angular": 0.7430874304337935,
+        "angular_deg": 42.57577412923177,
+        "landmark_px": 3.3731242360490743,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "6": {
+      "epoch": 6,
+      "phase": 1,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-18T05:28:17.222432+00:00",
+      "train_metrics": {
+        "total": 0.5046623709644724,
+        "landmark": 0.0001526303457130576,
+        "angular": 0.7550706126001984,
+        "angular_deg": 43.2623598503344,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.04930812387932117,
+        "translation": 0.0027190685870091534,
+        "eyeball_center": 0.0,
+        "pupil_center": 0.0,
+        "geom_angular": 0.0
+      },
+      "val_metrics": {
+        "total": 0.5046151397806226,
+        "landmark": 0.0001609104368429998,
+        "angular": 0.742982905922514,
+        "angular_deg": 42.56978523947976,
+        "landmark_px": 3.1580015832727604,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "7": {
+      "epoch": 7,
+      "phase": 1,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-18T06:11:10.160421+00:00",
+      "train_metrics": {
+        "total": 0.4689325792359112,
+        "landmark": 0.00014256278309607276,
+        "angular": 0.7549443249645912,
+        "angular_deg": 43.25512410843639,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.041401762620831825,
+        "translation": 0.002309600277937279,
+        "eyeball_center": 0.0,
+        "pupil_center": 0.0,
+        "geom_angular": 0.0
+      },
+      "val_metrics": {
+        "total": 0.4791010056481217,
+        "landmark": 0.00015277455183395155,
+        "angular": 0.742851094043616,
+        "angular_deg": 42.56223310990767,
+        "landmark_px": 2.9976573994665436,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "8": {
+      "epoch": 8,
+      "phase": 1,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-18T06:53:57.345585+00:00",
+      "train_metrics": {
+        "total": 0.4589600461352327,
+        "landmark": 0.00013952134005686733,
+        "angular": 0.7548872943138103,
+        "angular_deg": 43.251856491028555,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.04067339496723866,
+        "translation": 0.0021688350930252286,
+        "eyeball_center": 0.0,
+        "pupil_center": 0.0,
+        "geom_angular": 0.0
+      },
+      "val_metrics": {
+        "total": 0.4705648868372946,
+        "landmark": 0.00015005257543331633,
+        "angular": 0.7429417075532856,
+        "angular_deg": 42.56742477416992,
+        "landmark_px": 2.9468360344568887,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "9": {
+      "epoch": 9,
+      "phase": 2,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-18T07:35:50.134590+00:00",
+      "train_metrics": {
+        "total": 0.481118993011545,
+        "landmark": 0.0001392260770187977,
+        "angular": 0.7549209298666602,
+        "angular_deg": 43.253783631858774,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.04204624850543434,
+        "translation": 0.002459757734829074,
+        "eyeball_center": 0.0,
+        "pupil_center": 0.0,
+        "geom_angular": 0.0
+      },
+      "val_metrics": {
+        "total": 0.49079927711775806,
+        "landmark": 0.00015650486871670707,
+        "angular": 0.7427870660117178,
+        "angular_deg": 42.55856450398763,
+        "landmark_px": 3.074946399891015,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "10": {
+      "epoch": 10,
+      "phase": 2,
+      "filename": "checkpoint_epoch10.pt",
+      "saved_at": "2026-04-18T08:18:06.058156+00:00",
+      "train_metrics": {
+        "total": 0.46326150936571503,
+        "landmark": 0.00013450989456741786,
+        "angular": 0.7548360126448871,
+        "angular_deg": 43.24891826443678,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.03910011581939121,
+        "translation": 0.0023383564751028366,
+        "eyeball_center": 0.0,
+        "pupil_center": 0.0,
+        "geom_angular": 0.0
+      },
+      "val_metrics": {
+        "total": 0.4723564310507341,
+        "landmark": 0.00015062385941608667,
+        "angular": 0.7426036440964902,
+        "angular_deg": 42.548055082378966,
+        "landmark_px": 2.9604038151827727,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "11": {
+      "epoch": 11,
+      "phase": 2,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-18T08:59:26.882512+00:00",
+      "train_metrics": {
+        "total": 0.442350279554548,
+        "landmark": 0.00012906043881656876,
+        "angular": 0.7547414371147457,
+        "angular_deg": 43.24349948948394,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.03544865235347639,
+        "translation": 0.002168082805213608,
+        "eyeball_center": 0.0,
+        "pupil_center": 0.0,
+        "geom_angular": 0.0
+      },
+      "val_metrics": {
+        "total": 0.5041816581379284,
+        "landmark": 0.00016077220930266336,
+        "angular": 0.7423899386868332,
+        "angular_deg": 42.53581066709576,
+        "landmark_px": 3.154787695769108,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "12": {
+      "epoch": 12,
+      "phase": 2,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-18T09:41:33.886987+00:00",
+      "train_metrics": {
+        "total": 0.42559320924310345,
+        "landmark": 0.0001250717330079652,
+        "angular": 0.7546164439757979,
+        "angular_deg": 43.236337925605625,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.031372975281345236,
+        "translation": 0.001995271103771352,
+        "eyeball_center": 0.0,
+        "pupil_center": 0.0,
+        "geom_angular": 0.0
+      },
+      "val_metrics": {
+        "total": 0.4514974133534865,
+        "landmark": 0.0001439723865284274,
+        "angular": 0.7423301176591353,
+        "angular_deg": 42.53238317316229,
+        "landmark_px": 2.8314169240720344,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "13": {
+      "epoch": 13,
+      "phase": 2,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-18T10:23:45.898495+00:00",
+      "train_metrics": {
+        "total": 0.40943980662640533,
+        "landmark": 0.00012086415492918168,
+        "angular": 0.7546406443254121,
+        "angular_deg": 43.237724470055625,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.028572985345659697,
+        "translation": 0.00183682457223499,
+        "eyeball_center": 0.0,
+        "pupil_center": 0.0,
+        "geom_angular": 0.0
+      },
+      "val_metrics": {
+        "total": 0.4255581440347614,
+        "landmark": 0.00013570093600940184,
+        "angular": 0.7425367709362145,
+        "angular_deg": 42.54422360044537,
+        "landmark_px": 2.6698443643974534,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "14": {
+      "epoch": 14,
+      "phase": 2,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-18T11:06:04.440761+00:00",
+      "train_metrics": {
+        "total": 0.40109117068006744,
+        "landmark": 0.00011863515689735618,
+        "angular": 0.7546785840560953,
+        "angular_deg": 43.23989823433093,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.027307620584321783,
+        "translation": 0.001743690725834672,
+        "eyeball_center": 0.0,
+        "pupil_center": 0.0,
+        "geom_angular": 0.0
+      },
+      "val_metrics": {
+        "total": 0.42086881561712786,
+        "landmark": 0.00013420561422897276,
+        "angular": 0.7426979964429682,
+        "angular_deg": 42.55346115574692,
+        "landmark_px": 2.6398369247263127,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "15": {
+      "epoch": 15,
+      "phase": 2,
+      "filename": "checkpoint_epoch15.pt",
+      "saved_at": "2026-04-18T11:48:13.274025+00:00",
+      "train_metrics": {
+        "total": 0.4033032683201615,
+        "landmark": 0.00011870657729467484,
+        "angular": 0.7546781285792314,
+        "angular_deg": 43.23987212953831,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.02932635261290688,
+        "translation": 0.0017130822269215307,
+        "eyeball_center": 0.0,
+        "pupil_center": 0.0,
+        "geom_angular": 0.0
+      },
+      "val_metrics": {
+        "total": 0.42110659751025115,
+        "landmark": 0.00013428143830617156,
+        "angular": 0.7425404458334952,
+        "angular_deg": 42.544434333570074,
+        "landmark_px": 2.6410558086453064,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    }
+  },
+  "best": {
+    "epoch": 14,
+    "val_loss": 0.42086881561712786,
+    "val_metrics": {
+      "total": 0.42086881561712786,
+      "landmark": 0.00013420561422897276,
+      "angular": 0.7426979964429682,
+      "angular_deg": 42.55346115574692,
+      "landmark_px": 2.6398369247263127,
+      "pose": 0.0,
+      "ray": 0.0,
+      "translation": 0.0
+    },
+    "saved_at": "2026-04-18T11:05:13.338831+00:00"
+  },
+  "config": {
+    "stage": 1,
+    "profile": "kaggle_t4x2",
+    "epochs": 15,
+    "eye": "L",
+    "hardware": {
+      "batch_size": 144,
+      "mv_groups": 16,
+      "num_workers": 4,
+      "pin_memory": true,
+      "amp": true,
+      "amp_dtype": "float16",
+      "grad_accum_steps": 2,
+      "compile_model": false,
+      "tf32": false,
+      "prefetch_factor": 2,
+      "persistent_workers": true
+    },
+    "phase_config": {
+      "1": {
+        "epochs": [
+          1,
+          8
+        ],
+        "lam_lm": 1.0,
+        "lam_gaze": 0.0,
+        "lam_eyeball": 0.0,
+        "lam_pupil": 0.0,
+        "lam_geom_angular": 0.0,
+        "lam_ray": 0.0,
+        "lam_reproj": 0.0,
+        "lam_mask": 0.0,
+        "lam_pose": 0.5,
+        "lam_trans": 0.5,
+        "lr": 0.001,
+        "sigma": 2.0,
+        "multiview": false,
+        "use_landmark_bridge": false,
+        "use_pose_bridge": false
+      },
+      "2": {
+        "epochs": [
+          9,
+          15
+        ],
+        "lam_lm": 1.0,
+        "lam_gaze": 0.0,
+        "lam_eyeball": 0.0,
+        "lam_pupil": 0.0,
+        "lam_geom_angular": 0.0,
+        "lam_ray": 0.0,
+        "lam_reproj": 0.0,
+        "lam_mask": 0.0,
+        "lam_pose": 1.0,
+        "lam_trans": 1.0,
+        "lr": 0.0003,
+        "sigma": 1.5,
+        "multiview": false,
+        "use_landmark_bridge": false,
+        "use_pose_bridge": false
+      }
+    },
+    "data_dir": null,
+    "core_backbone_weight_path": "/kaggle/input/models/farzadrahimkhanian/repnext-m1-distileled-300-e/pytorch/default/1/repnext_m1_distill_300e.pth",
+    "started_at": "2026-04-18T01:08:37.632995"
+  }
+}
