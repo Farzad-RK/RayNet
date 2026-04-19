@@ -43,7 +43,7 @@ import logging
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.optim.swa_utils import AveragedModel, get_ema_avg_fn
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.amp import GradScaler, autocast
 import numpy as np
 from datetime import datetime
@@ -955,7 +955,7 @@ def train(args):
     if args.ema_decay > 0:
         ema_model = AveragedModel(
             accelerator.unwrap_model(model),
-            multi_avg_fn=get_ema_avg_fn(args.ema_decay),
+            multi_avg_fn=get_ema_multi_avg_fn(args.ema_decay),
         )
         ema_model.to(device)
         ema_model.eval()
