@@ -338,6 +338,10 @@ def total_loss(
     pred_pose_6d=None, gt_head_R=None,
     lam_trans=0.0,
     pred_pose_t=None, gt_head_t=None,
+    # Refined landmarks on eye patch (subpixel pupillometry)
+    lam_lm_refine=0.0,
+    pred_refine_hm=None, pred_refine_coords=None,
+    gt_refine_coords=None, refine_feat_H=None, refine_feat_W=None,
 ):
     """
     Total training loss: landmarks + gaze + GazeGene 3D structure + pose.
@@ -421,6 +425,24 @@ def total_loss(
         trans = translation_loss(pred_pose_t, gt_head_t)
         total = total + lam_trans * trans
         components['translation_loss'] = trans.detach()
+
+    # Landmark refinement loss (eye-patch-space heatmap + coord L1)
+    if (lam_lm_refine > 0 and pred_refine_hm is not None
+            and pred_refine_coords is not None
+            and gt_refine_coords is not None
+            and refine_feat_H is not None and refine_feat_W is not None):
+        # Refinement sigma scaled to the refinement feature map; a 2px
+        # sigma on a 56-cell face map becomes ~4px on a 56-cell eye-patch
+        # map that covers a narrower region, but soft-argmax is weight-
+        # normalised so the absolute sigma mostly controls the sharpness
+        # of the target. Match the coarse head's 2.0 unless the caller
+        # overrides via sigma.
+        lm_refine = landmark_loss(
+            pred_refine_hm, pred_refine_coords, gt_refine_coords,
+            refine_feat_H, refine_feat_W, sigma)
+        total = total + lam_lm_refine * lm_refine
+        components['landmark_refine_loss'] = (
+            lm_refine.detach() / (refine_feat_H * refine_feat_W))
 
     components['landmark_loss'] *= 1.0 / (feat_H * feat_W)
     components['total_loss'] = total.detach()

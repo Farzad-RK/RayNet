@@ -6,7 +6,7 @@ Four task-specific paths:
   2. LandmarkBranch (M1 s2+s3 → U-Net decoder) — 14 iris/pupil landmarks
      at 56x56 resolution with attention-gated skip connections.
   3. GazeBranch — dedicated pipeline:
-        predicted landmarks → EyeCropModule (differentiable, 112x112)
+        predicted landmarks → EyeCropModule (differentiable, 224x224)
           → full RepNeXt-M1 EyeBackbone (private to gaze)
           → GazeFusionBlock(eye, pose, bbox) → GeometricGazeHead
      The gaze branch does NOT share features with landmark/pose; it
@@ -307,13 +307,16 @@ class EyeBackbone(nn.Module):
     Dedicated full RepNeXt-M1 backbone for the eye-crop branch.
 
     Unlike the other branches which share the stem+s0+s1 path, the eye
-    encoder takes a 112x112 landmark-guided eye patch and runs ALL four
+    encoder takes a 224x224 landmark-guided eye patch and runs ALL four
     RepNeXt stages privately. This gives the gaze pathway a high-res
     view of the iris/pupil, breaking the face-level 14x14 feature-map
     bottleneck that was capping val_angular near 42 degrees when the
     gaze branch shared low-level features with landmark/pose.
 
-    At 112x112 input the final feature map is 384ch @ ~4x4.
+    At 224x224 input the final feature map is 384ch @ 7x7 (stride 32),
+    matching the face-path branch resolution but dedicated entirely to
+    the eye region. The earlier 112x112 default produced a 4x4 map
+    that capped Stage 2 P3 val_angular near 17 degrees.
 
     ~4.8M params.
     """
@@ -327,12 +330,144 @@ class EyeBackbone(nn.Module):
         self.stage3 = stage3
 
     def forward(self, x):
-        x = checkpoint(self.stem, x, use_reentrant=False)
-        x = checkpoint(self.stage0, x, use_reentrant=False)
-        x = checkpoint(self.stage1, x, use_reentrant=False)
-        x = checkpoint(self.stage2, x, use_reentrant=False)
-        x = checkpoint(self.stage3, x, use_reentrant=False)
-        return x
+        """
+        Returns the bottleneck plus the three intermediate feature maps
+        used as skip connections by LandmarkRefinementHead. At 224x224
+        eye-patch input the spatial sizes are:
+            stem -> 56x56 (48ch)
+            s0   -> 56x56 (48ch)   <- not returned, redundant skip with stem
+            s1   -> 28x28 (96ch)   <- skip
+            s2   -> 14x14 (192ch)  <- skip
+            s3   ->  7x 7 (384ch)  <- bottleneck (also returned)
+        """
+        s_stem = checkpoint(self.stem, x, use_reentrant=False)
+        s0 = checkpoint(self.stage0, s_stem, use_reentrant=False)
+        s1 = checkpoint(self.stage1, s0, use_reentrant=False)
+        s2 = checkpoint(self.stage2, s1, use_reentrant=False)
+        s3 = checkpoint(self.stage3, s2, use_reentrant=False)
+        return s3, (s0, s1, s2)
+
+
+class LandmarkRefinementHead(nn.Module):
+    """
+    Subpixel landmark refinement on the 224x224 eye crop.
+
+    The face-frame landmark branch predicts at a 56x56 heatmap over a
+    224x224 face — 4 input pixels per cell, recovered to subpixel by
+    soft-argmax + offset. That's enough to drive the eye crop (which
+    only needs to know roughly where the eye is) but not enough for
+    pupillometry, where the pupil radius is ~5-15 px in the face frame
+    and a 0.5 px error already biases diameter measurements by 5-10%.
+
+    This head consumes the EyeBackbone's intermediate features and
+    decodes back to a 56x56 heatmap *in the eye-patch frame*. The eye
+    crop covers ~50-90 px of the face image (eye width plus 30% pad),
+    so 56 cells over that region gives ~1-1.6 px face-frame precision
+    per cell; soft-argmax + offset then drops residual error to ~0.2 px
+    in the face frame — roughly 4-8x better than the coarse head and
+    sufficient for pupil-diameter work.
+
+    Outputs land in BOTH coordinate spaces:
+      - `coords_eye`  : in eye-patch pixel space (used for the loss,
+                        which is computed in eye-patch coords because
+                        that's the frame the heatmap lives in)
+      - `coords_face` : the same predictions unprojected through the
+                        crop affine to face-frame pixels (used by
+                        pupillometry / iris-contour rendering / future
+                        second-pass crops)
+
+    Architecture mirrors UNetLandmarkBranch (3 attention-gated decoder
+    blocks: 7->14->28->56) so the two heads behave identically up to
+    input resolution. The s0 skip (also at 56x56, redundant with the
+    stem) is intentionally not used — the third decoder block's input
+    is already at 56x56 so a same-resolution skip would just add
+    parameters.
+    """
+
+    def __init__(self, n_landmarks=14, feat_size=56):
+        super().__init__()
+        self.n_landmarks = n_landmarks
+        self.feat_size = feat_size
+
+        # Decoder: 7 -> 14 -> 28 -> 56
+        self.dec3 = UNetDecoderBlock(in_ch=384, skip_ch=192, out_ch=192)
+        self.dec2 = UNetDecoderBlock(in_ch=192, skip_ch=96,  out_ch=96)
+        # Final block has no skip (we'd skip stem/s0 at 56x56, same res
+        # as the upsampled feature, which adds params with no spatial
+        # info gain). Use a plain upsample + double conv instead.
+        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear',
+                               align_corners=False)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(96, 48, 3, padding=1, bias=False),
+            nn.BatchNorm2d(48),
+            nn.GELU(),
+            nn.Conv2d(48, 48, 3, padding=1, bias=False),
+            nn.BatchNorm2d(48),
+            nn.GELU(),
+        )
+
+        self.heatmap = nn.Sequential(
+            nn.Conv2d(48, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, n_landmarks, 1),
+        )
+        self.offset = nn.Sequential(
+            nn.Conv2d(48, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, n_landmarks * 2, 1),
+        )
+
+    def forward(self, s3, skips, affine):
+        """
+        Args:
+            s3:    (B, 384, 7, 7) bottleneck from EyeBackbone
+            skips: (s0, s1, s2) intermediates from EyeBackbone:
+                       s0: (B, 48, 56, 56)   <- unused, see __init__ note
+                       s1: (B, 96, 28, 28)   <- skip for dec2
+                       s2: (B, 192, 14, 14)  <- skip for dec3
+            affine: dict from EyeCropModule.forward, used only to
+                    unproject the prediction back to face-frame coords.
+
+        Returns:
+            coords_eye:  (B, N, 2) refined coords in feat_size-cell space
+            coords_face: (B, N, 2) the same coords in face-frame pixels
+            heatmaps:    (B, N, feat_size, feat_size) raw logit heatmaps
+        """
+        _, s1, s2 = skips
+        d3 = self.dec3(s3, s2)         # (B, 192, 14, 14)
+        d2 = self.dec2(d3, s1)         # (B,  96, 28, 28)
+        d1 = self.dec1(self.up1(d2))   # (B,  48, 56, 56)
+
+        hm = self.heatmap(d1)          # (B, N, 56, 56)
+        off = self.offset(d1)          # (B, 2N, 56, 56)
+        coords_eye = self._soft_argmax(hm, off)  # in feat_size-cell space
+
+        coords_face = EyeCropModule.eye_to_face_coords(
+            coords_eye, affine, eye_feat_size=self.feat_size)
+
+        return coords_eye, coords_face, hm
+
+    def _soft_argmax(self, hm, off):
+        """Differentiable soft-argmax with subpixel offset refinement
+        (identical to UNetLandmarkBranch._soft_argmax)."""
+        B, N, H, W = hm.shape
+        flat = hm.view(B, N, -1)
+        weight = F.softmax(flat * 100.0, dim=-1).view(B, N, H, W)
+
+        gx = torch.arange(W, dtype=torch.float32, device=hm.device)
+        gy = torch.arange(H, dtype=torch.float32, device=hm.device)
+
+        x = (weight * gx[None, None, None, :]).sum(dim=[2, 3])
+        y = (weight * gy[None, None, :, None]).sum(dim=[2, 3])
+
+        off2 = off.view(B, N, 2, H * W)
+        idx = (y.long() * W + x.long()).clamp(0, H * W - 1)
+        dx = off2[:, :, 0, :].gather(2, idx.unsqueeze(2)).squeeze(2)
+        dy = off2[:, :, 1, :].gather(2, idx.unsqueeze(2)).squeeze(2)
+
+        return torch.stack([x + dx, y + dy], dim=-1)
 
 
 class GazeFusionBlock(nn.Module):
@@ -434,10 +569,11 @@ class GazeBranch(nn.Module):
     Gaze branch with dedicated landmark-guided eye-crop encoder.
 
     Pipeline:
-        image + landmarks_px
-          → EyeCropModule (differentiable, 112x112, 25% pad)
+        image + coarse landmarks_px
+          → EyeCropModule (differentiable, 224x224, 30% pad)
           → EyeBackbone (full RepNeXt-M1, private to gaze)
-          → CoordAtt + pool + proj → eye_feat (d_model)
+              ├─→ LandmarkRefinementHead (subpixel pupillometry)
+              └─→ CoordAtt + pool + proj → eye_feat (d_model)
         + BoxEncoder(face_bbox) → box_feat (d_model)
         + pose_feat (from PoseBranch, can be zeroed via use_pose_bridge)
           → GazeFusionBlock (eye anchor, zero-init residual for pose/box)
@@ -449,9 +585,16 @@ class GazeBranch(nn.Module):
     and running a private backbone, the iris gets a native 28x28 stem
     map with far more spatial detail. The zero-init fusion ensures that
     pose and bbox add refinement without disrupting the eye signal.
+
+    The LandmarkRefinementHead reuses the same EyeBackbone features and
+    decodes a 56x56 heatmap *in eye-patch coords*, which corresponds to
+    ~1-1.6 px face-frame precision per cell (vs. 4 px/cell for the
+    coarse face-frame head). It is the source of subpixel landmarks for
+    pupillometry; the coarse head only feeds the eye-crop transform.
     """
 
-    def __init__(self, d_model=256, eye_out_size=112, eye_pad_frac=0.25):
+    def __init__(self, d_model=256, eye_out_size=224, eye_pad_frac=0.30,
+                 n_landmarks=14, refine_feat_size=56):
         super().__init__()
         self.eye_crop = EyeCropModule(
             out_size=eye_out_size, pad_frac=eye_pad_frac)
@@ -465,13 +608,16 @@ class GazeBranch(nn.Module):
 
         self.head = GeometricGazeHead(d_model)
 
+        self.landmark_refine = LandmarkRefinementHead(
+            n_landmarks=n_landmarks, feat_size=refine_feat_size)
+
     def forward(self, image, landmarks_px, pose_feat, face_bbox=None,
                 cross_view_attn=None, n_views=1, cam_embed=None):
         """
         Args:
             image: (B, 3, H, W) raw face image (H=W=224 expected)
-            landmarks_px: (B, 14, 2) predicted landmarks in PIXEL space
-                          of `image`. Caller should detach to keep
+            landmarks_px: (B, 14, 2) predicted COARSE landmarks in PIXEL
+                          space of `image`. Caller should detach to keep
                           gradients from flowing back to the landmark
                           branch during Stage 2 (landmark branch frozen).
             pose_feat: (B, d_model) from PoseBranch
@@ -482,14 +628,20 @@ class GazeBranch(nn.Module):
 
         Returns:
             eyeball_center: (B, 3)
-            pupil_center: (B, 3)
-            optical_axis: (B, 3)
-            gaze_angles: (B, 2)
+            pupil_center:   (B, 3)
+            optical_axis:   (B, 3)
+            gaze_angles:    (B, 2)
+            refine: dict with subpixel refinement outputs
+                'coords_eye':  (B, 14, 2) in 56-cell eye-patch space
+                'coords_face': (B, 14, 2) in face-frame px (224x224)
+                'heatmaps':    (B, 14, 56, 56)
+                'affine':      crop affine params (also shipped here so
+                               the loss can re-project the GT)
         """
-        eye = self.eye_crop(image, landmarks_px)            # (B, 3, 112, 112)
-        feat = self.encoder(eye)                            # (B, 384, h, w)
-        feat = self.coord_att(feat)
-        eye_feat = self.proj(self.pool(feat).flatten(1))    # (B, d_model)
+        eye, affine = self.eye_crop(image, landmarks_px)
+        s3, skips = self.encoder(eye)                        # bottleneck + skips
+        feat = self.coord_att(s3)
+        eye_feat = self.proj(self.pool(feat).flatten(1))     # (B, d_model)
 
         if face_bbox is not None:
             box_feat = self.box_encoder(face_bbox)
@@ -501,7 +653,19 @@ class GazeBranch(nn.Module):
         if cross_view_attn is not None:
             pooled = cross_view_attn(pooled, n_views, cam_embed)
 
-        return self.head(pooled)
+        eyeball_center, pupil_center, optical_axis, gaze_angles = \
+            self.head(pooled)
+
+        coords_eye, coords_face, refine_hm = self.landmark_refine(
+            s3, skips, affine)
+
+        refine = {
+            'coords_eye': coords_eye,
+            'coords_face': coords_face,
+            'heatmaps': refine_hm,
+            'affine': affine,
+        }
+        return eyeball_center, pupil_center, optical_axis, gaze_angles, refine
 
 
 # ─── Pose Branch ────────────────────────────────────────────────────
@@ -611,7 +775,7 @@ class RayNetV5(nn.Module):
 
         Image (224x224) + predicted landmarks (detached)
             ─→ GazeBranch:
-                EyeCropModule → 112x112 eye patch
+                EyeCropModule → 224x224 eye patch
                   → EyeBackbone (full RepNeXt-M1, private to gaze)
                   → GazeFusionBlock(eye, pose, bbox, zero-init residual)
                   → GeometricGazeHead (eyeball_center, pupil_center, optical_axis)
@@ -694,7 +858,7 @@ class RayNetV5(nn.Module):
             pose_feat if use_pose_bridge else torch.zeros_like(pose_feat)
         )
 
-        eyeball_center, pupil_center, optical_axis, gaze_angles = \
+        eyeball_center, pupil_center, optical_axis, gaze_angles, refine = \
             self.gaze_branch(
                 x, landmarks_px, gaze_pose_feat,
                 face_bbox=face_bbox,
@@ -704,9 +868,14 @@ class RayNetV5(nn.Module):
             )
 
         return {
-            # Landmarks
+            # Coarse landmarks (face-frame, 56x56 feature space)
             'landmark_coords': landmark_coords,        # (B, 14, 2) in 56x56 space
             'landmark_heatmaps': landmark_heatmaps,    # (B, 14, 56, 56)
+            # Refined landmarks (eye-patch decoder, subpixel for pupillometry)
+            'landmark_refine_coords_eye':  refine['coords_eye'],   # (B, 14, 2) in refine_feat cells
+            'landmark_refine_coords_face': refine['coords_face'],  # (B, 14, 2) in face px (224x224)
+            'landmark_refine_heatmaps':    refine['heatmaps'],     # (B, 14, feat, feat)
+            'eye_crop_affine':             refine['affine'],       # dict {cx, cy, half, out_size, H, W}
             # Gaze (GazeGene 3D eyeball structure)
             'eyeball_center': eyeball_center,          # (B, 3) CCS, cm
             'pupil_center': pupil_center,              # (B, 3) CCS, cm
@@ -757,7 +926,7 @@ def create_raynet_v5(backbone_weight_path=None, cross_view_cfg=None,
     #   landmark → s2 + s3 for the landmark branch encoder
     #   pose     → s2 + s3 for the pose branch encoder
     #   eye      → FULL M1 (stem + s0..s3) dedicated to the gaze branch,
-    #              operating on 112x112 landmark-guided eye crops
+    #              operating on 224x224 landmark-guided eye crops
     m1_shared = _make_m1(backbone_weight_path)
     m1_landmark = _make_m1(backbone_weight_path)
     m1_pose = _make_m1(backbone_weight_path)

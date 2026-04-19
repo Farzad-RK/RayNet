@@ -7,10 +7,10 @@ Staged training strategy:
     Phase 1 (epochs 1-8):   λ_lm=1.0, λ_pose=0.5, λ_trans=0.5
     Phase 2 (epochs 9-15):  λ_lm=1.0, λ_pose=1.0, λ_trans=1.0
 
-  Stage 2 — Eye-crop gaze encoder on frozen face path (curriculum unfreezes at P3):
-    Phase 1 (epochs 1-8):   Face FROZEN, gaze warmup on 112x112 eye crops
+  Stage 2 — Eye-crop gaze encoder on permanently-frozen face path:
+    Phase 1 (epochs 1-8):   Face FROZEN, gaze warmup on 224x224 eye crops
     Phase 2 (epochs 9-15):  Face FROZEN, + multi-view + geometric angular
-    Phase 3 (epochs 16-25): Face UNFROZEN, gentle joint fine-tuning (lr 5e-5)
+    Phase 3 (epochs 16-25): Face FROZEN, gaze refinement (lr 3e-5)
 
   Stage 3 — Full pipeline with bridges + MAGE box encoder:
     Phase 1 (epochs 1-5):   Bridge warmup, geometric angular active
@@ -43,6 +43,7 @@ import logging
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.swa_utils import AveragedModel, get_ema_avg_fn
 from torch.amp import GradScaler, autocast
 import numpy as np
 from datetime import datetime
@@ -133,22 +134,29 @@ STAGE_CONFIGS = {
         },
     },
 
-    # ---- Stage 2: Eye-crop gaze encoder, face path frozen then released ----
+    # ---- Stage 2: Eye-crop gaze encoder, face path frozen permanently ----
     # Purpose: The Stage 1 baseline already has solid landmarks + pose; in
     # Stage 2 we train ONLY the dedicated eye-crop gaze branch on top of
-    # those frozen predictions, then unfreeze for joint refinement.
-    # This breaks the 42° val_angular ceiling observed when the gaze
-    # branch shared low-level features with landmark/pose.
+    # those frozen predictions. The Quad-M1 design gives gaze its own
+    # private RepNeXt-M1, so co-training the face encoder offers no
+    # additional signal — only noise. Earlier Stage 2 designs unfroze
+    # the face path in Phase 3 for "joint fine-tuning"; that experiment
+    # regressed val_angular from 14° (P2 best) to oscillating 17–28°
+    # while train_angular kept descending — classic gradient conflict
+    # between gaze loss (wants eye-region features) and reactivated
+    # landmark/pose losses (want whole-face features). All three Stage 2
+    # phases now freeze the face path; the only progression is loss
+    # weight schedule and LR.
     #
-    # Phases 1-2: freeze_face=True — shared_stem, landmark_branch, and
+    # All phases: freeze_face=True — shared_stem, landmark_branch, and
     # pose_branch are in .eval() mode with requires_grad=False (so BN
     # running stats also freeze). The gaze branch (EyeCropModule +
     # EyeBackbone + fusion + head) is the only trainable path.
-    # Phase 3: unfreeze everything for gentle joint fine-tuning.
     2: {
         1: {
             'epochs': (1, 8),
             'lam_lm': 0.0,          # landmark branch frozen
+            'lam_lm_refine': 0.5,   # warm up the eye-patch subpixel head
             'lam_gaze': 1.0,
             'lam_eyeball': 0.3,
             'lam_pupil': 0.3,
@@ -164,11 +172,12 @@ STAGE_CONFIGS = {
             'use_landmark_bridge': False,
             'use_pose_bridge': True,
             'freeze_face': True,
-            'description': 'V5-S2P1: Eye-crop gaze warmup (face frozen)',
+            'description': 'V5-S2P1: Eye-crop gaze + refine warmup (face frozen)',
         },
         2: {
             'epochs': (9, 15),
             'lam_lm': 0.0,
+            'lam_lm_refine': 1.0,
             'lam_gaze': 1.0,
             'lam_eyeball': 0.5,
             'lam_pupil': 0.5,
@@ -184,11 +193,12 @@ STAGE_CONFIGS = {
             'use_landmark_bridge': False,
             'use_pose_bridge': True,
             'freeze_face': True,
-            'description': 'V5-S2P2: + multi-view + geom angular (face frozen)',
+            'description': 'V5-S2P2: + multi-view + geom angular + refine (face frozen)',
         },
         3: {
             'epochs': (16, 25),
-            'lam_lm': 0.5,          # gentle resume of landmark supervision
+            'lam_lm': 0.0,          # face permanently frozen
+            'lam_lm_refine': 1.0,
             'lam_gaze': 1.0,
             'lam_eyeball': 0.5,
             'lam_pupil': 0.5,
@@ -196,15 +206,15 @@ STAGE_CONFIGS = {
             'lam_ray': 0.3,
             'lam_reproj': 0.1,
             'lam_mask': 0.05,
-            'lam_pose': 0.3,        # face unfrozen — keep pose/trans light
-            'lam_trans': 0.3,
-            'lr': 5e-5,
+            'lam_pose': 0.0,        # pose branch frozen
+            'lam_trans': 0.0,
+            'lr': 3e-5,             # gentle refinement LR (cosine to ~0)
             'sigma': 1.0,
             'multiview': True,
             'use_landmark_bridge': False,
             'use_pose_bridge': True,
-            'freeze_face': False,
-            'description': 'V5-S2P3: Joint fine-tuning (face unfrozen)',
+            'freeze_face': True,
+            'description': 'V5-S2P3: Gaze + refine fine-tune (face permanently frozen)',
         },
     },
 
@@ -364,12 +374,36 @@ def _optimizer_state_compatible(saved_state, new_optimizer):
     return True
 
 
+# ============== EMA helpers ==============
+
+def _ema_copy_buffers(src_module, ema_module):
+    """
+    Copy non-parameter buffers (BN running_mean/running_var, etc.) from
+    the live model into the EMA model.
+
+    AveragedModel only averages parameters by default. If we left the
+    EMA model's BN buffers at their init-time values, validation through
+    the EMA would use stale BN statistics and silently degrade. The
+    standard fix (timm's ModelEmaV2, MoCo, etc.) is to mirror buffers
+    directly rather than EMA them — BN stats are already a running
+    average inside the live model, so smoothing them again is double
+    momentum and slows BN tracking unnecessarily.
+    """
+    src_buffers = dict(src_module.named_buffers())
+    for name, buf in ema_module.named_buffers():
+        # AveragedModel wraps the model as `self.module.<name>`; strip
+        # the leading "module." prefix when looking up in src.
+        key = name[len("module."):] if name.startswith("module.") else name
+        if key in src_buffers:
+            buf.data.copy_(src_buffers[key].data)
+
+
 # ============== Training Loop ==============
 
 def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                     scaler=None, grad_accum_steps=1, amp_enabled=False,
                     amp_dtype=torch.float16, batch_csv_writer=None,
-                    n_views=1):
+                    n_views=1, ema_model=None):
     """Run one training epoch with AMP and gradient accumulation support."""
     model.train()
     # model.train() recursively flips every submodule to train mode,
@@ -389,6 +423,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
         'translation': 0.0,
         # V5-specific
         'eyeball_center': 0.0, 'pupil_center': 0.0, 'geom_angular': 0.0,
+        'landmark_refine': 0.0,
     }
     n_batches = 0
 
@@ -446,6 +481,33 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
             if gt_pupil is not None:
                 gt_pupil = gt_pupil.to(device, non_blocking=True)
 
+            # --- Refined-landmark GT in eye-patch coords ---
+            # GT landmarks arrive in 56-cell face feature space; project
+            # through the eye-crop affine into the refinement head's
+            # output frame. If refinement is disabled (lam_lm_refine=0),
+            # skip this work entirely.
+            refine_kwargs = {}
+            if cfg.get('lam_lm_refine', 0.0) > 0:
+                gt_landmarks_px = batch['landmark_coords_px'].to(
+                    device, non_blocking=True)
+                refine_hm = predictions['landmark_refine_heatmaps']
+                refine_coords_eye = predictions['landmark_refine_coords_eye']
+                refine_affine = predictions['eye_crop_affine']
+                refine_feat_H = refine_hm.shape[2]
+                refine_feat_W = refine_hm.shape[3]
+                from RayNet.eye_crop import EyeCropModule
+                gt_refine_coords = EyeCropModule.face_to_eye_coords(
+                    gt_landmarks_px, refine_affine,
+                    eye_feat_size=refine_feat_H)
+                refine_kwargs = {
+                    'lam_lm_refine': cfg['lam_lm_refine'],
+                    'pred_refine_hm': refine_hm,
+                    'pred_refine_coords': refine_coords_eye,
+                    'gt_refine_coords': gt_refine_coords,
+                    'refine_feat_H': refine_feat_H,
+                    'refine_feat_W': refine_feat_W,
+                }
+
             loss, components = total_loss(
                 pred_hm, pred_coords, pred_gaze,
                 gt_landmarks, gt_optical_axis,
@@ -470,6 +532,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                 lam_trans=cfg.get('lam_trans', 0.0),
                 pred_pose_t=predictions.get('pred_pose_t'),
                 gt_head_t=gt_head_t,
+                **refine_kwargs,
             )
 
             # Multi-view consistency loss (Phase 2+)
@@ -508,12 +571,14 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
         # Optimizer step at accumulation boundary
         if (step + 1) % grad_accum_steps == 0:
             if has_accumulated:
+                did_step = False
                 if scaler is not None:
                     # FP16 path: scaler handles inf/nan detection internally
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
                     scaler.step(optimizer)
                     scaler.update()
+                    did_step = True
                 else:
                     # FP32 / BF16 path: manually check grad norm and skip step
                     # if non-finite (BF16 has no scaler to catch overflow/nan)
@@ -521,10 +586,15 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                         model.parameters(), max_norm=max_norm)
                     if torch.isfinite(total_norm):
                         optimizer.step()
+                        did_step = True
                     else:
                         log.warning("Epoch %d batch %d: non-finite grad norm "
                                     "(%s), skipping optimizer step",
                                     epoch, step + 1, total_norm.item())
+                if did_step and ema_model is not None:
+                    raynet = _unwrap_raynet(model)
+                    ema_model.update_parameters(raynet)
+                    _ema_copy_buffers(raynet, ema_model)
                 optimizer.zero_grad()
                 has_accumulated = False
             else:
@@ -548,6 +618,8 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
             running_losses['pose'] += components['pose_loss'].item()
         if 'translation_loss' in components:
             running_losses['translation'] += components['translation_loss'].item()
+        if 'landmark_refine_loss' in components:
+            running_losses['landmark_refine'] += components['landmark_refine_loss'].item()
         n_batches += 1
 
         # Per-batch CSV logging (high granularity)
@@ -581,16 +653,23 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
     # Flush any remaining gradients from incomplete accumulation
     if n_batches % grad_accum_steps != 0:
         if has_accumulated:
+            did_step = False
             if scaler is not None:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
                 scaler.step(optimizer)
                 scaler.update()
+                did_step = True
             else:
                 total_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), max_norm=max_norm)
                 if torch.isfinite(total_norm):
                     optimizer.step()
+                    did_step = True
+            if did_step and ema_model is not None:
+                raynet = _unwrap_raynet(model)
+                ema_model.update_parameters(raynet)
+                _ema_copy_buffers(raynet, ema_model)
             optimizer.zero_grad()
 
     for k in running_losses:
@@ -612,6 +691,11 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
     running_losses = {
         'total': 0.0, 'landmark': 0.0, 'angular': 0.0, 'angular_deg': 0.0,
         'landmark_px': 0.0, 'pose': 0.0, 'ray': 0.0, 'translation': 0.0,
+        'landmark_refine': 0.0,
+        # face-frame pixel error of the refined head (primary pupillometry
+        # accuracy metric). Reported in face-frame px so it's directly
+        # comparable to `landmark_px` from the coarse head.
+        'landmark_refine_px': 0.0,
     }
     n_batches = 0
 
@@ -646,6 +730,32 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
 
             feat_H, feat_W = pred_hm.shape[2], pred_hm.shape[3]
 
+            # Refined-landmark loss + GT projection (when enabled)
+            refine_kwargs = {}
+            lm_refine_px_error = None
+            if cfg.get('lam_lm_refine', 0.0) > 0:
+                refine_hm = predictions['landmark_refine_heatmaps']
+                refine_coords_eye = predictions['landmark_refine_coords_eye']
+                refine_coords_face = predictions['landmark_refine_coords_face']
+                refine_affine = predictions['eye_crop_affine']
+                refine_feat_H = refine_hm.shape[2]
+                refine_feat_W = refine_hm.shape[3]
+                from RayNet.eye_crop import EyeCropModule
+                gt_refine_coords = EyeCropModule.face_to_eye_coords(
+                    gt_landmarks_px, refine_affine,
+                    eye_feat_size=refine_feat_H)
+                refine_kwargs = {
+                    'lam_lm_refine': cfg['lam_lm_refine'],
+                    'pred_refine_hm': refine_hm,
+                    'pred_refine_coords': refine_coords_eye,
+                    'gt_refine_coords': gt_refine_coords,
+                    'refine_feat_H': refine_feat_H,
+                    'refine_feat_W': refine_feat_W,
+                }
+                # Face-frame px error for pupillometry reporting
+                lm_refine_px_error = torch.mean(
+                    torch.norm(refine_coords_face - gt_landmarks_px, dim=-1))
+
             loss, components = total_loss(
                 pred_hm, pred_coords, pred_gaze,
                 gt_landmarks, gt_optical_axis,
@@ -653,6 +763,7 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
                 lam_lm=cfg['lam_lm'],
                 lam_gaze=cfg['lam_gaze'],
                 sigma=cfg['sigma'],
+                **refine_kwargs,
             )
 
         img_size = images.shape[-1]
@@ -677,6 +788,11 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
         trans_val = components.get('translation_loss')
         if trans_val is not None:
             running_losses['translation'] += trans_val.item()
+        refine_val = components.get('landmark_refine_loss')
+        if refine_val is not None:
+            running_losses['landmark_refine'] += refine_val.item()
+        if lm_refine_px_error is not None:
+            running_losses['landmark_refine_px'] += lm_refine_px_error.item()
         n_batches += 1
 
     for k in running_losses:
@@ -826,6 +942,26 @@ def train(args):
     # ranks start from identical parameters.
     model = accelerator.prepare(model)
 
+    # EMA shadow model for validation. Tracks a moving average of the
+    # live model's parameters; we run validation through it so the
+    # reported metric reflects a smoothed weight trajectory rather than
+    # the noisy step-by-step weights. Created from the unwrapped model
+    # so the EMA copy carries no DDP/torch.compile machinery — it's a
+    # plain RayNetV5 used only for forward passes during eval. BN
+    # buffers are mirrored from the live model after every optimizer
+    # step (see _ema_copy_buffers); only parameters are EMA'd.
+    ema_model = None
+    ema_restored_from_ckpt = False
+    if args.ema_decay > 0:
+        ema_model = AveragedModel(
+            accelerator.unwrap_model(model),
+            multi_avg_fn=get_ema_avg_fn(args.ema_decay),
+        )
+        ema_model.to(device)
+        ema_model.eval()
+        if is_main:
+            print(f"EMA enabled (decay={args.ema_decay})")
+
     # --- Data loading ---
     # Multi-view is always active. Train + val both use 9-grouped batches so
     # CrossViewAttention, cam_embed, and PoseEncoder fusion are exercised at
@@ -861,8 +997,9 @@ def train(args):
             'epoch', 'stage', 'phase', 'lr',
             'train_total', 'train_landmark', 'train_angular_deg',
             'train_reproj', 'train_mask', 'train_ray_target', 'train_pose',
-            'train_translation',
+            'train_translation', 'train_landmark_refine',
             'val_total', 'val_landmark', 'val_angular_deg', 'val_landmark_px',
+            'val_landmark_refine', 'val_landmark_refine_px',
         ])
 
         batch_csv_path = os.path.join(output_dir, 'batch_log.csv')
@@ -911,6 +1048,15 @@ def train(args):
             )
         current_phase = get_phase(resume_ckpt['epoch'])
         best_val_loss = resume_ckpt.get('val_metrics', {}).get('total', best_val_loss)
+        # Restore EMA shadow weights so resume picks up the smoothed
+        # trajectory rather than re-EMAing from current weights (which
+        # would discard ~all previous decay history and bias val toward
+        # noisy weights for a few hundred steps).
+        if ema_model is not None and 'ema_state_dict' in resume_ckpt:
+            ema_model.load_state_dict(resume_ckpt['ema_state_dict'])
+            ema_restored_from_ckpt = True
+            if is_main:
+                print("  Restored EMA shadow weights from checkpoint")
         if is_main:
             print(f"  Resumed at epoch {start_epoch} (phase {current_phase}), "
                   f"best_val_loss={best_val_loss:.4f}")
@@ -1059,6 +1205,22 @@ def train(args):
 
             best_val_loss = fork_state.get(
                 'val_metrics', {}).get('total', best_val_loss)
+            # Same-stage fork: architecture is unchanged so the EMA state
+            # is meaningful — load it. Cross-stage fork (above) leaves
+            # EMA fresh because the architecture may have changed and
+            # any saved EMA tensors that survive the shape filter would
+            # be of a different epoch's task distribution.
+            if ema_model is not None and 'ema_state_dict' in fork_state:
+                ema_sd = fork_state['ema_state_dict']
+                ema_target_sd = ema_model.state_dict()
+                ema_filtered, ema_dropped = _filter_compatible_state(
+                    ema_sd, ema_target_sd)
+                ema_model.load_state_dict(ema_filtered, strict=False)
+                ema_restored_from_ckpt = True
+                if is_main:
+                    print(f"  [fork] EMA state loaded "
+                          f"({len(ema_filtered)} kept, "
+                          f"{len(ema_dropped)} dropped)")
             if is_main:
                 print(f"  Same-stage fork: loaded full state from epoch "
                       f"{src_epoch} (phase {current_phase}). New run "
@@ -1130,6 +1292,23 @@ def train(args):
         # be created in the phase-transition block below exactly like a
         # from-scratch run.
 
+    # Seed the EMA shadow from the live model whenever no EMA was
+    # restored from a checkpoint. EMA was created right after
+    # accelerator.prepare, BEFORE warmstart/fork loaded the actual
+    # starting weights — leaving it at random init would mean the
+    # first ~1/(1-decay) ≈ 1000 updates produce a validation model
+    # that's a mix of random init and trained weights. Copying the
+    # current live state into the EMA shadow makes it identical to
+    # the live model at step 0 and decays correctly from there.
+    if ema_model is not None and not ema_restored_from_ckpt:
+        live_sd = _unwrap_raynet(model).state_dict()
+        ema_inner_sd = ema_model.module.state_dict()
+        for k in ema_inner_sd:
+            if k in live_sd and ema_inner_sd[k].shape == live_sd[k].shape:
+                ema_inner_sd[k].data.copy_(live_sd[k].data)
+        if is_main:
+            print("  EMA shadow seeded from current live weights")
+
     for epoch in range(start_epoch, args.epochs + 1):
         phase = get_phase(epoch)
         cfg = get_phase_config(epoch)
@@ -1149,6 +1328,7 @@ def train(args):
                 print(f"\n{'='*60}")
                 print(f"Phase {phase}: {cfg['description']}")
                 print(f"  lr={cfg['lr']}, lam_lm={cfg['lam_lm']}, "
+                      f"lam_lm_refine={cfg.get('lam_lm_refine', 0)}, "
                       f"lam_gaze={cfg['lam_gaze']}, lam_ray={cfg.get('lam_ray', 0)}, "
                       f"lam_pose={cfg.get('lam_pose', 0)}, lam_trans={cfg.get('lam_trans', 0)}, "
                       f"sigma={cfg['sigma']}")
@@ -1218,6 +1398,7 @@ def train(args):
             amp_dtype=amp_dtype,
             batch_csv_writer=batch_csv_writer,
             n_views=active_n_views,
+            ema_model=ema_model,
         )
         if batch_csv_file is not None:
             batch_csv_file.flush()
@@ -1228,8 +1409,13 @@ def train(args):
         # uninformative val gaze metrics. The val loader now delivers
         # 9-grouped batches (see _create_mds_mv_loader), so the reshape
         # inside CrossViewAttention is well-defined.
+        # Validate through the EMA shadow when enabled. EMA tracks the
+        # smoothed weight trajectory so val metrics are not contaminated
+        # by single-batch weight oscillation. Falls back to the live
+        # model when --ema_decay 0 was passed.
+        val_model = ema_model if ema_model is not None else model
         val_losses = validate(
-            model, active_val_loader, device, epoch, cfg,
+            val_model, active_val_loader, device, epoch, cfg,
             amp_enabled=hw['amp'],
             amp_dtype=amp_dtype,
             n_views=active_n_views,
@@ -1253,11 +1439,14 @@ def train(args):
                 mv_str += f" pose={train_losses['pose']:.4f}"
             if train_losses.get('translation', 0) > 0:
                 mv_str += f" trans={train_losses['translation']:.4f}"
+            refine_str = ""
+            if val_losses.get('landmark_refine_px', 0) > 0:
+                refine_str = f" lm_refine_px={val_losses['landmark_refine_px']:.2f}px"
             print(f"Epoch {epoch:3d} | Phase {phase} | lr {current_lr:.2e} | "
                   f"Train: loss={train_losses['total']:.4f} lm={train_losses['landmark']:.4f} "
                   f"ang={train_losses['angular_deg']:.2f}deg{mv_str} | "
                   f"Val: loss={val_losses['total']:.4f} lm_px={val_losses['landmark_px']:.2f}px "
-                  f"ang={val_losses['angular_deg']:.2f}deg")
+                  f"ang={val_losses['angular_deg']:.2f}deg{refine_str}")
 
             if hw['amp'] and device.type == 'cuda':
                 mem_gb = torch.cuda.max_memory_allocated() / 1e9
@@ -1273,16 +1462,28 @@ def train(args):
                 f"{train_losses.get('ray_target', 0):.6f}",
                 f"{train_losses.get('pose', 0):.6f}",
                 f"{train_losses.get('translation', 0):.6f}",
+                f"{train_losses.get('landmark_refine', 0):.6f}",
                 f"{val_losses['total']:.6f}",
                 f"{val_losses['landmark']:.6f}",
                 f"{val_losses['angular_deg']:.4f}",
                 f"{val_losses['landmark_px']:.4f}",
+                f"{val_losses.get('landmark_refine', 0):.6f}",
+                f"{val_losses.get('landmark_refine_px', 0):.4f}",
             ])
             csv_file.flush()
 
             # Unwrap DDP (and torch.compile) before handing the raw module to
             # the checkpoint code; its state_dict is what's serialised.
             save_model = accelerator.unwrap_model(model)
+
+            # Build the extras blob once per epoch — picked up by both
+            # save_best and the periodic save below. EMA state ships in
+            # `ema_state_dict` so resume can restore the smoothed weights;
+            # without this, resume would EMA-from-init and lose the
+            # smoothing benefit for the rest of training.
+            ckpt_extras = {'profile': args.profile}
+            if ema_model is not None:
+                ckpt_extras['ema_state_dict'] = ema_model.state_dict()
 
             # Save best model
             if val_losses['total'] < best_val_loss:
@@ -1293,7 +1494,7 @@ def train(args):
                         epoch=epoch, model=save_model, val_loss=best_val_loss,
                         val_metrics=val_losses, optimizer=optimizer,
                         scheduler=scheduler, scaler=scaler,
-                        extra={'profile': args.profile},
+                        extra=ckpt_extras,
                     )
                 else:
                     save_dict = {
@@ -1305,6 +1506,8 @@ def train(args):
                         'val_angular_deg': val_losses['angular_deg'],
                         'profile': args.profile,
                     }
+                    if ema_model is not None:
+                        save_dict['ema_state_dict'] = ema_model.state_dict()
                     torch.save(save_dict, os.path.join(output_dir, 'best_model.pt'))
                 print(f"  -> Saved best model (val_loss={best_val_loss:.4f})")
 
@@ -1315,7 +1518,7 @@ def train(args):
                     epoch=epoch, model=save_model, optimizer=optimizer,
                     scheduler=scheduler, scaler=scaler, phase=phase,
                     train_metrics=train_losses, val_metrics=val_losses,
-                    tag='latest',
+                    tag='latest', extra=ckpt_extras,
                 )
                 # Periodic named checkpoint
                 if epoch % args.ckpt_every == 0:
@@ -1323,6 +1526,7 @@ def train(args):
                         epoch=epoch, model=save_model, optimizer=optimizer,
                         scheduler=scheduler, scaler=scaler, phase=phase,
                         train_metrics=train_losses, val_metrics=val_losses,
+                        extra=ckpt_extras,
                     )
                 # Upload logs after each epoch (survives interruption/crash)
                 try:
@@ -1542,6 +1746,14 @@ def parse_args():
                              'you want to restart Stage N even though the '
                              'source was also Stage N. Optimizer momentum '
                              'and scaler state are still preserved.')
+    parser.add_argument('--ema_decay', type=float, default=0.999,
+                        help='EMA decay for validation weights (default 0.999). '
+                             'Set 0 to disable EMA. The EMA model tracks a '
+                             'moving average of the trainable parameters and '
+                             'is what validation runs through; the live model '
+                             'is what gets gradient updates. EMA dampens the '
+                             'val oscillation seen in S2 P3 when train loss '
+                             'descends but val loss bounces.')
     parser.add_argument('--reset_pose_translation', action='store_true',
                         help='After warmstart, zero-init pose_head rows 6:9 '
                              '(translation). Use when the translation loss '

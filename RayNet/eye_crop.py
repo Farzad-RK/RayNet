@@ -15,6 +15,13 @@ Motivation:
     zooms in on the eye so a dedicated encoder sees the iris at
     subpixel resolution.
 
+    Default `out_size` is 224 (matches the face-crop input size, so the
+    EyeBackbone produces a 14x14 stride-16 token map dedicated to the
+    eye region). The earlier 112x112 default doubled feature-map
+    capacity vs. the face path but capped Stage 2 P3 val_angular at
+    ~17deg; cropping at 224 quadruples token capacity over 112 with
+    no upstream pixel-information change.
+
 Geometry:
     Given 14 landmarks in pixel space (all eye-region), compute a
     square bbox centered on their centroid with half-size
@@ -35,12 +42,19 @@ class EyeCropModule(nn.Module):
     Landmark-guided differentiable eye crop.
 
     Args:
-        out_size: output spatial size (default 112, matches MAC-Gaze)
-        pad_frac: padding fraction beyond tight landmark bbox (default 0.25)
-        min_half_size: minimum half-side in input pixels (default 24)
+        out_size: output spatial size (default 224, full face-crop scale —
+            doubles feature-map capacity vs. the previous 112 default).
+        pad_frac: padding fraction beyond tight landmark bbox (default 0.30).
+            Slightly wider than the 0.25 used at 112x112 to keep eyelid
+            and brow context that the higher-capacity feature map can
+            actually use.
+        min_half_size: minimum half-side in input pixels (default 32).
+            At 224 output, a 24px source half-side meant ~9.3x bilinear
+            upsample, which adds interpolation noise without information.
+            32 keeps the upsample under 7x.
     """
 
-    def __init__(self, out_size=112, pad_frac=0.25, min_half_size=24.0):
+    def __init__(self, out_size=224, pad_frac=0.30, min_half_size=32.0):
         super().__init__()
         self.out_size = out_size
         self.pad_frac = pad_frac
@@ -55,6 +69,14 @@ class EyeCropModule(nn.Module):
 
         Returns:
             crop: (B, 3, out_size, out_size) eye patch
+            affine: dict with per-sample crop geometry, used by the
+                    refinement landmark head to project face-frame GT
+                    coordinates into eye-patch space and to project
+                    refined predictions back. Keys:
+                      cx, cy: (B,) crop centroid in face-frame pixels
+                      half:   (B,) crop half-side in face-frame pixels
+                      out_size: int, eye-patch size (square)
+                      H, W:   ints, source face-frame dims
         """
         B, _, H, W = image.shape
 
@@ -94,4 +116,88 @@ class EyeCropModule(nn.Module):
             padding_mode='zeros',
             align_corners=True,
         )
-        return crop
+
+        affine = {
+            'cx': cx, 'cy': cy, 'half': half,
+            'out_size': self.out_size, 'H': H, 'W': W,
+        }
+        return crop, affine
+
+    @staticmethod
+    def face_to_eye_coords(coords_face, affine, eye_feat_size=None):
+        """
+        Project face-frame pixel coordinates into eye-patch coordinates.
+
+        Use this to compute GT for the refinement landmark head: the
+        face-frame GT is mapped through the same affine that produced
+        the eye crop, into the coordinate system the refinement head
+        outputs in.
+
+        Args:
+            coords_face: (B, N, 2) (x, y) in face-frame pixels.
+            affine: dict from EyeCropModule.forward.
+            eye_feat_size: optional output spatial size of the
+                refinement decoder (e.g. 56 for a 56x56 heatmap). When
+                supplied, the result is scaled from `out_size` pixels
+                into `eye_feat_size` cells, matching the heatmap's
+                coordinate frame so soft-argmax outputs are directly
+                comparable. When None, returns coords in eye-patch
+                pixel space (i.e. in 0..out_size-1).
+
+        Returns:
+            coords_eye: (B, N, 2) in eye-patch (or feature-map) space.
+        """
+        cx = affine['cx'][:, None]   # (B, 1) — broadcast across N landmarks
+        cy = affine['cy'][:, None]
+        half = affine['half'][:, None]
+        out_size = affine['out_size']
+
+        # In eye-patch pixel space (align_corners=True convention):
+        #     coord_eye_px = (coord_face - (cx - half)) * (out_size - 1) / (2 * half)
+        # which collapses to:
+        #     coord_eye_px = (coord_face - cx) * (out_size - 1) / (2 * half) + (out_size - 1) / 2
+        scale = (out_size - 1) / (2.0 * half)
+        x_eye_px = (coords_face[..., 0] - cx) * scale + (out_size - 1) / 2.0
+        y_eye_px = (coords_face[..., 1] - cy) * scale + (out_size - 1) / 2.0
+
+        if eye_feat_size is not None and eye_feat_size != out_size:
+            ratio = (eye_feat_size - 1) / (out_size - 1)
+            x_eye_px = x_eye_px * ratio
+            y_eye_px = y_eye_px * ratio
+
+        return torch.stack([x_eye_px, y_eye_px], dim=-1)
+
+    @staticmethod
+    def eye_to_face_coords(coords_eye, affine, eye_feat_size=None):
+        """
+        Inverse of `face_to_eye_coords`: lift refined eye-patch
+        predictions back to face-frame pixels for downstream consumers
+        (pupillometry, iris contour rendering, second-pass crops).
+
+        Args:
+            coords_eye: (B, N, 2) coords in eye-patch pixel space, OR
+                in `eye_feat_size`-cell space when `eye_feat_size` is
+                given (in which case they are first rescaled to
+                eye-patch pixel space).
+            affine: dict from EyeCropModule.forward.
+            eye_feat_size: see `face_to_eye_coords`.
+
+        Returns:
+            coords_face: (B, N, 2) in face-frame pixels.
+        """
+        cx = affine['cx'][:, None]
+        cy = affine['cy'][:, None]
+        half = affine['half'][:, None]
+        out_size = affine['out_size']
+
+        x = coords_eye[..., 0]
+        y = coords_eye[..., 1]
+        if eye_feat_size is not None and eye_feat_size != out_size:
+            ratio = (out_size - 1) / (eye_feat_size - 1)
+            x = x * ratio
+            y = y * ratio
+
+        scale = (2.0 * half) / (out_size - 1)
+        x_face = (x - (out_size - 1) / 2.0) * scale + cx
+        y_face = (y - (out_size - 1) / 2.0) * scale + cy
+        return torch.stack([x_face, y_face], dim=-1)
