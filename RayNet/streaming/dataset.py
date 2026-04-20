@@ -294,6 +294,7 @@ def create_multiview_streaming_dataloaders(
     mv_groups=2,
     num_workers=4,
     transform=None,
+    val_transform=None,
     pin_memory=True,
     prefetch_factor=2,
     persistent_workers=False,
@@ -314,7 +315,11 @@ def create_multiview_streaming_dataloaders(
         local_cache: Local cache directory.
         mv_groups: Number of multi-view groups per batch.
         num_workers: DataLoader workers.
-        transform: Optional torchvision transform to apply to image tensors.
+        transform: Train-only transform (ColorJitter, RandomAffine, etc.).
+        val_transform: Val-only transform. Should at minimum apply the same
+            Normalize step as the end of `transform` so that the shared
+            stem's BN running_mean/var — calibrated on train images —
+            produce correctly-scaled activations for val images too.
         pin_memory: Pin memory for GPU transfer.
         prefetch_factor: Prefetch factor per worker.
         persistent_workers: Keep workers alive between epochs.
@@ -332,6 +337,7 @@ def create_multiview_streaming_dataloaders(
         batch_size=actual_batch,
         num_workers=num_workers,
         transform=transform,
+        val_transform=val_transform,
         shuffle_train=False,  # preserve multi-view grouping order
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,

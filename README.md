@@ -1,53 +1,54 @@
 # RayNet v5 — Multi-Task Gaze Estimation with Explicit 3D Eyeball Geometry
 
-Multi-task deep learning for gaze estimation, iris/pupil landmarks, and head pose on the [GazeGene](https://github.com/gazegene) dataset. Trained with multi-view geometric supervision.
+Multi-task deep learning for gaze estimation, iris/pupil landmarks, head pose, and **anatomical eye-region segmentation** on the [GazeGene](https://github.com/gazegene) dataset. Trained with multi-view geometric supervision and parallel MTL from epoch 1.
 
-## Architecture (v5 Quad-M1, eye-crop gaze)
+## Architecture (v5 Triple-M1, AERI gaze)
 
 ```
 Input: (3, 224, 224) GazeGene face crop + (3,) face bbox (x_p, y_p, L_x)
   │
   ▼
 SharedStem  (RepNeXt-M1 stem + stages[0..1])    48→96ch, 28x28   ~0.21M
+  │     (landmark-owned: only landmark loss backprops here)
   │
-  ├──────────────┬───────────────┐
-  ▼              ▼
-Landmark Branch  Pose Branch     (each: RepNeXt-M1 stages[2..3])
-  U-Net decoder  6D rotation +
-  + attention    3D translation
-  gates          (gradient-isolated: reads s1.detach())
-  14 pts @56×56
-        │
-        │  predicted landmarks (×4 to pixel space, .detach())
-        ▼
-  EyeCropModule (112×112, 25% pad, min half-size 24px)
-        │
-        ▼
-  EyeBackbone  (private full RepNeXt-M1, stem + s0..s3)       ~5M
-        │
-        ▼
-  GazeFusionBlock(eye, pose, box)   zero-init residual, eye as anchor
-        │
-        ▼
-  Eyeball center + pupil center → optical_axis = normalize(pupil − eyeball)
-                                               ▲
-                                               │
-                                     MAGE BoxEncoder (face bbox)
+  ├───────────────┬───────────────────┬────────────────────┐
+  ▼               ▼ (s1.detach)       ▼ (s1.detach)
+Landmark Branch   Pose Branch         Gaze Branch
+(M1 s2+s3)        (M1 s2+s3)          (M1 s2+s3)
+U-Net decoder     CoordAtt+pool       ┌────────────────────┐
++ attention       ⊕ BoxEncoder(bbox)  │ AERIHead (mini-UNet)│
+gates             (zero-init residual)│ → iris_logits       │
+14 pts @56×56     → pose_feat         │ → eyeball_logits    │
+                  → 6D rot + 3D t     │   (both @ 56×56)    │
+                                      └────────────────────┘
+                                                 │
+                                       eyeball mask gates
+                                       the 7×7 gaze map:
+                                       gaze_s3 *= (0.25 +
+                                         0.75 · sigmoid(eyeball))
+                                                 │
+                                                 ▼
+                                       GazeFusion(gaze, pose_feat)
+                                       (zero-init residual)
+                                                 │
+                                                 ▼
+                                       Eyeball + pupil 3D →
+                                       optical_axis =
+                                         normalize(pupil − eyeball)
 ```
 
-- Backbone: **RepNeXt-M1** (~4.8M per instance); shared stem + 3 face branches + 1 private eye backbone.
-- Total: **~17M params** (SharedStem 0.21M, LandmarkBranch 6.18M, PoseBranch 4.45M, GazeBranch 5.04M, CrossView+Cam 1.07M).
-- Gaze branch now has its **own** full M1 fed by a landmark-guided 112×112 eye crop — it does not share the face's 14×14 feature map anymore.
-- Landmarks feeding the crop are always `.detach()`-ed; during Stage 2 P1/P2 the face path is frozen so the crop input distribution matches inference.
+- Backbone: **RepNeXt-M1** (~4.8M per instance). One shared stem + three independent `s2+s3` branches.
+- Total: **~18.7M params** (SharedStem 0.21M, LandmarkBranch 6.18M, PoseBranch 4.69M, GazeBranch 6.53M, CrossView+Cam 1.07M).
+- **Triple-M1** refers to the three task-specific branches above a single shared stem — not an eye-crop encoder. There is no pixel-level cropping anywhere in the forward path.
 
 ## Key Design
 
-- **Eye-crop gaze**: the ~42° `val_angular` ceiling in the old Triple-M1 design came from the iris occupying 2-3 cells of the stride-16 face feature map. A differentiable landmark-guided crop + dedicated M1 puts the iris back in a native 28×28 stem map. Driving experiments: `docs/experiments/raynet_v5_500_samples_per_subject/` (S1 baseline, `val_landmark_px` 2.64) and `docs/experiments/raynet_v5_S2_fork_500_samples_per_subject/` (showed the 42° ceiling).
-- **Explicit 3D eyeball geometry**: predict `eyeball_center` + `pupil_center`, derive `optical_axis = normalize(pupil − eyeball)`. Supervised with L1 on centers + angular loss.
-- **MAGE integration**: BoxEncoder consumes the face bounding box `(x_p, y_p, L_x)` derived from the Intrinsic Delta method — no MediaPipe-468 dependency at inference.
-- **Multi-view consistency**: 9-camera GazeGene batches; CrossViewAttention + CameraEmbedding fuse across views, gaze-ray + landmark-shape consistency losses supervise agreement.
-- **Gradient isolation**: pose branch reads `s1.detach()`; landmarks into the eye crop are `.detach()`-ed so gaze loss never flows back through the face path.
-- **Freeze-face curriculum (Stage 2 P1/P2)**: `shared_stem + landmark_branch + pose_branch` held at `.eval()` + `requires_grad=False` (BN stats frozen) while only the eye-crop gaze branch trains; released in P3 for joint fine-tuning.
+- **AERI (Anatomical Eye Region Isolation)**: the gaze branch carries its own mini U-Net (`AERIHead`) that produces binary iris + eyeball segmentation logits at 56×56. The predicted eyeball mask is downsampled to 7×7 and used as a soft attention gate on the gaze bottleneck (`0.25 + 0.75·sigmoid(·)`), so the pooled gaze vector is eye-region-dominant without any geometric crop. Masks are baked into the MDS shards from GazeGene anatomy (see `RayNet/streaming/eye_masks.py`).
+- **Landmark-owned stem + full gradient isolation**: pose and gaze both read `s1.detach()` (and `s0.detach()` where used as a skip), so gaze/pose gradients never reach the shared low-level encoder. Landmark loss is the sole driver of `SharedStem`.
+- **Parallel MTL from epoch 1**: no sequential freeze stages. Landmark + pose + gaze + AERI segmentation + head translation are all active from the first step. Phase transitions adjust loss weights and LR only.
+- **Explicit 3D eyeball geometry**: predict `eyeball_center` + `pupil_center`, derive `optical_axis = normalize(pupil − eyeball)` (GazeGene Sec 4.2.2). Supervised with L1 on centers + angular loss on the derived axis.
+- **MAGE integration inside PoseBranch**: `BoxEncoder` consumes `(x_p, y_p, L_x)` from the Intrinsic Delta method (see `dataset.py::__getitem__` and `docs/wiki/Geometry-and-Kappa.md`). Fused into pose via a zero-init residual so pose predictions at step 0 come from the CNN feature alone and bbox signal ramps in as the encoder trains.
+- **Multi-view consistency**: 9-camera GazeGene batches; `CrossViewAttention` + `CameraEmbedding` fuse across views; gaze-ray + landmark-shape consistency losses supervise agreement (phase 2+).
 
 ## Data
 
@@ -56,7 +57,7 @@ Two modes:
 - **Local**: `--data_dir /path/to/GazeGene_FaceCrops`
 - **MDS streaming** (MosaicML + MinIO/S3): `--mds_streaming --mds_train s3://gazegene/train --mds_val s3://gazegene/val`
 
-Convert local GazeGene → MDS shards:
+Convert local GazeGene → MDS shards (baked-in iris + eyeball masks are written automatically):
 
 ```bash
 python -m RayNet.streaming.convert_to_mds \
@@ -66,33 +67,39 @@ python -m RayNet.streaming.convert_to_mds \
 
 ## Training
 
-Staged schedule (see `RayNet/train.py:STAGE_CONFIGS`):
+Single stage, three phases, all losses active from epoch 1 (see `RayNet/train.py::PHASE_CONFIG`):
 
-1. **Stage 1** — landmark + pose baseline (gaze disabled, `val_angular` ~42° throughout). Recommended recipe: 500 samples/subject, 15 epochs, `kaggle_t4x2`; drives `val_landmark_px` to ≈ 2.64 (see `docs/experiments/raynet_v5_500_samples_per_subject/`).
-2. **Stage 2** — eye-crop gaze on top of the frozen face path. P1 gaze warmup (lr 3e-4, face frozen, single-view) → P2 + multi-view + geometric angular (lr 1e-4, face frozen) → P3 joint fine-tuning (lr 5e-5, face unfrozen). The freeze-face design was chosen after `docs/experiments/raynet_v5_S2_fork_500_samples_per_subject/` showed the old Triple-M1 Stage 2 flooring at ~42°.
-3. **Stage 3** — full pipeline with optional bridges + MAGE box encoder (retained for comparison experiments).
+| Phase | Epochs | Purpose | LR | Multi-view loss |
+|-------|--------|---------|----|-----------------|
+| 1 | 1–8   | warmup — all losses active, moderate weights | 5e-4 | off |
+| 2 | 9–16  | main — full weights + multi-view consistency | 3e-4 | on |
+| 3 | 17–25 | fine-tune — lower LR, gaze emphasis | 1e-4 | on |
+
+Phase transitions carry over optimizer momentum and rebuild only the `CosineAnnealingLR` for the new phase window. Gradient clipping is `max_norm=5.0` in phase 1 (lets the multi-task gradient settle) and `max_norm=2.0` afterwards.
 
 ```bash
-# Stage 1 (landmark + pose baseline)
+# Single GPU
 python -m RayNet.train \
   --mds_streaming \
   --mds_train s3://gazegene/train \
   --mds_val   s3://gazegene/val \
   --core_backbone_weight_path ./ptrained_models/repnext_m1_distill_300e.pth \
-  --profile kaggle_t4x2 \
-  --stage 1 \
-  --samples_per_subject 500
+  --profile t4 \
+  --samples_per_subject 500 \
+  --epochs 25
 
-# Stage 2 (forks from a Stage 1 checkpoint)
-python -m RayNet.train \
+# Multi-GPU (Kaggle 2× T4 / similar)
+accelerate launch --multi_gpu --num_processes 2 \
+  -m RayNet.train \
   --mds_streaming --mds_train s3://gazegene/train --mds_val s3://gazegene/val \
   --core_backbone_weight_path ./ptrained_models/repnext_m1_distill_300e.pth \
-  --profile kaggle_t4x2 --stage 2 \
-  --fork_from s3://raynet-checkpoints/checkpoints/<stage1_run_id>/best_model.pt \
-  --run_id <new_stage2_run_id>
+  --profile kaggle_t4x2 \
+  --samples_per_subject 500 \
+  --epochs 25 \
+  --ckpt_bucket raynet-checkpoints --ckpt_prefix checkpoints
 ```
 
-Stages are `--stage 1|2|3`. All stages use the same v5 Quad-M1 model; only loss weights, the `freeze_face` flag, and (optionally) the active bridges change. Multi-GPU launches go through `accelerate launch --multi_gpu`; `build_accelerator()` sets `find_unused_parameters=True` so DDP tolerates the frozen face path in Stage 2 P1/P2.
+No `--stage` flag. No `freeze_face`. Fork/warmstart/resume machinery is preserved for cross-architecture migrations and hyperparameter branching.
 
 ## Project Structure
 
@@ -100,16 +107,18 @@ Stages are `--stage 1|2|3`. All stages use the same v5 Quad-M1 model; only loss 
 RayNet/
 ├── backbone/                  # RepNeXt variants
 ├── RayNet/
-│   ├── raynet_v5.py           # Quad-M1 model (shared stem + 3 branches + eye backbone)
-│   ├── eye_crop.py            # Differentiable 112×112 landmark-guided eye crop
+│   ├── raynet_v5.py           # Triple-M1 model (shared stem + 3 branches + AERI)
 │   ├── coordatt.py            # Coordinate Attention
 │   ├── multiview_loss.py      # Cross-view consistency
-│   ├── losses.py              # Landmark + angular + geometry + pose losses
-│   ├── dataset.py             # GazeGene loader (local)
-│   ├── streaming/             # MosaicML MDS streaming + MinIO
+│   ├── losses.py              # Landmark + angular + geometry + pose + seg losses
+│   ├── dataset.py             # GazeGene loader (local) + AERI mask rendering
+│   ├── streaming/
+│   │   ├── eye_masks.py       # AERI iris + eyeball mask renderer
+│   │   ├── convert_to_mds.py  # Shard writer (masks baked into shards)
+│   │   └── dataset.py         # MosaicML MDS streaming reader
 │   ├── normalization.py       # Easy-Norm (MAGE) image normalization
-│   ├── hardware_profiles.py   # Profiles + Accelerator (find_unused_parameters=True)
-│   ├── train.py               # Staged training + set_face_frozen helper
+│   ├── hardware_profiles.py   # Profiles + Accelerator
+│   ├── train.py               # Parallel MTL training (3 phases, 1 stage)
 │   └── inference.py           # Inference + visualization
 ├── docs/                      # Experiments, wiki, figures
 └── deploy/                    # ONNX/TensorRT export
@@ -117,16 +126,18 @@ RayNet/
 
 ## Inference
 
-Run `RayNet/inference.py` with a trained checkpoint to reproduce visualizations under `docs/`. The script is preserved through cleanup and exercises the same v5 forward path as training.
+Run `RayNet/inference.py` with a trained checkpoint to reproduce visualizations under `docs/`. The AERI masks are exposed as `iris_mask_logits` / `eyeball_mask_logits` in the forward dict and can be visualised alongside the landmarks + optical axis.
 
 ## Target Metrics (GazeGene benchmark)
 
-| Metric | GazeGene ResNet-18 | RayNet v5 Target | S1 500 spc (reference) |
-|--------|-------------------|------------------|------------------------|
-| Iris 2D (px) | 1.84 | < 1.3 | **2.64** (best E14, 15 ep) |
-| Optical axis (°) | 4.98 | < 4.0 | 42.5° (gaze disabled in S1) |
-| Eyeball 3D (cm) | 0.11 | < 0.09 | — (S2+ only) |
-| Pupil 3D (cm) | 0.15 | < 0.12 | — (S2+ only) |
-| Parameters (M) | 11.7 | ~17 | ~17 |
+| Metric | GazeGene ResNet-18 | RayNet v5 Target |
+|--------|-------------------|------------------|
+| Iris 2D (px) | 1.84 | < 1.3 |
+| Optical axis (°) | 4.98 | < 4.0 |
+| Eyeball 3D (cm) | 0.11 | < 0.09 |
+| Pupil 3D (cm) | 0.15 | < 0.12 |
+| Iris mask IoU | — | > 0.85 (auxiliary) |
+| Eyeball mask IoU | — | > 0.90 (auxiliary) |
+| Parameters (M) | 11.7 | ~18.7 |
 
-The "S1 500 spc (reference)" column is from `docs/experiments/raynet_v5_500_samples_per_subject/` (Stage 1, `--samples_per_subject 500`, 15 epochs, `kaggle_t4x2`). Stage 2 (eye-crop gaze) runs from there.
+The S1 500-spc reference from the prior Quad-M1 design (`docs/experiments/raynet_v5_500_samples_per_subject/`, `val_landmark_px` = 2.64 at best epoch 14) is the landmark-accuracy baseline to beat under the new architecture.

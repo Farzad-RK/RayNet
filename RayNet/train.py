@@ -1387,13 +1387,26 @@ def _create_mds_mv_loader(args, hw):
     """
     from RayNet.streaming.dataset import create_multiview_streaming_dataloaders
 
-    # Same augmentation as single-view loader (train only)
     from torchvision import transforms as T
+
+    # Normalize to ImageNet stats (applied to BOTH train and val so that
+    # the shared stem's BN running_mean/var — calibrated on ColorJitter'd
+    # training images — match the activation scale seen at val time.
+    # Without this, the jitter ±40% brightness/contrast widens the training
+    # pixel variance relative to clean val images; the stem's BN running_var
+    # grows to absorb that extra variance, then attenuates clean val
+    # activations by the corresponding factor — degrading both landmark and
+    # gaze metrics progressively with each epoch.
+    normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225])
+
     train_transform = T.Compose([
         T.ColorJitter(brightness=0.4, contrast=0.4,
                       saturation=0.2, hue=0.1),
         T.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+        normalize,
     ])
+    val_transform = normalize
 
     print("Creating multi-view MDS streaming loaders (train + val)...")
     train_loader_mv, val_loader_mv = create_multiview_streaming_dataloaders(
@@ -1403,6 +1416,7 @@ def _create_mds_mv_loader(args, hw):
         mv_groups=hw['mv_groups'],
         num_workers=hw['num_workers'],
         transform=train_transform,
+        val_transform=val_transform,
         pin_memory=hw['pin_memory'],
         prefetch_factor=hw['prefetch_factor'],
         persistent_workers=hw['persistent_workers'],
