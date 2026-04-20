@@ -44,6 +44,8 @@ MDS_COLUMNS = {
     'head_t': 'ndarray',
     'gaze_target': 'ndarray',
     'gaze_depth': 'float32',
+    'iris_mask': 'ndarray',       # (56, 56) uint8 {0, 255} — AERI iris GT
+    'eyeball_mask': 'ndarray',    # (56, 56) uint8 {0, 255} — AERI eyeball GT
     'subject': 'int',
     'cam_id': 'int',
     'frame_idx': 'int',
@@ -69,6 +71,8 @@ def _sample_to_mds(sample):
         'head_t': sample['head_t'].numpy(),
         'gaze_target': sample['gaze_target'].numpy(),
         'gaze_depth': float(sample['gaze_depth']),
+        'iris_mask': sample['iris_mask'].numpy(),
+        'eyeball_mask': sample['eyeball_mask'].numpy(),
         'subject': sample['subject'],
         'cam_id': sample['cam_id'],
         'frame_idx': sample['frame_idx'],

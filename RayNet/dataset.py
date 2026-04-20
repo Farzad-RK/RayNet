@@ -27,9 +27,13 @@ from collections import defaultdict
 import random
 
 from RayNet.kappa import build_R_kappa
+from RayNet.streaming.eye_masks import render_all_masks, extract_subject_attrs
 
 # Indices to subsample 100 iris points down to 10 evenly-spaced points
 IRIS_SUBSAMPLE_IDX = list(range(0, 100, 10))  # [0, 10, 20, ..., 90]
+
+# AERI mask spatial resolution (matches P2 feature map: stride-4 of 224)
+MASK_SIZE = 56
 
 
 def _intrinsic_delta_bbox(K_orig, K_crop_native, crop_w, crop_h):
@@ -335,6 +339,17 @@ class GazeGeneDataset(Dataset):
         else:
             R_kappa = np.eye(3, dtype=np.float64)
 
+        # --- AERI binary masks (iris + eyeball at stride-4 resolution) ---
+        # Native iris contour size matches the raw JPG before resize; the
+        # renderer rescales from native_size → img_size internally, then
+        # area-downsamples from img_size → MASK_SIZE.
+        subj_attrs_mask = extract_subject_attrs(subject_attrs, eye_idx)
+        iris_mask_np, eyeball_mask_np = render_all_masks(
+            iris_2d, t_eye, t_pupil, intrinsic_cropped,
+            subject_attrs=subj_attrs_mask,
+            face_size=self.img_size, native_size=orig_w,
+            out_size=MASK_SIZE)
+
         # --- Convert image to tensor (uint8, normalized in train.py) ---
         img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
         img_tensor = torch.from_numpy(img_rgb.transpose(2, 0, 1)).contiguous()
@@ -366,6 +381,8 @@ class GazeGeneDataset(Dataset):
             # GazeGene gaze labels
             'gaze_target': torch.from_numpy(gaze_target).float(),           # (3,) 3D target, CCS
             'gaze_depth': torch.tensor(gaze_depth).float(),                 # scalar, vergence depth
+            'iris_mask': torch.from_numpy(iris_mask_np),                    # (56, 56) uint8 {0, 255}
+            'eyeball_mask': torch.from_numpy(eyeball_mask_np),              # (56, 56) uint8 {0, 255}
             'subject': subj_num,
             'cam_id': s['cam_id'],
             'frame_idx': s['frame_idx'],
@@ -436,7 +453,8 @@ def gazegene_collate_fn(batch):
                    'K', 'intrinsic_original', 'face_bbox_gt',
                    'R_cam', 'T_cam', 'head_R', 'head_t',
                    'eyeball_center_3d', 'pupil_center_3d',
-                   'gaze_target', 'gaze_depth']
+                   'gaze_target', 'gaze_depth',
+                   'iris_mask', 'eyeball_mask']
     scalar_keys = ['subject', 'cam_id', 'frame_idx']
 
     for key in tensor_keys:

@@ -116,6 +116,12 @@ class StreamingGazeGeneDataset(_Base):
             'gaze_depth': torch.tensor(
                 float(raw['gaze_depth']), dtype=torch.float32)
                 if 'gaze_depth' in raw else torch.tensor(0.0),
+            'iris_mask': torch.from_numpy(
+                np.ascontiguousarray(raw['iris_mask']))
+                if 'iris_mask' in raw else torch.zeros(56, 56, dtype=torch.uint8),
+            'eyeball_mask': torch.from_numpy(
+                np.ascontiguousarray(raw['eyeball_mask']))
+                if 'eyeball_mask' in raw else torch.zeros(56, 56, dtype=torch.uint8),
             'subject': int(raw['subject']),
             'cam_id': int(raw['cam_id']),
             'frame_idx': int(raw['frame_idx']),
@@ -167,6 +173,7 @@ def _collate_fn(batch):
         'K', 'intrinsic_original', 'face_bbox_gt',
         'R_cam', 'T_cam', 'eyeball_center_3d', 'pupil_center_3d',
         'head_R', 'head_t', 'gaze_target', 'gaze_depth',
+        'iris_mask', 'eyeball_mask',
     ]
     scalar_keys = ['subject', 'cam_id', 'frame_idx']
 

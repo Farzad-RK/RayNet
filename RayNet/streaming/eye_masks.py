@@ -182,6 +182,33 @@ def render_all_masks(iris_mesh_2d, eyeball_center_3d, pupil_center_3d, K,
 # Containment / consistency metrics for the debug script
 # ---------------------------------------------------------------------
 
+def extract_subject_attrs(attr_entry, eye_idx):
+    """Pull per-eye (eyeball_radius, cornea_radius, cornea2center) from
+    a GazeGene subject_label.pkl entry.
+
+    Each attribute may be scalar, (L, R) pair, or missing. Values land
+    in the dict shape expected by `render_all_masks` (same keys, all in
+    centimetres). Missing keys are simply absent — callers fall back to
+    the DEFAULT_* constants.
+    """
+    if not attr_entry:
+        return {}
+    out = {}
+    for key in ('eyeball_radius', 'cornea_radius', 'cornea2center'):
+        v = attr_entry.get(key)
+        if v is None:
+            continue
+        try:
+            arr = np.asarray(v, dtype=np.float64).ravel()
+        except (TypeError, ValueError):
+            continue
+        if arr.size >= 2:
+            out[key] = float(arr[eye_idx])
+        elif arr.size == 1:
+            out[key] = float(arr[0])
+    return out
+
+
 def mask_stats(iris, eyeball):
     """Per-sample statistics on an (iris, eyeball) pair."""
     iris_b = iris > 0
