@@ -1,34 +1,42 @@
 """
 Anatomical Eye Region Isolation (AERI) mask generation.
 
-Given GazeGene per-sample ground truth, render three binary masks
-aligned with the 224x224 face crop, downsampled to 56x56 for shard
-storage and segmentation-head supervision:
+Given GazeGene per-sample ground truth + per-subject anatomical
+attributes, render two binary masks aligned with the 224x224 face crop
+and downsampled to 56x56 for shard storage and segmentation-head
+supervision:
 
   - iris_mask    : closed polygon from the 100-point iris_mesh_2D.
-  - pupil_mask   : disk at pupil_center_2D with radius inferred from
-                   the 4 iris landmarks closest to the pupil center.
   - eyeball_mask : tangent-cone silhouette of the 3D eyeball sphere
-                   projected through K. Theoretical (no eyelid clip),
-                   so occluded sclera IS included — this is deliberate
-                   (the model must learn to look *through* occlusion).
+                   UNION the cornea-sphere silhouette, both projected
+                   through K. Theoretical (no eyelid clip) — occluded
+                   sclera IS included, which is deliberate: the model
+                   must learn to look through eyelid/nose occlusion.
 
-All masks are rasterized at the full 224 pixel grid and then area-
-downsampled to 56, which gives smoother edges than drawing directly at
-56 (iris is ~4 px across at 56, so a single-pixel rasterization error
-is a 25% IoU hit).
+Pupil is supervised through the 3D pupil_center_3d L1 head; at 56x56 a
+2-4 mm pupil projects to ~1 px of mask which carries no useful
+segmentation signal, so no separate pupil mask is rendered.
+
+Subject-specific anatomy (from GazeGene subject_label.pkl) replaces the
+old hard-coded 12 mm eyeball — the dataset provides per-subject
+eyeball_radius / cornea_radius / cornea2center in centimetres, and the
+cornea bulge is the reason the iris silhouette poked outside the plain
+eyeball silhouette in the first debug run.
+
+All masks are rasterized at 224 and then area-downsampled to 56, which
+gives smoother edges than drawing directly at 56 (iris is ~4 px across
+at 56, so a single-pixel rasterization error is a 25% IoU hit).
 
 Coordinate conventions:
-  - iris_mesh_2D and pupil_center_2D as shipped in GazeGene are in the
-    native 448x448 crop frame. Callers pass `native_size` so masks come
-    out in the requested rendering frame.
-  - K is the intrinsic matrix already rescaled to `face_size` (224 by
-    default in this repo — see dataset.py line 272-275).
-  - eyeball_center_3d is in CCS (camera coordinate system), centimeters,
-    which is the GazeGene convention.
-
-Anatomical constants:
-  - EYEBALL_RADIUS_CM = 1.2  (adult eyeball radius ≈ 12 mm)
+  - iris_mesh_2D as shipped in GazeGene is in the native 448x448 crop
+    frame. Callers pass `native_size` so masks come out in the
+    requested rendering frame.
+  - K is the intrinsic matrix already rescaled to `face_size` (see
+    dataset.py line 272-275).
+  - eyeball_center_3d and pupil_center_3d are in CCS (camera
+    coordinate system), centimetres, per the dataset README:
+    "any physically meaningful labels in the dataset are measured in
+    centimeters".
 """
 
 from __future__ import annotations
@@ -37,7 +45,11 @@ import numpy as np
 import cv2
 
 
-EYEBALL_RADIUS_CM = 1.2
+# Fallback radius if subject_label.pkl is missing (e.g. streaming shard
+# that doesn't carry attrs). Typical adult eyeball ≈ 1.2 cm.
+DEFAULT_EYEBALL_RADIUS_CM = 1.2
+DEFAULT_CORNEA_RADIUS_CM = 0.8
+DEFAULT_CORNEA_OFFSET_CM = 0.55
 
 
 # ---------------------------------------------------------------------
@@ -65,181 +77,162 @@ def render_iris_mask(iris_mesh_2d, face_size=224, native_size=448,
 
 
 # ---------------------------------------------------------------------
-# Pupil disk mask
+# Eyeball silhouette mask (two-sphere: eyeball ∪ cornea)
 # ---------------------------------------------------------------------
 
-def render_pupil_mask(pupil_center_2d, iris_mesh_2d,
-                      face_size=224, native_size=448, out_size=56):
+def render_eyeball_mask(eyeball_center_3d, K,
+                        pupil_center_3d=None,
+                        eyeball_radius_cm=DEFAULT_EYEBALL_RADIUS_CM,
+                        cornea_radius_cm=DEFAULT_CORNEA_RADIUS_CM,
+                        cornea_offset_cm=DEFAULT_CORNEA_OFFSET_CM,
+                        face_size=224, out_size=56,
+                        n_samples=96):
     """
-    Rasterize a pupil disk centred on `pupil_center_2d`.
+    Project the eyeball + cornea silhouettes and return their UNION.
 
-    Radius is estimated as the mean distance from the pupil center to
-    its 4 nearest iris-mesh points — matching the 4-pupil-boundary
-    selection already done by dataset.py so the disk boundary is
-    consistent with the 4 pupil landmarks the model also learns.
+    Anatomy:
+        The human eyeball isn't a single sphere. A ~12 mm main sphere
+        is centred at `eyeball_center_3d`; a smaller ~8 mm cornea
+        sphere sits forward along the optical axis, offset by
+        `cornea2center` (~5.5 mm) from the eyeball center. The iris
+        contour lives on the cornea surface, which is why a single-
+        sphere silhouette with radius 12 mm clipped the iris at extreme
+        angles. The two-sphere union matches the true silhouette.
+
+    The optical axis direction is derived from
+        axis_hat = normalize(pupil_center_3d - eyeball_center_3d)
+    which is the same geometric definition used by GeometricGazeHead.
+    If `pupil_center_3d` is None, the cornea sphere is skipped and this
+    reduces to a plain single-sphere silhouette.
 
     Args:
-        pupil_center_2d : (2,)   pupil center in `native_size` px.
-        iris_mesh_2d    : (100, 2) iris contour points in `native_size` px
-                           (used to infer the pupil radius).
-        face_size       : see render_iris_mask.
-        native_size     : see render_iris_mask.
-        out_size        : see render_iris_mask.
+        eyeball_center_3d : (3,) CCS, centimetres.
+        K                 : (3, 3) intrinsic matrix rescaled to
+                             `face_size` pixel space.
+        pupil_center_3d   : (3,) CCS, centimetres. Used to orient the
+                             cornea offset direction. Pass None to
+                             disable cornea rendering.
+        eyeball_radius_cm : subject-specific eyeball radius.
+        cornea_radius_cm  : subject-specific cornea radius.
+        cornea_offset_cm  : distance from eyeball center to cornea
+                             center along the optical axis.
+        face_size         : render resolution before downsampling.
+        out_size          : final mask resolution.
+        n_samples         : silhouette-circle sample count per sphere.
 
     Returns:
         (out_size, out_size) uint8 mask in {0, 255}.
     """
-    scale = face_size / native_size
-    c_native = np.asarray(pupil_center_2d, dtype=np.float64)
-    iris_native = np.asarray(iris_mesh_2d, dtype=np.float64)
-    dists = np.linalg.norm(iris_native - c_native[None, :], axis=1)
-    r_native = float(np.mean(np.sort(dists)[:4]))
-
-    c_px = c_native * scale
-    r_px = r_native * scale
+    eyeball_center_3d = np.asarray(eyeball_center_3d, dtype=np.float64)
+    K = np.asarray(K, dtype=np.float64)
 
     mask = np.zeros((face_size, face_size), dtype=np.uint8)
-    cv2.circle(mask, (int(round(c_px[0])), int(round(c_px[1]))),
-               int(round(r_px)), 255, thickness=-1)
+    _draw_sphere_silhouette(
+        mask, eyeball_center_3d, eyeball_radius_cm, K, n_samples)
+
+    if pupil_center_3d is not None and cornea_radius_cm > 0:
+        pupil_center_3d = np.asarray(pupil_center_3d, dtype=np.float64)
+        axis = pupil_center_3d - eyeball_center_3d
+        axis_norm = float(np.linalg.norm(axis))
+        if axis_norm > 1e-6:
+            axis_hat = axis / axis_norm
+            cornea_center = eyeball_center_3d + cornea_offset_cm * axis_hat
+            _draw_sphere_silhouette(
+                mask, cornea_center, cornea_radius_cm, K, n_samples)
+
     return _downsample(mask, out_size)
 
 
 # ---------------------------------------------------------------------
-# Eyeball sphere silhouette mask
+# Combined entry point
 # ---------------------------------------------------------------------
 
-def render_eyeball_mask(eyeball_center_3d, K,
-                        face_size=224, out_size=56,
-                        radius_cm=EYEBALL_RADIUS_CM,
-                        n_samples=96):
+def render_all_masks(iris_mesh_2d, eyeball_center_3d, pupil_center_3d, K,
+                     subject_attrs=None,
+                     face_size=224, native_size=448, out_size=56):
     """
-    Project the 3D eyeball sphere's silhouette circle through K.
+    Render (iris, eyeball) for one sample.
 
-    Geometry (view from camera origin looking down +Z):
-      Let C be the sphere center in CCS, d = |C|, r = radius. The set of
-      points on the sphere that are tangent to rays from the origin form
-      a circle (the "limb" of the sphere as seen from that viewpoint).
-      Call it the silhouette circle; it lies in the plane perpendicular
-      to C, centered at
-
-          C_sil = C * (d^2 - r^2) / d^2
-
-      with radius
-
-          r_sil = r * sqrt(1 - (r/d)^2).
-
-      Projecting this circle through K yields (in general) an ellipse in
-      the image plane. We sample the circle at `n_samples` angles and
-      rasterize the resulting projected polygon with cv2.fillPoly, which
-      is exact to ≈1 pixel for n_samples ≥ 48.
-
-    Args:
-        eyeball_center_3d : (3,) CCS center in centimetres.
-        K                 : (3, 3) intrinsic matrix already rescaled to
-                             `face_size` pixel space.
-        face_size         : render resolution before downsampling.
-        out_size          : final mask resolution.
-        radius_cm         : eyeball radius (default 1.2 cm).
-        n_samples         : silhouette-circle sample count.
+    If `subject_attrs` is a dict with keys 'eyeball_radius',
+    'cornea_radius', 'cornea2center' (as per GazeGene subject_label.pkl),
+    those override the defaults. Missing keys fall back to the
+    DEFAULT_* constants defined at module top.
 
     Returns:
-        (out_size, out_size) uint8 mask in {0, 255}. Returns an all-zero
-        mask if the sphere contains the camera (d <= r, degenerate).
+        (iris_mask, eyeball_mask) as uint8 {0, 255} at out_size.
     """
-    C = np.asarray(eyeball_center_3d, dtype=np.float64)
-    K = np.asarray(K, dtype=np.float64)
-    d = float(np.linalg.norm(C))
-    if d <= radius_cm:
-        return np.zeros((out_size, out_size), dtype=np.uint8)
-
-    # Silhouette circle in 3D
-    ratio_sq = (radius_cm / d) ** 2
-    C_sil = C * (1.0 - ratio_sq)
-    r_sil = radius_cm * float(np.sqrt(1.0 - ratio_sq))
-
-    # Orthonormal basis for the silhouette plane (perpendicular to C_hat)
-    C_hat = C / d
-    helper = (np.array([1.0, 0.0, 0.0]) if abs(C_hat[0]) < 0.9
-              else np.array([0.0, 1.0, 0.0]))
-    u = np.cross(C_hat, helper)
-    u /= np.linalg.norm(u)
-    v = np.cross(C_hat, u)
-
-    theta = np.linspace(0.0, 2.0 * np.pi, n_samples, endpoint=False)
-    circle_3d = (C_sil[None, :]
-                 + r_sil * (np.cos(theta)[:, None] * u[None, :]
-                            + np.sin(theta)[:, None] * v[None, :]))
-
-    # Project each point: K @ P_ccs, then divide by z.
-    proj = circle_3d @ K.T        # (n_samples, 3)
-    pts_2d = proj[:, :2] / proj[:, 2:3]
-
-    mask = np.zeros((face_size, face_size), dtype=np.uint8)
-    cv2.fillPoly(mask, [np.round(pts_2d).astype(np.int32)], 255)
-    return _downsample(mask, out_size)
-
-
-# ---------------------------------------------------------------------
-# Combined
-# ---------------------------------------------------------------------
-
-def render_all_masks(iris_mesh_2d, pupil_center_2d, eyeball_center_3d, K,
-                     face_size=224, native_size=448, out_size=56):
-    """Convenience wrapper — returns (iris, pupil, eyeball) at out_size."""
-    iris = render_iris_mask(iris_mesh_2d,
-                            face_size=face_size,
-                            native_size=native_size,
-                            out_size=out_size)
-    pupil = render_pupil_mask(pupil_center_2d, iris_mesh_2d,
-                              face_size=face_size,
-                              native_size=native_size,
-                              out_size=out_size)
-    eyeball = render_eyeball_mask(eyeball_center_3d, K,
-                                  face_size=face_size,
-                                  out_size=out_size)
-    return iris, pupil, eyeball
+    a = subject_attrs or {}
+    iris = render_iris_mask(
+        iris_mesh_2d,
+        face_size=face_size, native_size=native_size, out_size=out_size)
+    eyeball = render_eyeball_mask(
+        eyeball_center_3d, K,
+        pupil_center_3d=pupil_center_3d,
+        eyeball_radius_cm=float(a.get('eyeball_radius',
+                                      DEFAULT_EYEBALL_RADIUS_CM)),
+        cornea_radius_cm=float(a.get('cornea_radius',
+                                     DEFAULT_CORNEA_RADIUS_CM)),
+        cornea_offset_cm=float(a.get('cornea2center',
+                                     DEFAULT_CORNEA_OFFSET_CM)),
+        face_size=face_size, out_size=out_size)
+    return iris, eyeball
 
 
 # ---------------------------------------------------------------------
 # Containment / consistency metrics for the debug script
 # ---------------------------------------------------------------------
 
-def mask_stats(iris, pupil, eyeball):
-    """
-    Per-sample statistics on a (iris, pupil, eyeball) triple.
-
-    Returns a dict with:
-      - iris_area_frac, pupil_area_frac, eyeball_area_frac :
-            fraction of mask pixels that are foreground.
-      - pupil_in_iris_frac    : fraction of pupil pixels inside iris.
-      - iris_in_eyeball_frac  : fraction of iris pixels inside eyeball.
-      - pupil_over_iris_ratio : pupil_area / iris_area (anatomical
-            expected range 0.05 – 0.30).
-    """
+def mask_stats(iris, eyeball):
+    """Per-sample statistics on an (iris, eyeball) pair."""
     iris_b = iris > 0
-    pupil_b = pupil > 0
     eyeball_b = eyeball > 0
     n = iris.size
-
     iris_n = int(iris_b.sum())
-    pupil_n = int(pupil_b.sum())
     eyeball_n = int(eyeball_b.sum())
-
     return {
         'iris_area_frac': iris_n / n,
-        'pupil_area_frac': pupil_n / n,
         'eyeball_area_frac': eyeball_n / n,
-        'pupil_in_iris_frac': (
-            float((pupil_b & iris_b).sum()) / max(pupil_n, 1)),
         'iris_in_eyeball_frac': (
             float((iris_b & eyeball_b).sum()) / max(iris_n, 1)),
-        'pupil_over_iris_ratio': pupil_n / max(iris_n, 1),
     }
 
 
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
+
+def _draw_sphere_silhouette(mask, center_3d, radius_cm, K, n_samples):
+    """In-place: fill the silhouette polygon of one sphere onto `mask`.
+
+    Geometry:
+        Tangent cone from camera origin to a sphere of radius r at
+        center C (|C| = d) has half-angle α with sin α = r/d. The
+        tangent points lie on a circle perpendicular to C at distance
+        (d^2 - r^2)/d, with radius r * sqrt(1 - (r/d)^2). Project that
+        circle through K, fill the polygon.
+    """
+    d = float(np.linalg.norm(center_3d))
+    if d <= radius_cm:
+        return
+    ratio_sq = (radius_cm / d) ** 2
+    c_sil = center_3d * (1.0 - ratio_sq)
+    r_sil = radius_cm * float(np.sqrt(1.0 - ratio_sq))
+
+    c_hat = center_3d / d
+    helper = (np.array([1.0, 0.0, 0.0]) if abs(c_hat[0]) < 0.9
+              else np.array([0.0, 1.0, 0.0]))
+    u = np.cross(c_hat, helper)
+    u /= np.linalg.norm(u)
+    v = np.cross(c_hat, u)
+
+    theta = np.linspace(0.0, 2.0 * np.pi, n_samples, endpoint=False)
+    circle_3d = (c_sil[None, :]
+                 + r_sil * (np.cos(theta)[:, None] * u[None, :]
+                            + np.sin(theta)[:, None] * v[None, :]))
+    proj = circle_3d @ K.T
+    pts_2d = proj[:, :2] / proj[:, 2:3]
+    cv2.fillPoly(mask, [np.round(pts_2d).astype(np.int32)], 255)
+
 
 def _downsample(mask224, out_size):
     """Area-interp downsample then rebinarize — smoother than drawing
