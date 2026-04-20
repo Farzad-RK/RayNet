@@ -298,6 +298,26 @@ def geometric_angular_loss(pred_eyeball, pred_pupil, gt_optical_axis):
     return angle.mean()
 
 
+def mask_seg_loss(pred_logits, gt_mask_uint8):
+    """
+    Binary segmentation BCE-with-logits for AERI iris / eyeball masks.
+
+    GT masks are stored as uint8 {0, 255} in the shards (see
+    RayNet.streaming.eye_masks). They're normalised to float {0, 1} here
+    before BCE. Pred shape (B, H, W), GT shape (B, H, W); both are
+    single-channel binary masks at 56x56.
+
+    Args:
+        pred_logits: (B, H, W) raw logits from AERIHead.
+        gt_mask_uint8: (B, H, W) GT mask in uint8 {0, 255}.
+
+    Returns:
+        loss: scalar BCE-with-logits (mean over all pixels).
+    """
+    gt = gt_mask_uint8.to(pred_logits.dtype) / 255.0
+    return F.binary_cross_entropy_with_logits(pred_logits, gt)
+
+
 def angular_error(pred_gaze, gt_gaze):
     """
     Angular error in radians between predicted and GT gaze vectors.
@@ -338,6 +358,11 @@ def total_loss(
     pred_pose_6d=None, gt_head_R=None,
     lam_trans=0.0,
     pred_pose_t=None, gt_head_t=None,
+    # AERI segmentation (iris + eyeball binary masks @ 56x56)
+    lam_iris_seg=0.0,
+    pred_iris_mask_logits=None, gt_iris_mask=None,
+    lam_eyeball_seg=0.0,
+    pred_eyeball_mask_logits=None, gt_eyeball_mask=None,
 ):
     """
     Total training loss: landmarks + gaze + GazeGene 3D structure + pose.
@@ -421,6 +446,19 @@ def total_loss(
         trans = translation_loss(pred_pose_t, gt_head_t)
         total = total + lam_trans * trans
         components['translation_loss'] = trans.detach()
+
+    # AERI segmentation losses (iris + eyeball masks, BCE-with-logits @ 56x56)
+    if (lam_iris_seg > 0 and pred_iris_mask_logits is not None
+            and gt_iris_mask is not None):
+        iris_seg = mask_seg_loss(pred_iris_mask_logits, gt_iris_mask)
+        total = total + lam_iris_seg * iris_seg
+        components['iris_seg_loss'] = iris_seg.detach()
+
+    if (lam_eyeball_seg > 0 and pred_eyeball_mask_logits is not None
+            and gt_eyeball_mask is not None):
+        eyeball_seg = mask_seg_loss(pred_eyeball_mask_logits, gt_eyeball_mask)
+        total = total + lam_eyeball_seg * eyeball_seg
+        components['eyeball_seg_loss'] = eyeball_seg.detach()
 
     components['landmark_loss'] *= 1.0 / (feat_H * feat_W)
     components['total_loss'] = total.detach()
