@@ -303,7 +303,7 @@ class AERIHead(nn.Module):
         logits = self.head(d1)                # (B, 2, 56, 56)
         iris = logits[:, 0]                   # (B, 56, 56)
         eyeball = logits[:, 1]
-        return iris, eyeball
+        return iris, eyeball, d1
 
 
 # ─── Gaze Fusion + Geometric Head ───────────────────────────────────
@@ -397,6 +397,9 @@ class GazeBranch(nn.Module):
         self.coord_att = CoordinateAttention(384)
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.proj = nn.Linear(384, d_model)
+        # Mask-Weighted Foveal Pooling
+        # 384 (global context from s3) + 48 (foveal precision from d1) = 432
+        self.proj = nn.Linear(384 + 48, d_model)
 
         self.fusion_block = GazeFusionBlock(d_model)
         self.head = GeometricGazeHead(d_model)
@@ -405,20 +408,44 @@ class GazeBranch(nn.Module):
                 cross_view_attn=None, n_views=1, cam_embed=None):
         gaze_s2, gaze_s3 = self.encoder(s1_detached)
 
-        iris_logits, eyeball_logits = self.aeri(
+        # iris_logits, eyeball_logits = self.aeri(
+        #     s0_detached, s1_detached, gaze_s2, gaze_s3)
+        #
+        #
+        # # AERI attention on the 7x7 bottleneck. Downsample the 56x56
+        # # eyeball sigmoid to 7x7 via area-average, apply baseline +
+        # # foreground scaling so the background still contributes 25%
+        # # (prevents zero-mask collapse early in training when AERI is
+        # # still random).
+        # eye_attn_56 = torch.sigmoid(eyeball_logits).unsqueeze(1)
+        # eye_attn_7 = F.adaptive_avg_pool2d(eye_attn_56, 7)
+        # gaze_s3 = gaze_s3 * (0.25 + 0.75 * eye_attn_7)
+        #
+        # feat = self.coord_att(gaze_s3)
+        # gaze_feat = self.proj(self.pool(feat).flatten(1))
+        # 1. Unpack d1 from AERI
+        iris_logits, eyeball_logits, d1 = self.aeri(
             s0_detached, s1_detached, gaze_s2, gaze_s3)
 
-        # AERI attention on the 7x7 bottleneck. Downsample the 56x56
-        # eyeball sigmoid to 7x7 via area-average, apply baseline +
-        # foreground scaling so the background still contributes 25%
-        # (prevents zero-mask collapse early in training when AERI is
-        # still random).
+        # 2. Create the 56x56 probability mask
         eye_attn_56 = torch.sigmoid(eyeball_logits).unsqueeze(1)
+
+        # 3. Apply global attention to the 7x7 bottleneck (keep existing logic)
         eye_attn_7 = F.adaptive_avg_pool2d(eye_attn_56, 7)
         gaze_s3 = gaze_s3 * (0.25 + 0.75 * eye_attn_7)
 
+        # 4. Extract Global Features (1D vector)
         feat = self.coord_att(gaze_s3)
-        gaze_feat = self.proj(self.pool(feat).flatten(1))
+        global_feat = self.pool(feat).flatten(1)  # Shape: (B, 384)
+
+        # 5. Extract Foveal Features (The SOTA Fix)
+        # Multiply high-res d1 by the eye mask to remove background noise
+        foveal_map = d1 * eye_attn_56  # Shape: (B, 48, 56, 56)
+        foveal_feat = self.pool(foveal_map).flatten(1)  # Shape: (B, 48)
+
+        # 6. Fuse and Project
+        fused_feat = torch.cat([global_feat, foveal_feat], dim=1)  # Shape: (B, 432)
+        gaze_feat = self.proj(fused_feat)  # Shape: (B, d_model)
 
         # pooled_sv is the pre-CrossViewAttention (single-view) representation.
         # Returned separately so the training loop can supervise the single-view
