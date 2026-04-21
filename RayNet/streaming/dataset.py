@@ -72,7 +72,7 @@ class StreamingGazeGeneDataset(_Base):
         img_np = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
 
         # 4. Convert to Torch Tensor (H, W, C) -> (C, H, W)
-        img = torch.from_numpy(img_np).permute(2, 0, 1).contiguous()
+        img = torch.from_numpy(img_np).permute(2, 0, 1).contiguous().float().div(255.0)
 
         if self.transform is not None:
             img = self.transform(img)

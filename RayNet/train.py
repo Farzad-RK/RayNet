@@ -280,7 +280,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
             continue
 
         # UINT 8 to tensor of floats normalized from 0.0 to 1.0
-        images = batch['image'].to(device, non_blocking=True).float().div_(255.0)
+        images = batch['image'].to(device, non_blocking=True)
         gt_landmarks = batch['landmark_coords'].to(device, non_blocking=True)
         gt_optical_axis = batch['optical_axis'].to(device, non_blocking=True)
 
@@ -552,7 +552,7 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
         if not batch:
             continue
 
-        images = batch['image'].to(device, non_blocking=True).float().div_(255.0)
+        images = batch['image'].to(device, non_blocking=True)
         gt_landmarks = batch['landmark_coords'].to(device, non_blocking=True)
         gt_optical_axis = batch['optical_axis'].to(device, non_blocking=True)
         gt_landmarks_px = batch['landmark_coords_px'].to(device, non_blocking=True)
