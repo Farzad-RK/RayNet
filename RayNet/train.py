@@ -117,6 +117,7 @@ PHASE_CONFIG = {
         'epochs': (9, 16),
         'lam_lm': 1.0,
         'lam_gaze': 1.0,
+        'lam_gaze_sv': 0.3,   # single-view pathway supervision (pre-CrossViewAttn)
         'lam_eyeball': 0.5,
         'lam_pupil': 0.5,
         'lam_geom_angular': 0.2,
@@ -133,15 +134,19 @@ PHASE_CONFIG = {
         'description': 'V5-P2: full losses + multi-view consistency',
     },
     # ---- Phase 3: fine-tune — reduced LR, gaze emphasis ----
+    # lam_reproj=0: gaze_consist hit its kappa-angle floor (~0.174) in P2 and
+    # is now generating wrong gradients that bias predictions toward the
+    # kappa-averaged mean direction. Disabling it removes that interference.
     3: {
         'epochs': (17, 25),
         'lam_lm': 0.5,
         'lam_gaze': 1.0,
+        'lam_gaze_sv': 0.5,   # higher SV weight in fine-tune to close train/val gap
         'lam_eyeball': 0.5,
         'lam_pupil': 0.5,
         'lam_geom_angular': 0.3,
         'lam_ray': 0.3,
-        'lam_reproj': 0.1,
+        'lam_reproj': 0.0,    # disabled: gaze_consist floor causes wrong gradients
         'lam_mask': 0.05,
         'lam_pose': 0.5,
         'lam_trans': 0.5,
@@ -150,7 +155,7 @@ PHASE_CONFIG = {
         'lr': 1e-4,
         'sigma': 1.0,
         'multiview': True,
-        'description': 'V5-P3: fine-tune (lower LR, gaze emphasis)',
+        'description': 'V5-P3: fine-tune (lower LR, gaze emphasis, no gaze_consist)',
     },
 }
 
@@ -356,6 +361,18 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                 pred_eyeball_mask_logits=predictions.get('eyeball_mask_logits'),
                 gt_eyeball_mask=gt_eyeball_mask,
             )
+
+            # Single-view pathway supervision: direct gaze L1 on pre-CrossViewAttn
+            # features so the GeometricGazeHead is also optimized for val
+            # (which bypasses CrossViewAttention entirely).
+            lam_gaze_sv = cfg.get('lam_gaze_sv', 0.0)
+            if lam_gaze_sv > 0:
+                gaze_sv = predictions.get('gaze_vector_sv')
+                if gaze_sv is not None:
+                    from RayNet.losses import gaze_loss as _gaze_loss
+                    sv_loss = _gaze_loss(gaze_sv, gt_optical_axis)
+                    if torch.isfinite(sv_loss):
+                        loss = loss + lam_gaze_sv * sv_loss
 
             # Multi-view consistency loss (Phase 2+)
             # Ray-based: works with unit gaze vectors, numerically stable.

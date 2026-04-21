@@ -420,15 +420,28 @@ class GazeBranch(nn.Module):
         feat = self.coord_att(gaze_s3)
         gaze_feat = self.proj(self.pool(feat).flatten(1))
 
-        pooled = self.fusion_block(gaze_feat, pose_feat)
+        # pooled_sv is the pre-CrossViewAttention (single-view) representation.
+        # Returned separately so the training loop can supervise the single-view
+        # pathway directly, preventing val degradation from CrossViewAttention
+        # train/val asymmetry (train uses 9-view fusion; val bypasses it).
+        pooled_sv = self.fusion_block(gaze_feat, pose_feat)
 
+        pooled = pooled_sv
         if cross_view_attn is not None:
-            pooled = cross_view_attn(pooled, n_views, cam_embed)
+            pooled = cross_view_attn(pooled_sv, n_views, cam_embed)
 
         eyeball_center, pupil_center, optical_axis, gaze_angles = \
             self.head(pooled)
+
+        # Single-view gaze prediction (no CrossViewAttention).
+        # Only computed when multi-view fusion is actually active (n_views > 1)
+        # so there is no overhead in single-view inference / validation.
+        sv_optical_axis = None
+        if n_views > 1:
+            _, _, sv_optical_axis, _ = self.head(pooled_sv)
+
         return (eyeball_center, pupil_center, optical_axis, gaze_angles,
-                iris_logits, eyeball_logits)
+                iris_logits, eyeball_logits, sv_optical_axis)
 
 
 # ─── Pose Branch (now fuses BoxEncoder) ────────────────────────────
@@ -581,12 +594,15 @@ class RayNetV5(nn.Module):
             s1.detach(), face_bbox=face_bbox)
 
         # Gaze branch — gradient-isolated + AERI attention.
+        # pose_feat is detached before cam_embed so gaze loss cannot
+        # backpropagate into pose_branch through this side path.
         cam_embed = None
         if R_cam is not None and T_cam is not None:
-            cam_embed = self.camera_embedding(R_cam, T_cam) + pose_feat
+            cam_embed = self.camera_embedding(R_cam, T_cam) + pose_feat.detach()
 
         (eyeball_center, pupil_center, optical_axis, gaze_angles,
-         iris_mask_logits, eyeball_mask_logits) = self.gaze_branch(
+         iris_mask_logits, eyeball_mask_logits,
+         sv_optical_axis) = self.gaze_branch(
             s0.detach(), s1.detach(), pose_feat,
             cross_view_attn=self.cross_view_attn,
             n_views=n_views,
@@ -605,6 +621,8 @@ class RayNetV5(nn.Module):
             'pupil_center': pupil_center,              # (B, 3) cm, CCS
             'gaze_vector': optical_axis,               # (B, 3) unit
             'gaze_angles': gaze_angles,                # (B, 2) pitch/yaw
+            # Single-view gaze (pre-CrossViewAttention); None when n_views==1
+            'gaze_vector_sv': sv_optical_axis,         # (B, 3) unit or None
             # Pose
             'pred_pose_6d': pred_pose_6d,              # (B, 6)
             'pred_pose_t': pred_pose_t,                # (B, 3) m
