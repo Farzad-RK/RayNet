@@ -1088,6 +1088,29 @@ def train(args):
         # be created in the phase-transition block below exactly like a
         # from-scratch run.
 
+        # Default behavior (old): start from epoch 1
+        start_epoch = 1
+        current_phase = 0
+
+        # NEW: override with warmstart_phase if provided
+        if args.warmstart_phase is not None:
+            if args.warmstart_phase not in PHASE_CONFIG:
+                raise ValueError(
+                    f"--warmstart_phase={args.warmstart_phase} is invalid. "
+                    f"Valid phases: {list(PHASE_CONFIG.keys())}"
+                )
+
+            phase_cfg = PHASE_CONFIG[args.warmstart_phase]
+            phase_start, _ = phase_cfg['epochs']
+
+            start_epoch = phase_start
+            current_phase = 0  # force phase transition logic to trigger
+
+            if is_main:
+                print(f"  Warmstart phase override: starting from "
+                      f"phase {args.warmstart_phase} (epoch {start_epoch})")
+
+
     # Seed the EMA shadow from the live model whenever no EMA was
     # restored from a checkpoint. EMA was created right after
     # accelerator.prepare, BEFORE warmstart/fork loaded the actual
@@ -1514,6 +1537,9 @@ def parse_args():
     parser.add_argument('--warmstart_checkpoint', type=str, default='best_model.pt',
                         help='Checkpoint file to pull from --warmstart_from run '
                              '(default: best_model.pt)')
+    parser.add_argument('--warmstart_phase', type=int, default=None,
+                        help='Start warmstart from a specific phase (overrides epoch=1). '
+                             'Optimizer is NOT loaded (unlike fork).')
     parser.add_argument('--fork_from', type=str, default=None,
                         help='Fork from a previous run: load FULL training '
                              'state (model + optimizer + scheduler + scaler '
