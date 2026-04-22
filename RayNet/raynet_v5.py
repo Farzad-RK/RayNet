@@ -396,10 +396,12 @@ class GazeBranch(nn.Module):
 
         self.coord_att = CoordinateAttention(384)
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.proj = nn.Linear(384, d_model)
-        # Mask-Weighted Foveal Pooling
-        # 384 (global context from s3) + 48 (foveal precision from d1) = 432
-        self.proj = nn.Linear(384 + 48, d_model)
+
+        # --- AERI  ---
+        # 384 (global) + 48 (foveal d1) = 432
+        self.fusion_norm = nn.LayerNorm(432)
+        self.proj = nn.Linear(432, d_model)
+        # --- AERI ---
 
         self.fusion_block = GazeFusionBlock(d_model)
         self.head = GeometricGazeHead(d_model)
