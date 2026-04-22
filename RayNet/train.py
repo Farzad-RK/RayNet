@@ -138,7 +138,7 @@ PHASE_CONFIG = {
     # is now generating wrong gradients that bias predictions toward the
     # kappa-averaged mean direction. Disabling it removes that interference.
     3: {
-        'epochs': (17, 25),
+        'epochs': (17, 30),
         'lam_lm': 0.5,
         'lam_gaze': 2.0,
         'lam_gaze_sv': 1.0,   # higher SV weight in fine-tune to close train/val gap
@@ -168,6 +168,30 @@ def get_phase(epoch):
             return phase
     # Fallback: return the last defined phase (not hardcoded 3)
     return max(PHASE_CONFIG.keys())
+
+def get_scheduled_alpha(epoch):
+    """
+    Calculates the alpha value for Inductive Bias Scheduling.
+    Prevents Geometric Shock when switching from eyeball-only to
+    Iris-Centric Saliency during a warmstart from Epoch 20.
+    """
+    # Configuration for the Alpha Re-Introduction (ARI)
+    start_epoch = 20
+    ramp_end_epoch = 30
+    alpha_start = 0.4  # Moderate reliance to mitigate distribution shift
+    alpha_cap = 0.9    # Triple-Lock recommendation to prevent attention collapse
+
+    # 1. Before warmstart point
+    if epoch < start_epoch:
+        return alpha_start
+
+    # 2. Linear Ramp over 4 epochs (20, 21, 22, 23, 24)
+    if start_epoch <= epoch < ramp_end_epoch:
+        # Progress ratio (0.0 at Epoch 20, 1.0 at Epoch 24)
+        ratio = (epoch - start_epoch) / (ramp_end_epoch - start_epoch)
+        alpha = alpha_start + ratio * (alpha_cap - alpha_start)
+        return alpha
+    return alpha_cap
 
 
 def get_phase_config(epoch):
@@ -314,10 +338,13 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
 
         mv_components = None
         # Forward pass with AMP autocast
+        aeri_alpha = get_scheduled_alpha(epoch)
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             predictions = model(images, n_views=n_views,
                                 R_cam=R_cam, T_cam=T_cam,
-                                face_bbox=face_bbox_gt)
+                                face_bbox=face_bbox_gt,
+                                aeri_alpha=aeri_alpha #AERI ALPHA
+                                )
 
             pred_hm = predictions['landmark_heatmaps']
             pred_coords = predictions['landmark_coords']
@@ -571,10 +598,13 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
         if gt_eyeball_mask is not None:
             gt_eyeball_mask = gt_eyeball_mask.to(device, non_blocking=True)
 
+        aeri_alpha = get_scheduled_alpha(epoch)
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             predictions = model(images, n_views=n_views,
                                 R_cam=R_cam, T_cam=T_cam,
-                                face_bbox=face_bbox_gt)
+                                face_bbox=face_bbox_gt,
+                                aeri_alpha=aeri_alpha,
+                                )
 
             pred_hm = predictions['landmark_heatmaps']
             pred_coords = predictions['landmark_coords']

@@ -405,7 +405,8 @@ class GazeBranch(nn.Module):
         self.head = GeometricGazeHead(d_model)
 
     def forward(self, s0_detached, s1_detached, pose_feat,
-                cross_view_attn=None, n_views=1, cam_embed=None):
+                    cross_view_attn=None, n_views=1, cam_embed=None,
+                    aeri_alpha=0.2):  # Default to low influence for safety
         gaze_s2, gaze_s3 = self.encoder(s1_detached)
 
         # iris_logits, eyeball_logits = self.aeri(
@@ -424,28 +425,65 @@ class GazeBranch(nn.Module):
         # feat = self.coord_att(gaze_s3)
         # gaze_feat = self.proj(self.pool(feat).flatten(1))
         # 1. Unpack d1 from AERI
+        #
+        # iris_logits, eyeball_logits, d1 = self.aeri(
+        #     s0_detached, s1_detached, gaze_s2, gaze_s3)
+        #
+        # # 2. Create the 56x56 probability mask
+        # eye_attn_56 = torch.sigmoid(eyeball_logits).unsqueeze(1)
+        #
+        # # 3. Apply global attention to the 7x7 bottleneck (keep existing logic)
+        # eye_attn_7 = F.adaptive_avg_pool2d(eye_attn_56, 7)
+        # gaze_s3 = gaze_s3 * (0.25 + 0.75 * eye_attn_7)
+        #
+        # # 4. Extract Global Features (1D vector)
+        # feat = self.coord_att(gaze_s3)
+        # global_feat = self.pool(feat).flatten(1)  # Shape: (B, 384)
+        #
+        # # 5. Extract Foveal Features (The SOTA Fix)
+        # # Multiply high-res d1 by the eye mask to remove background noise
+        # foveal_map = d1 * eye_attn_56  # Shape: (B, 48, 56, 56)
+        # foveal_feat = self.pool(foveal_map).flatten(1)  # Shape: (B, 48)
+        #
+        # # 6. Fuse and Project
+        # fused_feat = torch.cat([global_feat, foveal_feat], dim=1)  # Shape: (B, 432)
+        # gaze_feat = self.proj(fused_feat)  # Shape: (B, d_model)
+
+        # 1. High-Res Features from AERI
         iris_logits, eyeball_logits, d1 = self.aeri(
             s0_detached, s1_detached, gaze_s2, gaze_s3)
 
-        # 2. Create the 56x56 probability mask
-        eye_attn_56 = torch.sigmoid(eyeball_logits).unsqueeze(1)
+        iris_mask = torch.sigmoid(iris_logits).unsqueeze(1)
+        eye_mask = torch.sigmoid(eyeball_logits).unsqueeze(1)
 
-        # 3. Apply global attention to the 7x7 bottleneck (keep existing logic)
-        eye_attn_7 = F.adaptive_avg_pool2d(eye_attn_56, 7)
+        # 2. Saliency Calculation
+        saliency_56 = (0.8 * iris_mask) + (0.2 * eye_mask)
+
+        # 3. Refined Influence Scheduling (AERI Influence)
+        # We blend saliency with a uniform field.
+        # When alpha is low, the model sees the whole 56x56 field equally.
+        uniform_mask = torch.ones_like(saliency_56)
+        scheduled_mask = (aeri_alpha * saliency_56) + ((1.0 - aeri_alpha) * uniform_mask)
+
+        # 4. Stochastic Masking (The "Anti-Shortcut" Trigger)
+        # Prevents the model from relying 100% on specific pixel-mask correlations
+        if self.training:
+            # 10% chance to drop the mask influence entirely for a batch
+            mask_dropout = (torch.rand(1, device=scheduled_mask.device) > 0.1).float()
+            scheduled_mask = scheduled_mask * mask_dropout + (1.0 - mask_dropout) * uniform_mask
+
+        # 5. Feature Extraction
+        eye_attn_7 = F.adaptive_avg_pool2d(scheduled_mask, 7)
         gaze_s3 = gaze_s3 * (0.25 + 0.75 * eye_attn_7)
+        global_feat = self.pool(self.coord_att(gaze_s3)).flatten(1)
 
-        # 4. Extract Global Features (1D vector)
-        feat = self.coord_att(gaze_s3)
-        global_feat = self.pool(feat).flatten(1)  # Shape: (B, 384)
+        foveal_map = d1 * scheduled_mask
+        foveal_feat = self.pool(foveal_map).flatten(1)
 
-        # 5. Extract Foveal Features (The SOTA Fix)
-        # Multiply high-res d1 by the eye mask to remove background noise
-        foveal_map = d1 * eye_attn_56  # Shape: (B, 48, 56, 56)
-        foveal_feat = self.pool(foveal_map).flatten(1)  # Shape: (B, 48)
-
-        # 6. Fuse and Project
-        fused_feat = torch.cat([global_feat, foveal_feat], dim=1)  # Shape: (B, 432)
-        gaze_feat = self.proj(fused_feat)  # Shape: (B, d_model)
+        # 6. Stabilized Fusion
+        fused_feat = torch.cat([global_feat, foveal_feat], dim=1)
+        fused_feat = self.fusion_norm(fused_feat)
+        gaze_feat = self.proj(fused_feat)
 
         # pooled_sv is the pre-CrossViewAttention (single-view) representation.
         # Returned separately so the training loop can supervise the single-view
@@ -594,7 +632,7 @@ class RayNetV5(nn.Module):
         self.camera_embedding = CameraEmbedding(d_model=cv_cfg['d_model'])
 
     def forward(self, x, n_views=1, R_cam=None, T_cam=None,
-                face_bbox=None, **_unused):
+                face_bbox=None,aeri_alpha=0.2, **_unused):
         """
         Args:
             x: (B, 3, 224, 224) face crop.
@@ -634,6 +672,7 @@ class RayNetV5(nn.Module):
             cross_view_attn=self.cross_view_attn,
             n_views=n_views,
             cam_embed=cam_embed,
+            aeri_alpha=aeri_alpha,
         )
 
         return {
