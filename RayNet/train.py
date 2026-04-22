@@ -140,19 +140,19 @@ PHASE_CONFIG = {
     3: {
         'epochs': (17, 25),
         'lam_lm': 0.5,
-        'lam_gaze': 1.0,
-        'lam_gaze_sv': 0.5,   # higher SV weight in fine-tune to close train/val gap
+        'lam_gaze': 2.0,
+        'lam_gaze_sv': 1.0,   # higher SV weight in fine-tune to close train/val gap
         'lam_eyeball': 0.5,
         'lam_pupil': 0.5,
-        'lam_geom_angular': 0.3,
-        'lam_ray': 0.3,
+        'lam_geom_angular': 0.8,
+        'lam_ray': 0.1,
         'lam_reproj': 0.0,    # disabled: gaze_consist floor causes wrong gradients
-        'lam_mask': 0.05,
+        'lam_mask': 0.0,
         'lam_pose': 0.5,
         'lam_trans': 0.5,
-        'lam_iris_seg': 0.3,
-        'lam_eyeball_seg': 0.3,
-        'lr': 1e-4,
+        'lam_iris_seg': 0.1, # MINIMIZED: Avoid over-constraining the manifold
+        'lam_eyeball_seg': 0.1,
+        'lr': 5e-6,              # CONSTANT: Micro-polishing LR
         'sigma': 1.0,
         'multiview': True,
         'description': 'V5-P3: fine-tune (lower LR, gaze emphasis, no gaze_consist)',
@@ -1088,11 +1088,11 @@ def train(args):
         # be created in the phase-transition block below exactly like a
         # from-scratch run.
 
-        # Default behavior (old): start from epoch 1
+        # Default behavior : start from epoch 1
         start_epoch = 1
         current_phase = 0
 
-        # NEW: override with warmstart_phase if provided
+        # override with warmstart_phase if provided
         if args.warmstart_phase is not None:
             if args.warmstart_phase not in PHASE_CONFIG:
                 raise ValueError(
