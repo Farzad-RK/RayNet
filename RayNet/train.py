@@ -138,24 +138,24 @@ PHASE_CONFIG = {
     # is now generating wrong gradients that bias predictions toward the
     # kappa-averaged mean direction. Disabling it removes that interference.
     3: {
-        'epochs': (17, 30),
+        'epochs': (17, 35),
         'lam_lm': 0.5,
         'lam_gaze': 2.0,
         'lam_gaze_sv': 1.0,   # higher SV weight in fine-tune to close train/val gap
         'lam_eyeball': 0.5,
         'lam_pupil': 0.5,
         'lam_geom_angular': 0.8,
-        'lam_ray': 0.1,
+        'lam_ray': 0.0,
         'lam_reproj': 0.0,    # disabled: gaze_consist floor causes wrong gradients
         'lam_mask': 0.0,
         'lam_pose': 0.5,
         'lam_trans': 0.5,
         'lam_iris_seg': 0.1, # MINIMIZED: Avoid over-constraining the manifold
         'lam_eyeball_seg': 0.1,
-        'lr': 5e-6,              # CONSTANT: Micro-polishing LR
+        'lr': 3e-4,        # This is the exact learning rate that helped Quad-M1 to rach 8 degree
         'sigma': 1.0,
-        'multiview': True,
-        'description': 'V5-P3: fine-tune (lower LR, gaze emphasis, no gaze_consist)',
+        'multiview': False,
+        'description': 'V5-Tripple-M1-P3: Monocular Gaze baseline establishment ',
     },
 }
 
