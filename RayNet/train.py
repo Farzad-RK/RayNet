@@ -1,18 +1,24 @@
 """
-RayNet v5 Training Script (Triple-M1 architecture, parallel MTL).
+RayNet v5 Training Script (Triple-M1 + AERI/HRFH-α, branch-staged).
 
-Training strategy — one stage, all losses active from epoch 1:
+Training strategy — one stage, three branch-staged phases:
 
-  The v5 Triple-M1 graph fully isolates branches at the stem with
-  `s1.detach()` on pose and gaze, so there is no need for sequential
-  freeze phases. Landmark gradients steer the shared stem; pose and
-  gaze each train their own s2+s3 encoder in parallel; AERI segments
-  the iris and eyeball on the gaze feature pyramid. Curriculum over
-  epochs is a loss-weight ramp only — nothing is ever frozen.
+  Phase 1 (epochs 1-8) — landmark + AERI seg + headpose. Gaze branch
+    (encoder + fusion + GeometricGazeHead) is FROZEN. AERI head stays
+    trainable so iris/eyeball masks converge before HRFH-α consumes
+    them. lam_gaze = 0; seg weights raised to 1.0.
 
-  Phase 1 (epochs 1-8):   warmup — all losses active, moderate weights
-  Phase 2 (epochs 9-16):  main  — full weights + multi-view consistency
-  Phase 3 (epochs 17-25): fine-tune — reduced LR, gaze emphasis
+  Phase 2 (epochs 9-18) — monocular gaze fine-tune. Shared stem +
+    landmark branch + pose branch are FROZEN (.eval() so BN stats
+    don't drift). Multi-view consistency OFF, n_views forced to 1.
+    α ramped from 0.4 to 0.7 over the first 3 epochs of P2 (epochs
+    9-11), held at 0.7 for the rest. Mask supervision stays at 0.5.
+
+  Phase 3 (epochs 19-35) — full unfreeze + multi-view fusion at
+    5×–10× lower LR than P2. α held constant at 0.7 (no ramp during
+    fine-tune — the previously-shipped 0.4→0.9 ramp during the cosine
+    LR decay caused validation drift in
+    `triple_m1_aeri_iris_eyeball_500spc_run_20260423_101115`).
 
   Gradient clipping (max_norm) varies by phase:
     Phase 1: max_norm=5.0 (aggressive, allows large multi-task gradients)
@@ -87,77 +93,178 @@ log = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 
 PHASE_CONFIG = {
-    # ---- Phase 1: warmup — all losses active, moderate weights ----
-    # Landmark owns the stem and converges fastest; pose + gaze train
-    # through their detached s1 clone so the noisy early gaze gradient
-    # can't corrupt the landmark-owned low-level encoder. AERI segments
-    # supervise the gaze branch from epoch 1 so the learned eyeball
-    # attention map is meaningful by the time gaze loss matters.
+    # ---- Phase 1 — landmark + AERI seg + headpose. Gaze branch frozen. ----
+    # The shared stem is landmark-owned; pose + AERI train alongside.
+    # The gaze branch encoder, fusion block, and GeometricGazeHead are
+    # frozen (.eval() + requires_grad_(False)) by `apply_phase_freeze`
+    # below — this is the difference between this curriculum and the
+    # parallel-MTL schedule that shipped with v5.0.
+    # AERI seg weights raised to 1.0 so iris/eyeball masks are crisp
+    # before HRFH-α consumes them in P2.
     1: {
         'epochs': (1, 8),
         'lam_lm': 1.0,
-        'lam_gaze': 0.5,
-        'lam_eyeball': 0.3,
-        'lam_pupil': 0.3,
-        'lam_geom_angular': 0.1,
+        'lam_gaze': 0.0,        # gaze branch frozen
+        'lam_gaze_sv': 0.0,
+        'lam_eyeball': 0.0,
+        'lam_pupil': 0.0,
+        'lam_geom_angular': 0.0,
         'lam_ray': 0.0,
         'lam_reproj': 0.0,
         'lam_mask': 0.0,
         'lam_pose': 0.5,
         'lam_trans': 0.5,
-        'lam_iris_seg': 0.5,
-        'lam_eyeball_seg': 0.5,
+        'lam_iris_seg': 1.0,
+        'lam_eyeball_seg': 1.0,
         'lr': 5e-4,
         'sigma': 2.0,
         'multiview': False,
-        'description': 'V5-P1: warmup (lm + pose + gaze + AERI, moderate)',
+        'freeze_set': 'gaze_only',  # see apply_phase_freeze
+        'description': 'V5-P1: lm + AERI seg + headpose (gaze frozen)',
     },
-    # ---- Phase 2: main — full weights + multi-view consistency ----
+    # ---- Phase 2 — monocular gaze fine-tune. Stem/lm/pose frozen. ----
+    # Single-view only. AERI seg supervision held at 0.5 so masks stay
+    # stable while gaze adapts. lam_gaze_sv = 1.0 (== lam_gaze pathway)
+    # because n_views == 1 means the single-view pathway IS the
+    # supervision pathway — there is no CrossViewAttention to bypass.
     2: {
-        'epochs': (9, 16),
-        'lam_lm': 1.0,
-        'lam_gaze': 1.0,
-        'lam_gaze_sv': 0.3,   # single-view pathway supervision (pre-CrossViewAttn)
-        'lam_eyeball': 0.5,
-        'lam_pupil': 0.5,
-        'lam_geom_angular': 0.2,
-        'lam_ray': 0.2,
-        'lam_reproj': 0.1,
-        'lam_mask': 0.05,
-        'lam_pose': 1.0,
-        'lam_trans': 1.0,
+        'epochs': (9, 18),
+        'lam_lm': 0.0,          # landmark frozen
+        'lam_gaze': 2.0,
+        'lam_gaze_sv': 0.0,     # n_views==1 → pooled_sv == pooled, no SV side path
+        'lam_eyeball': 0.3,
+        'lam_pupil': 0.3,
+        'lam_geom_angular': 0.5,
+        'lam_ray': 0.0,
+        'lam_reproj': 0.0,
+        'lam_mask': 0.0,
+        'lam_pose': 0.0,        # pose frozen
+        'lam_trans': 0.0,
         'lam_iris_seg': 0.5,
         'lam_eyeball_seg': 0.5,
         'lr': 3e-4,
         'sigma': 1.5,
-        'multiview': True,
-        'description': 'V5-P2: full losses + multi-view consistency',
+        'multiview': False,
+        'freeze_set': 'face_only',  # freeze stem + landmark + pose
+        'description': 'V5-P2: monocular gaze + AERI fine-tune (face frozen)',
     },
-    # ---- Phase 3: fine-tune — reduced LR, gaze emphasis ----
-    # lam_reproj=0: gaze_consist hit its kappa-angle floor (~0.174) in P2 and
-    # is now generating wrong gradients that bias predictions toward the
-    # kappa-averaged mean direction. Disabling it removes that interference.
+    # ---- Phase 3 — full unfreeze, multi-view fusion at 5×–10× lower LR ----
+    # The cosine-decay-from-3e-4 schedule used in run_20260423_101115
+    # over-shook the basin discovered in P2 (val_angular_deg climbed
+    # from 12.43 at epoch 28 to 15.30 at epoch 35). We start from a
+    # much lower LR; α stays at 0.7 — no ramp during fine-tune.
+    # Multi-view consistency ramps in via mv_weight = min(1, epoch/22)
+    # in train_one_epoch.
     3: {
-        'epochs': (17, 35),
+        'epochs': (19, 35),
         'lam_lm': 0.5,
         'lam_gaze': 2.0,
-        'lam_gaze_sv': 1.0,   # higher SV weight in fine-tune to close train/val gap
-        'lam_eyeball': 0.5,
-        'lam_pupil': 0.5,
-        'lam_geom_angular': 0.8,
+        'lam_gaze_sv': 1.0,     # close train/val gap when CrossViewAttn is on
+        'lam_eyeball': 0.4,
+        'lam_pupil': 0.4,
+        'lam_geom_angular': 0.5,
         'lam_ray': 0.0,
-        'lam_reproj': 0.0,    # disabled: gaze_consist floor causes wrong gradients
-        'lam_mask': 0.0,
-        'lam_pose': 0.5,
-        'lam_trans': 0.5,
-        'lam_iris_seg': 0.1, # MINIMIZED: Avoid over-constraining the manifold
-        'lam_eyeball_seg': 0.1,
-        'lr': 3e-4,        # This is the exact learning rate that helped Quad-M1 to rach 8 degree
+        'lam_reproj': 0.1,
+        'lam_mask': 0.05,
+        'lam_pose': 0.3,
+        'lam_trans': 0.3,
+        'lam_iris_seg': 0.3,    # NOT 0.1 — keep masks supervised; HRFH consumes them
+        'lam_eyeball_seg': 0.3,
+        'lr': 5e-5,             # 6× lower than P2 (was 3e-4)
         'sigma': 1.0,
-        'multiview': False,
-        'description': 'V5-Tripple-M1-P3: Monocular Gaze baseline establishment ',
+        'multiview': True,
+        'freeze_set': 'none',
+        'description': 'V5-P3: multi-view fine-tune (all unfrozen, low LR)',
     },
 }
+
+
+# ============== Branch-Staged Freeze Helpers ==============
+
+# Three named freeze sets cover the curriculum + fully-unfrozen ablation.
+# `apply_phase_freeze` is idempotent and called once per phase transition.
+FREEZE_SETS = {
+    # P1 — gaze branch frozen except AERI head (which is supervised).
+    'gaze_only': {
+        'freeze_modules': [
+            'gaze_branch.encoder',
+            'gaze_branch.coord_att',
+            'gaze_branch.foveal_proj',
+            'gaze_branch.global_norm',
+            'gaze_branch.foveal_norm',
+            'gaze_branch.proj',
+            'gaze_branch.fusion_block',
+            'gaze_branch.head',
+        ],
+        # AERI head + cross_view_attn + camera_embedding intentionally
+        # NOT frozen — AERI is supervised by seg loss; cross-view modules
+        # see no gradient when n_views==1 anyway.
+    },
+    # P2 — face path frozen (stem + landmark + pose). Gaze + AERI train.
+    'face_only': {
+        'freeze_modules': [
+            'shared_stem',
+            'landmark_branch',
+            'pose_branch',
+        ],
+    },
+    # P3 — nothing frozen.
+    'none': {
+        'freeze_modules': [],
+    },
+}
+
+
+def _resolve_module(root, dotted_name):
+    """Walk dotted name down to a child module."""
+    mod = root
+    for part in dotted_name.split('.'):
+        mod = getattr(mod, part)
+    return mod
+
+
+def apply_phase_freeze(model, freeze_set_name, log_fn=print):
+    """
+    Apply a named freeze pattern to the unwrapped RayNetV5 instance.
+
+    For each frozen submodule:
+      - requires_grad_(False)  — no parameter updates
+      - .eval()                — BN running stats stop drifting
+
+    Trainable submodules are explicitly set back to .train() and have
+    requires_grad_(True) restored, so a phase that goes "narrow → wider"
+    correctly re-enables previously frozen branches.
+
+    The function operates on the unwrapped RayNetV5 (call _unwrap_raynet
+    first when handed a DDP / torch.compile wrapper).
+    """
+    spec = FREEZE_SETS.get(freeze_set_name, FREEZE_SETS['none'])
+    frozen = set(spec['freeze_modules'])
+
+    # First pass: re-enable everything (idempotent baseline). We touch
+    # only top-level branches + their children to avoid clobbering
+    # buffers or modules outside the named set.
+    top_level = ['shared_stem', 'landmark_branch', 'pose_branch',
+                 'gaze_branch', 'cross_view_attn', 'camera_embedding']
+    for name in top_level:
+        if not hasattr(model, name):
+            continue
+        mod = getattr(model, name)
+        mod.requires_grad_(True)
+        mod.train()
+
+    # Second pass: freeze the named submodules.
+    for name in frozen:
+        try:
+            mod = _resolve_module(model, name)
+        except AttributeError:
+            log_fn(f"  [freeze] WARN: '{name}' not found, skipping")
+            continue
+        mod.requires_grad_(False)
+        mod.eval()
+
+    log_fn(f"  [freeze] applied set='{freeze_set_name}' "
+           f"(frozen={sorted(frozen) or 'none'})")
 
 
 def get_phase(epoch):
@@ -171,27 +278,30 @@ def get_phase(epoch):
 
 def get_scheduled_alpha(epoch):
     """
-    Calculates the alpha value for Inductive Bias Scheduling.
-    Prevents Geometric Shock when switching from eyeball-only to
-    Iris-Centric Saliency during a warmstart from Epoch 20.
+    Three-region AERI-α schedule aligned with the branch-staged curriculum.
+
+      - Phase 1 (epochs 1-8):  α = 0.4 — gaze branch is frozen, value is moot
+        but kept low to keep the (training-only) AERI losses from being
+        gated. Masks are still being learned.
+      - Phase 2 ramp (epochs 9-11): α linearly interpolated 0.4 → 0.7 over
+        the first 3 epochs of gaze training — small, deliberate ARI window
+        BEFORE LR cosine decay, not during fine-tune.
+      - Phase 2 fine-tune + Phase 3 (epochs 12+): α = 0.7 held constant.
+        The 0.4→0.9 ramp during cosine LR decay caused validation drift in
+        triple_m1_aeri_iris_eyeball_500spc_run_20260423_101115 (val_angular
+        12.4° → 15.3° from epoch 28 to 35). Hold α flat through fine-tune.
     """
-    # Configuration for the Alpha Re-Introduction (ARI)
-    start_epoch = 20
-    ramp_end_epoch = 30
-    alpha_start = 0.4  # Moderate reliance to mitigate distribution shift
-    alpha_cap = 0.9    # Triple-Lock recommendation to prevent attention collapse
+    alpha_p1 = 0.4
+    alpha_p2 = 0.7
+    ramp_start_epoch = 9   # first epoch of Phase 2
+    ramp_end_epoch = 12    # first epoch of constant α = alpha_p2
 
-    # 1. Before warmstart point
-    if epoch < start_epoch:
-        return alpha_start
-
-    # 2. Linear Ramp over 4 epochs (20, 21, 22, 23, 24)
-    if start_epoch <= epoch < ramp_end_epoch:
-        # Progress ratio (0.0 at Epoch 20, 1.0 at Epoch 24)
-        ratio = (epoch - start_epoch) / (ramp_end_epoch - start_epoch)
-        alpha = alpha_start + ratio * (alpha_cap - alpha_start)
-        return alpha
-    return alpha_cap
+    if epoch < ramp_start_epoch:
+        return alpha_p1
+    if epoch < ramp_end_epoch:
+        ratio = (epoch - ramp_start_epoch) / (ramp_end_epoch - ramp_start_epoch)
+        return alpha_p1 + ratio * (alpha_p2 - alpha_p1)
+    return alpha_p2
 
 
 def get_phase_config(epoch):
@@ -1185,6 +1295,17 @@ def train(args):
                           f"lam_shape={cfg['lam_mask']}")
                 print(f"{'='*60}")
 
+            # Branch-staged freeze: requires_grad_(False) + .eval() the
+            # submodules named by cfg['freeze_set']; re-enable everything
+            # else. Operates on the unwrapped RayNetV5 so DDP / compile
+            # wrappers don't intercept the call.
+            freeze_set = cfg.get('freeze_set', 'none')
+            apply_phase_freeze(
+                _unwrap_raynet(model),
+                freeze_set,
+                log_fn=(print if is_main else (lambda *_: None)),
+            )
+
             phase_start, phase_end = cfg['epochs']
 
             if optimizer is None:
@@ -1224,7 +1345,15 @@ def train(args):
         # cfg['multiview'] only gates the auxiliary multiview_consistency_loss
         # inside train_one_epoch — see header comment on PHASE_CONFIG above.
         # Pass --no_multiview on the CLI to truly ablate cross-view fusion.
-        active_n_views = 1 if args.no_multiview else 9
+        #
+        # Phase 2 is monocular by design: the gaze branch trains on a
+        # single-view objective and CrossViewAttention is short-circuited
+        # so its parameters do not drift on identity-only batches. Force
+        # n_views=1 there regardless of cfg['multiview'] (defense in depth).
+        if phase == 2 or args.no_multiview:
+            active_n_views = 1
+        else:
+            active_n_views = 9
 
         # Train
         train_losses = train_one_epoch(

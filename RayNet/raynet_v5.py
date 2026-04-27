@@ -373,21 +373,39 @@ class GeometricGazeHead(nn.Module):
 
 class GazeBranch(nn.Module):
     """
-    AERI-based gaze branch.
+    AERI + HRFH-α gaze branch.
 
     Pipeline (operating on gradient-isolated shared-stem features):
-        s0.detach(), s1.detach() (from SharedStem)
-        s1.detach() → BranchEncoder → gaze_s2 (14x14), gaze_s3 (7x7)
-        AERIHead(s0, s1, gaze_s2, gaze_s3)
-          → iris_logits, eyeball_logits (both 56x56)
-        AERI attention:
-          effective_mask = 0.25 + 0.75 * sigmoid(eyeball_logits)
-          gaze_s3 ← gaze_s3 * avg_pool(effective_mask → 7x7)
-        CoordinateAttention → AdaptiveAvgPool → Linear → gaze_feat
-        GazeFusionBlock(gaze_feat, pose_feat) (zero-init residual for pose)
-        CrossViewAttention (when n_views > 1)
-        GeometricGazeHead → eyeball_center, pupil_center, optical_axis
+      s0.detach(), s1.detach() from SharedStem
+      s1.detach() → BranchEncoder → gaze_s2 (14x14), gaze_s3 (7x7)
+      AERIHead(s0, s1, gaze_s2, gaze_s3)
+        → iris_logits, eyeball_logits, d1 (B,48,56,56)
+      saliency = SALIENCY_IRIS_W * sigmoid(iris)
+               + SALIENCY_EYE_W  * sigmoid(eye)
+      scheduled_mask = α * saliency + (1 - α) * 1
+      Global path: gaze_s3 * (0.25 + 0.75 * pool₇(scheduled_mask))
+                   → CoordAtt → pool → 384-d → LayerNorm
+      Foveal path: pool(d1 * scheduled_mask) → 48-d → Linear→96 → GELU
+                   → LayerNorm → stochastic depth (training only,
+                   FOVEAL_DROP_P) — identity at val.
+      [global ‖ foveal_proj] (480-d) → Linear → 256-d gaze_feat
+      GazeFusionBlock(gaze_feat, pose_feat)  (zero-init residual)
+      CrossViewAttention (when n_views > 1)
+      GeometricGazeHead → eyeball_center, pupil_center, optical_axis
     """
+
+    # Saliency mix: iris is ~8x8 cells of a 56x56 map, eyeball is ~25x15.
+    # 0.65/0.35 keeps the iris dominant without crowding out the limbus
+    # context that the geometric head uses to localise eyeball_center.
+    SALIENCY_IRIS_W = 0.65
+    SALIENCY_EYE_W = 0.35
+
+    # Foveal stochastic-depth drop probability (training only).
+    # Replaces the previous train-only mask_dropout, which created a
+    # train/val asymmetry on the GLOBAL path. Stochastic depth on the
+    # foveal contribution still regularises the high-resolution channel
+    # without ever flipping the global mask gate at val.
+    FOVEAL_DROP_P = 0.10
 
     def __init__(self, d_model=256):
         super().__init__()
@@ -397,95 +415,79 @@ class GazeBranch(nn.Module):
         self.coord_att = CoordinateAttention(384)
         self.pool = nn.AdaptiveAvgPool2d(1)
 
-        # --- AERI  ---
-        # 384 (global) + 48 (foveal d1) = 432
-        self.fusion_norm = nn.LayerNorm(432)
-        self.proj = nn.Linear(432, d_model)
-        # --- AERI ---
+        # --- AERI / HRFH-α fusion ---
+        # The 48-d raw foveal vector is projected to 96-d before being
+        # concatenated with the 384-d global vector. Without this, after
+        # LayerNorm + Linear(432→256) the foveal contribution accounts
+        # for only ~11% of the projected feature, which suppresses the
+        # sub-pixel iris signal HRFH was designed to extract.
+        # Each path is normalised separately so the global stats don't
+        # drown the foveal stats inside a shared LN over 432 dims.
+        self.foveal_proj = nn.Sequential(
+            nn.Linear(48, 96),
+            nn.GELU(),
+        )
+        self.global_norm = nn.LayerNorm(384)
+        self.foveal_norm = nn.LayerNorm(96)
+        # 384 (global) + 96 (foveal_proj) = 480
+        self.proj = nn.Linear(480, d_model)
+        # --- AERI / HRFH-α fusion ---
 
         self.fusion_block = GazeFusionBlock(d_model)
         self.head = GeometricGazeHead(d_model)
 
     def forward(self, s0_detached, s1_detached, pose_feat,
                     cross_view_attn=None, n_views=1, cam_embed=None,
-                    aeri_alpha=0.2):  # Default to low influence for safety
+                    aeri_alpha=0.4):
         gaze_s2, gaze_s3 = self.encoder(s1_detached)
 
-        # iris_logits, eyeball_logits = self.aeri(
-        #     s0_detached, s1_detached, gaze_s2, gaze_s3)
-        #
-        #
-        # # AERI attention on the 7x7 bottleneck. Downsample the 56x56
-        # # eyeball sigmoid to 7x7 via area-average, apply baseline +
-        # # foreground scaling so the background still contributes 25%
-        # # (prevents zero-mask collapse early in training when AERI is
-        # # still random).
-        # eye_attn_56 = torch.sigmoid(eyeball_logits).unsqueeze(1)
-        # eye_attn_7 = F.adaptive_avg_pool2d(eye_attn_56, 7)
-        # gaze_s3 = gaze_s3 * (0.25 + 0.75 * eye_attn_7)
-        #
-        # feat = self.coord_att(gaze_s3)
-        # gaze_feat = self.proj(self.pool(feat).flatten(1))
-        # 1. Unpack d1 from AERI
-        #
-        # iris_logits, eyeball_logits, d1 = self.aeri(
-        #     s0_detached, s1_detached, gaze_s2, gaze_s3)
-        #
-        # # 2. Create the 56x56 probability mask
-        # eye_attn_56 = torch.sigmoid(eyeball_logits).unsqueeze(1)
-        #
-        # # 3. Apply global attention to the 7x7 bottleneck (keep existing logic)
-        # eye_attn_7 = F.adaptive_avg_pool2d(eye_attn_56, 7)
-        # gaze_s3 = gaze_s3 * (0.25 + 0.75 * eye_attn_7)
-        #
-        # # 4. Extract Global Features (1D vector)
-        # feat = self.coord_att(gaze_s3)
-        # global_feat = self.pool(feat).flatten(1)  # Shape: (B, 384)
-        #
-        # # 5. Extract Foveal Features (The SOTA Fix)
-        # # Multiply high-res d1 by the eye mask to remove background noise
-        # foveal_map = d1 * eye_attn_56  # Shape: (B, 48, 56, 56)
-        # foveal_feat = self.pool(foveal_map).flatten(1)  # Shape: (B, 48)
-        #
-        # # 6. Fuse and Project
-        # fused_feat = torch.cat([global_feat, foveal_feat], dim=1)  # Shape: (B, 432)
-        # gaze_feat = self.proj(fused_feat)  # Shape: (B, d_model)
-
-        # 1. High-Res Features from AERI
+        # 1. AERI segmentation + d1 harvest
         iris_logits, eyeball_logits, d1 = self.aeri(
             s0_detached, s1_detached, gaze_s2, gaze_s3)
 
         iris_mask = torch.sigmoid(iris_logits).unsqueeze(1)
         eye_mask = torch.sigmoid(eyeball_logits).unsqueeze(1)
 
-        # 2. Saliency Calculation
-        saliency_56 = (0.8 * iris_mask) + (0.2 * eye_mask)
+        # 2. Saliency: iris-dominant but with enough limbus context for
+        #    the geometric head to localise eyeball_center.
+        saliency_56 = (self.SALIENCY_IRIS_W * iris_mask
+                       + self.SALIENCY_EYE_W * eye_mask)
 
-        # 3. Refined Influence Scheduling (AERI Influence)
-        # We blend saliency with a uniform field.
-        # When alpha is low, the model sees the whole 56x56 field equally.
+        # 3. α schedule: blend saliency with a uniform field. Caller
+        #    decides α via the curriculum (see train.get_scheduled_alpha).
         uniform_mask = torch.ones_like(saliency_56)
-        scheduled_mask = (aeri_alpha * saliency_56) + ((1.0 - aeri_alpha) * uniform_mask)
+        scheduled_mask = (aeri_alpha * saliency_56
+                          + (1.0 - aeri_alpha) * uniform_mask)
 
-        # 4. Stochastic Masking (The "Anti-Shortcut" Trigger)
-        # Prevents the model from relying 100% on specific pixel-mask correlations
-        if self.training:
-            # 10% chance to drop the mask influence entirely for a batch
-            mask_dropout = (torch.rand(1, device=scheduled_mask.device) > 0.1).float()
-            scheduled_mask = scheduled_mask * mask_dropout + (1.0 - mask_dropout) * uniform_mask
-
-        # 5. Feature Extraction
+        # 4. Global path — gate the 7x7 bottleneck. The 0.25 baseline +
+        #    0.75 sigmoid scaling keeps non-eye context contributing 25%
+        #    of the signal, preventing collapse if AERI predicts an
+        #    empty mask. NB: no stochastic dropout here — keeping the
+        #    global path identical between train and val is what fixes
+        #    the asymmetry that drove the previous P3 val drift.
         eye_attn_7 = F.adaptive_avg_pool2d(scheduled_mask, 7)
-        gaze_s3 = gaze_s3 * (0.25 + 0.75 * eye_attn_7)
-        global_feat = self.pool(self.coord_att(gaze_s3)).flatten(1)
+        gaze_s3_gated = gaze_s3 * (0.25 + 0.75 * eye_attn_7)
+        global_feat = self.pool(self.coord_att(gaze_s3_gated)).flatten(1)
+        global_feat = self.global_norm(global_feat)
 
-        foveal_map = d1 * scheduled_mask
-        foveal_feat = self.pool(foveal_map).flatten(1)
+        # 5. Foveal path — gate d1 at 56x56 then pool to 48-d.
+        foveal_feat = self.pool(d1 * scheduled_mask).flatten(1)
+        foveal_feat = self.foveal_proj(foveal_feat)
+        foveal_feat = self.foveal_norm(foveal_feat)
 
-        # 6. Stabilized Fusion
-        fused_feat = torch.cat([global_feat, foveal_feat], dim=1)
-        fused_feat = self.fusion_norm(fused_feat)
-        gaze_feat = self.proj(fused_feat)
+        # 6. Stochastic depth on the foveal contribution only.
+        #    Drop the foveal vector with prob FOVEAL_DROP_P during
+        #    training; identity at val. Forces the global pathway to
+        #    stay competent without making the global mask gate change
+        #    behaviour between train and val.
+        if self.training and self.FOVEAL_DROP_P > 0:
+            keep = (torch.rand(foveal_feat.shape[0], 1,
+                               device=foveal_feat.device)
+                    >= self.FOVEAL_DROP_P).float()
+            foveal_feat = foveal_feat * keep / (1.0 - self.FOVEAL_DROP_P)
+
+        # 7. Concat and project to d_model.
+        gaze_feat = self.proj(torch.cat([global_feat, foveal_feat], dim=1))
 
         # pooled_sv is the pre-CrossViewAttention (single-view) representation.
         # Returned separately so the training loop can supervise the single-view

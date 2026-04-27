@@ -1,32 +1,36 @@
 """
-RayNet inference and visualization tool.
+RayNet v5 inference and visualization tool.
 
-Runs RayNet on images, video files, or webcam feed and visualizes:
-  - 14 iris/pupil landmarks (10 iris contour + 4 pupil boundary)
-  - 3D gaze vector projected as an arrow from eye center
-  - Head pose axes (RGB = XYZ) from 6D rotation prediction
-  - Pitch/yaw angles as text overlay
+Triple-M1 + AERI architecture (raynet_v5). Embedded face detection: the
+caller passes a full frame, the module detects the face internally
+(MediaPipe with Haar cascade fallback), crops to 224x224, and runs the
+v5 model. Visualizes:
+
+  - 14 iris/pupil landmarks (10 iris + 4 pupil) projected back to frame
+  - AERI iris + eyeball masks at 56x56, upsampled and overlaid
+  - 3D gaze vector projected from the predicted eyeball_center
+  - Head pose axes (RGB = XYZ) from the 6D rotation prediction
+  - The face bounding box used by the model, drawn on the frame
+  - Optional translation / pitch / yaw overlay
+
+The model accepts `face_bbox=None`: the BoxEncoder residual is
+zero-initialised, so omitting the bbox just zeroes the BoxEncoder
+contribution to the pose feature. When MediaPipe gives us a real bbox
+we also synthesise the MAGE (x_p, y_p, L_x) tuple (assuming a centred
+principal point) and feed it to the model so PoseBranch's BoxEncoder is
+exercised.
 
 Usage:
-    # Single image
-    python -m RayNet.inference --checkpoint best_model.pt --input face.jpg
-
-    # Video file
-    python -m RayNet.inference --checkpoint best_model.pt --input video.mp4
-
-    # Webcam (default camera 0)
     python -m RayNet.inference --checkpoint best_model.pt --webcam
+    python -m RayNet.inference --checkpoint best_model.pt --input face.jpg
+    python -m RayNet.inference --checkpoint best_model.pt --input clip.mp4
 
-    # With MinIO checkpoint loading
-    python -m RayNet.inference \
-        --ckpt_bucket raynet-checkpoints \
-        --minio_endpoint http://204.168.238.119:9000 \
-        --run_id run_20260412_123641 \
-        --ckpt_file best_model.pt \
-        --webcam
-
-    # With face detection (requires mediapipe)
-    python -m RayNet.inference --checkpoint best_model.pt --webcam --face_detect
+    # MinIO checkpoint loading
+    python -m RayNet.inference \\
+        --ckpt_bucket raynet-checkpoints \\
+        --minio_endpoint http://204.168.238.119:9000 \\
+        --run_id triple_m1_aeri_iris_eyeball_500spc_run_20260423_101115 \\
+        --ckpt_file best_model.pt --webcam
 """
 
 import argparse
@@ -40,40 +44,40 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# ─── Landmark layout ────────────────────────────────────────────────
-# 14 landmarks: indices 0-9 = iris contour, 10-13 = pupil boundary
+
+# 14 landmarks: 0-9 iris contour, 10-13 pupil
 IRIS_IDX = list(range(10))
 PUPIL_IDX = list(range(10, 14))
 
-# Colors (BGR)
-COLOR_IRIS = (0, 255, 0)        # green
-COLOR_PUPIL = (0, 200, 255)     # orange
-COLOR_GAZE = (255, 0, 255)      # magenta
-COLOR_POSE_X = (0, 0, 255)     # red
-COLOR_POSE_Y = (0, 255, 0)     # green
-COLOR_POSE_Z = (255, 0, 0)     # blue
-COLOR_TEXT = (255, 255, 255)    # white
-COLOR_BG = (40, 40, 40)        # dark gray
+COLOR_IRIS = (0, 255, 0)
+COLOR_PUPIL = (0, 200, 255)
+COLOR_GAZE = (255, 0, 255)
+COLOR_POSE_X = (0, 0, 255)
+COLOR_POSE_Y = (0, 255, 0)
+COLOR_POSE_Z = (255, 0, 0)
+COLOR_TEXT = (255, 255, 255)
+COLOR_BG = (40, 40, 40)
+COLOR_FACEBOX = (0, 220, 220)
+COLOR_IRIS_MASK = (0, 255, 0)
+COLOR_EYE_MASK = (0, 255, 255)
 
 
 def load_model(args):
     """
-    Load RayNet model with trained weights from checkpoint.
-
-    The checkpoint contains ALL weights (backbone + heads + everything),
-    so pretrained backbone .pth files are NOT needed. We build the empty
-    architecture and load the full state dict from the checkpoint.
+    Build RayNet v5 (Triple-M1) and load the trained state dict from the
+    checkpoint. Backbone .pth weights are NOT required at inference —
+    every parameter is in the checkpoint.
     """
-    from RayNet.raynet import create_raynet_architecture, device
+    from RayNet.raynet_v5 import create_raynet_v5, device
 
-    model = create_raynet_architecture(
-        core_backbone_name=args.core_backbone,
-        pose_backbone_name=args.pose_backbone,
+    model = create_raynet_v5(
+        backbone_weight_path=None,
+        n_landmarks=14,
     )
 
-    # Load checkpoint (contains ALL trained weights)
     if args.checkpoint:
-        state = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        state = torch.load(args.checkpoint, map_location=device,
+                           weights_only=False)
     elif args.run_id:
         from RayNet.streaming.checkpoint import CheckpointManager
         mgr = CheckpointManager(
@@ -83,15 +87,22 @@ def load_model(args):
         )
         state = mgr.load(args.ckpt_file, map_location=device)
     else:
-        raise ValueError("Provide --checkpoint (local) or --run_id + --ckpt_bucket (MinIO)")
+        raise ValueError(
+            "Provide --checkpoint (local) or --run_id + --ckpt_bucket (MinIO)")
 
-    # Handle torch.compile wrapper
     target = model._orig_mod if hasattr(model, '_orig_mod') else model
     if 'model_state_dict' in state:
-        target.load_state_dict(state['model_state_dict'], strict=False)
+        missing, unexpected = target.load_state_dict(
+            state['model_state_dict'], strict=False)
         epoch = state.get('epoch', '?')
-        stage = state.get('config', {}).get('stage', '?')
-        print(f"Loaded checkpoint: stage {stage}, epoch {epoch}")
+        cfg = state.get('config', {}) or {}
+        phase = cfg.get('phase', cfg.get('stage', '?'))
+        print(f"Loaded v5 checkpoint: phase {phase}, epoch {epoch}")
+        if missing:
+            print(f"  missing keys: {len(missing)} (first: {missing[:3]})")
+        if unexpected:
+            print(f"  unexpected keys: {len(unexpected)} "
+                  f"(first: {unexpected[:3]})")
     else:
         target.load_state_dict(state, strict=False)
         print("Loaded raw state dict")
@@ -100,30 +111,17 @@ def load_model(args):
     return model, device
 
 
-def preprocess_image(image_bgr, img_size=224):
-    """
-    Preprocess a BGR image for RayNet inference.
-
-    Args:
-        image_bgr: (H, W, 3) BGR uint8 image (face crop)
-        img_size: model input size
-
-    Returns:
-        tensor: (1, 3, img_size, img_size) normalized tensor
-    """
-    img = cv2.resize(image_bgr, (img_size, img_size))
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = img.astype(np.float32) / 255.0
-    # Normalize to [-1, 1] (mean=0.5, std=0.5)
+def preprocess_crop(crop_bgr, img_size=224):
+    """BGR uint8 face crop → (1, 3, 224, 224) tensor in [-1, 1]."""
+    img = cv2.resize(crop_bgr, (img_size, img_size))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     img = (img - 0.5) / 0.5
-    tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
-    return tensor
+    return torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
 
 
 def rotation_6d_to_matrix(r6d):
-    """Convert 6D rotation to 3x3 matrix (numpy, single sample)."""
-    a1 = r6d[:3]
-    a2 = r6d[3:6]
+    """6D rotation → 3x3 (numpy, single sample), Gram-Schmidt."""
+    a1, a2 = r6d[:3], r6d[3:6]
     b1 = a1 / (np.linalg.norm(a1) + 1e-8)
     b2 = a2 - np.dot(b1, a2) * b1
     b2 = b2 / (np.linalg.norm(b2) + 1e-8)
@@ -131,12 +129,13 @@ def rotation_6d_to_matrix(r6d):
     return np.stack([b1, b2, b3], axis=-1)
 
 
+# ─── Face detection ─────────────────────────────────────────────────
+
 def detect_faces_mediapipe(image_bgr):
-    """Detect faces using MediaPipe. Returns list of (x, y, w, h) bounding boxes."""
     import mediapipe as mp
-    mp_face = mp.solutions.face_detection
     h, w = image_bgr.shape[:2]
-    with mp_face.FaceDetection(min_detection_confidence=0.5) as fd:
+    with mp.solutions.face_detection.FaceDetection(
+            min_detection_confidence=0.5) as fd:
         results = fd.process(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
         if not results.detections:
             return []
@@ -152,254 +151,15 @@ def detect_faces_mediapipe(image_bgr):
 
 
 def detect_faces_opencv(image_bgr):
-    """Fallback face detection using OpenCV's DNN or Haar cascade."""
-    cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+    cascade_path = (cv2.data.haarcascades
+                    + 'haarcascade_frontalface_default.xml')
     cascade = cv2.CascadeClassifier(cascade_path)
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     faces = cascade.detectMultiScale(gray, 1.1, 5, minSize=(60, 60))
     return [(x, y, w, h) for (x, y, w, h) in faces]
 
 
-def expand_bbox(x, y, w, h, img_w, img_h, factor=1.3):
-    """Expand bounding box by a factor and make it square."""
-    cx, cy = x + w / 2, y + h / 2
-    side = max(w, h) * factor
-    x1 = max(0, int(cx - side / 2))
-    y1 = max(0, int(cy - side / 2))
-    x2 = min(img_w, int(cx + side / 2))
-    y2 = min(img_h, int(cy + side / 2))
-    return x1, y1, x2, y2
-
-
-@torch.no_grad()
-def run_inference(model, image_tensor, device, use_bridge=True):
-    """
-    Run single-view inference.
-
-    Returns:
-        landmarks: (14, 2) numpy array in feature map coords
-        gaze_vector: (3,) numpy unit vector
-        gaze_angles: (2,) numpy [pitch, yaw] in radians
-        pose_6d: (6,) numpy 6D rotation
-        pose_t: (3,) numpy translation in meters
-    """
-    image_tensor = image_tensor.to(device)
-    out = model(image_tensor, n_views=1, use_bridge=use_bridge)
-
-    landmarks = out['landmark_coords'][0].cpu().numpy()       # (14, 2)
-    gaze_vector = out['gaze_vector'][0].cpu().numpy()          # (3,)
-    gaze_angles = out['gaze_angles'][0].cpu().numpy()          # (2,)
-    pose_6d = out['pred_pose_6d'][0].cpu().numpy() if out['pred_pose_6d'] is not None else None
-    pose_t = out['pred_pose_t'][0].cpu().numpy() if out['pred_pose_t'] is not None else None
-
-    return landmarks, gaze_vector, gaze_angles, pose_6d, pose_t
-
-
-def draw_landmarks(canvas, landmarks_px, radius=2):
-    """Draw 14 landmarks on the image. Iris=green, pupil=orange."""
-    for i in IRIS_IDX:
-        pt = tuple(landmarks_px[i].astype(int))
-        cv2.circle(canvas, pt, radius, COLOR_IRIS, -1, cv2.LINE_AA)
-
-    for i in PUPIL_IDX:
-        pt = tuple(landmarks_px[i].astype(int))
-        cv2.circle(canvas, pt, radius, COLOR_PUPIL, -1, cv2.LINE_AA)
-
-    # Connect iris contour
-    for i in range(len(IRIS_IDX)):
-        p1 = tuple(landmarks_px[IRIS_IDX[i]].astype(int))
-        p2 = tuple(landmarks_px[IRIS_IDX[(i + 1) % len(IRIS_IDX)]].astype(int))
-        cv2.line(canvas, p1, p2, COLOR_IRIS, 1, cv2.LINE_AA)
-
-    # Connect pupil points
-    for i in range(len(PUPIL_IDX)):
-        p1 = tuple(landmarks_px[PUPIL_IDX[i]].astype(int))
-        p2 = tuple(landmarks_px[PUPIL_IDX[(i + 1) % len(PUPIL_IDX)]].astype(int))
-        cv2.line(canvas, p1, p2, COLOR_PUPIL, 1, cv2.LINE_AA)
-
-
-def draw_gaze_arrow(canvas, origin, gaze_vector, length=80, thickness=2):
-    """
-    Draw gaze direction as an arrow projected onto the image.
-
-    gaze_vector is in CCS: x=right, y=down, z=forward.
-    We project the xy components to get the 2D arrow direction and
-    use the z component to scale (closer = longer arrow).
-    """
-    # Project 3D gaze to 2D image plane (perspective-like)
-    dx = gaze_vector[0]  # right
-    dy = gaze_vector[1]  # down
-    dz = gaze_vector[2]  # forward (into screen)
-
-    # Scale arrow length by how much the gaze goes into the screen
-    scale = length / max(abs(dz), 0.1)
-    end_x = int(origin[0] + dx * scale)
-    end_y = int(origin[1] + dy * scale)
-
-    origin_pt = (int(origin[0]), int(origin[1]))
-    end_pt = (end_x, end_y)
-
-    cv2.arrowedLine(canvas, origin_pt, end_pt, COLOR_GAZE, thickness,
-                    cv2.LINE_AA, tipLength=0.3)
-
-
-def draw_pose_axes(canvas, center, R_mat, axis_length=40, thickness=2):
-    """Draw head pose as RGB axes (X=red, Y=green, Z=blue)."""
-    origin = np.array(center, dtype=float)
-
-    for i, color in enumerate([COLOR_POSE_X, COLOR_POSE_Y, COLOR_POSE_Z]):
-        axis = R_mat[:, i]  # column i of rotation matrix
-        # Project to 2D: x component → right, y component → down
-        end = origin + axis_length * np.array([axis[0], axis[1]])
-        cv2.arrowedLine(canvas,
-                        (int(origin[0]), int(origin[1])),
-                        (int(end[0]), int(end[1])),
-                        color, thickness, cv2.LINE_AA, tipLength=0.25)
-
-
-def draw_info_overlay(canvas, gaze_angles, pose_t, fps=None):
-    """Draw text overlay with gaze angles and pose info."""
-    pitch_deg = math.degrees(gaze_angles[0])
-    yaw_deg = math.degrees(gaze_angles[1])
-
-    lines = [
-        f"Gaze: pitch={pitch_deg:+.1f} yaw={yaw_deg:+.1f}",
-    ]
-    if pose_t is not None:
-        lines.append(f"Trans: x={pose_t[0]:.2f} y={pose_t[1]:.2f} z={pose_t[2]:.2f} m")
-    if fps is not None:
-        lines.append(f"FPS: {fps:.1f}")
-
-    y_offset = 20
-    for line in lines:
-        (tw, th), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(canvas, (8, y_offset - th - 4), (12 + tw, y_offset + 4), COLOR_BG, -1)
-        cv2.putText(canvas, line, (10, y_offset),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_TEXT, 1, cv2.LINE_AA)
-        y_offset += th + 12
-
-
-def visualize_predictions(image_bgr, landmarks_feat, gaze_vector, gaze_angles,
-                          pose_6d, pose_t, feat_size=56, img_size=224,
-                          crop_bbox=None):
-    """
-    Draw all predictions on the image.
-
-    Args:
-        image_bgr: original image (or crop)
-        landmarks_feat: (14, 2) landmark coords in feature map space (56x56)
-        gaze_vector: (3,) unit vector in CCS
-        gaze_angles: (2,) pitch, yaw in radians
-        pose_6d: (6,) 6D rotation or None
-        pose_t: (3,) translation or None
-        feat_size: feature map spatial dim (P2 at stride 4 = 56 for 224 input)
-        img_size: model input size
-        crop_bbox: (x1, y1, x2, y2) if drawing on full frame
-
-    Returns:
-        canvas: annotated image
-    """
-    if crop_bbox is not None:
-        canvas = image_bgr.copy()
-        x1, y1, x2, y2 = crop_bbox
-        crop_w, crop_h = x2 - x1, y2 - y1
-
-        # Scale landmarks from feature space to crop space, then to frame space
-        scale_x = crop_w / feat_size
-        scale_y = crop_h / feat_size
-        landmarks_px = landmarks_feat.copy()
-        landmarks_px[:, 0] = landmarks_feat[:, 0] * scale_x + x1
-        landmarks_px[:, 1] = landmarks_feat[:, 1] * scale_y + y1
-
-        # Eye center for gaze arrow (average of all landmarks)
-        eye_center = landmarks_px.mean(axis=0)
-
-        # Pose axes center
-        pose_center = ((x1 + x2) / 2, (y1 + y2) / 2)
-
-        # Draw crop box
-        cv2.rectangle(canvas, (x1, y1), (x2, y2), (128, 128, 128), 1)
-
-        lm_radius = max(2, int(crop_w / 80))
-        arrow_len = max(40, int(crop_w / 3))
-        axis_len = max(30, int(crop_w / 4))
-    else:
-        h, w = image_bgr.shape[:2]
-        canvas = image_bgr.copy()
-
-        # Scale from feature space to display image
-        scale_x = w / feat_size
-        scale_y = h / feat_size
-        landmarks_px = landmarks_feat.copy()
-        landmarks_px[:, 0] *= scale_x
-        landmarks_px[:, 1] *= scale_y
-
-        eye_center = landmarks_px.mean(axis=0)
-        pose_center = (w / 2, h / 2)
-
-        lm_radius = max(2, int(w / 80))
-        arrow_len = max(40, int(w / 3))
-        axis_len = max(30, int(w / 4))
-
-    # Draw landmarks
-    draw_landmarks(canvas, landmarks_px, radius=lm_radius)
-
-    # Draw gaze arrow from eye center
-    # draw_gaze_arrow(canvas, eye_center, gaze_vector, length=arrow_len, thickness=2)
-
-    # Draw head pose axes
-    if pose_6d is not None:
-        R_mat = rotation_6d_to_matrix(pose_6d)
-        draw_pose_axes(canvas, pose_center, R_mat, axis_length=axis_len)
-
-    # Draw text overlay
-    # draw_info_overlay(canvas, gaze_angles, pose_t)
-
-    return canvas
-
-
-def process_single_image(model, device, image_path, args):
-    """Process a single image file."""
-    image = cv2.imread(str(image_path))
-    if image is None:
-        print(f"Error: cannot read {image_path}")
-        return
-
-    if args.face_detect:
-        faces = detect_faces(image)
-        if not faces:
-            print("No face detected")
-            return
-        h, w = image.shape[:2]
-        for (fx, fy, fw, fh) in faces:
-            x1, y1, x2, y2 = expand_bbox(fx, fy, fw, fh, w, h)
-            crop = image[y1:y2, x1:x2]
-            tensor = preprocess_image(crop)
-            lm, gaze, angles, p6d, pt = run_inference(model, tensor, device,
-                                                       use_bridge=args.use_bridge)
-            image = visualize_predictions(image, lm, gaze, angles, p6d, pt,
-                                          crop_bbox=(x1, y1, x2, y2))
-    else:
-        # Assume the input is already a face crop
-        tensor = preprocess_image(image)
-        lm, gaze, angles, p6d, pt = run_inference(model, tensor, device,
-                                                   use_bridge=args.use_bridge)
-        image = visualize_predictions(image, lm, gaze, angles, p6d, pt)
-
-    # Display
-    cv2.imshow('RayNet Inference', image)
-    print("Press any key to close...")
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-
-    # Save if requested
-    if args.output:
-        cv2.imwrite(str(args.output), image)
-        print(f"Saved to {args.output}")
-
-
 def detect_faces(image_bgr):
-    """Try MediaPipe first, fall back to OpenCV Haar cascade."""
     try:
         boxes = detect_faces_mediapipe(image_bgr)
         if boxes:
@@ -409,8 +169,245 @@ def detect_faces(image_bgr):
     return detect_faces_opencv(image_bgr)
 
 
+def expand_to_square(x, y, w, h, img_w, img_h, factor=1.3):
+    """Square-ify and pad a detection box, clipped to image."""
+    cx, cy = x + w / 2.0, y + h / 2.0
+    side = max(w, h) * factor
+    x1 = max(0, int(round(cx - side / 2.0)))
+    y1 = max(0, int(round(cy - side / 2.0)))
+    x2 = min(img_w, int(round(cx + side / 2.0)))
+    y2 = min(img_h, int(round(cy + side / 2.0)))
+    return x1, y1, x2, y2
+
+
+def mage_bbox_from_pixels(x1, y1, x2, y2, img_w, img_h):
+    """
+    Synthesise (x_p, y_p, L_x) for the MAGE BoxEncoder from a pixel-space
+    bounding box, assuming a centred principal point. This mirrors
+    `dataset._intrinsic_delta_bbox` for the inference case where we have
+    no per-camera intrinsics: principal point at image centre, so
+    x_p = (cx_box - W/2) / (W/2), L_x = (x2-x1) / W.
+    """
+    W, H = float(img_w), float(img_h)
+    cx_box = 0.5 * (x1 + x2)
+    cy_box = 0.5 * (y1 + y2)
+    x_p = (cx_box - W * 0.5) / (W * 0.5)
+    y_p = (cy_box - H * 0.5) / (H * 0.5)
+    L_x = (x2 - x1) / W
+    return np.array([x_p, y_p, L_x], dtype=np.float32)
+
+
+# ─── Inference ──────────────────────────────────────────────────────
+
+@torch.no_grad()
+def run_inference(model, image_tensor, device, face_bbox=None):
+    """
+    Single-view forward pass through RayNet v5.
+
+    Args:
+        face_bbox: optional (3,) numpy or tensor [x_p, y_p, L_x]; passed
+            to PoseBranch's BoxEncoder. If None, BoxEncoder zeros out
+            (its residual is zero-init so the model still works, just
+            without the bbox prior in pose features).
+    """
+    image_tensor = image_tensor.to(device)
+    bbox_t = None
+    if face_bbox is not None:
+        bbox_t = torch.from_numpy(face_bbox).unsqueeze(0).to(device) \
+            if isinstance(face_bbox, np.ndarray) else face_bbox.to(device)
+
+    out = model(image_tensor, n_views=1, face_bbox=bbox_t,
+                aeri_alpha=0.9)
+
+    landmarks = out['landmark_coords'][0].cpu().numpy()
+    iris_logits = out['iris_mask_logits'][0].cpu().numpy()
+    eyeball_logits = out['eyeball_mask_logits'][0].cpu().numpy()
+    eyeball_center = out['eyeball_center'][0].cpu().numpy()
+    gaze_vector = out['gaze_vector'][0].cpu().numpy()
+    gaze_angles = out['gaze_angles'][0].cpu().numpy()
+    pose_6d = out['pred_pose_6d'][0].cpu().numpy()
+    pose_t = out['pred_pose_t'][0].cpu().numpy()
+
+    return {
+        'landmarks': landmarks,
+        'iris_mask': iris_logits,
+        'eyeball_mask': eyeball_logits,
+        'eyeball_center': eyeball_center,
+        'gaze_vector': gaze_vector,
+        'gaze_angles': gaze_angles,
+        'pose_6d': pose_6d,
+        'pose_t': pose_t,
+    }
+
+
+# ─── Drawing ────────────────────────────────────────────────────────
+
+def draw_landmarks(canvas, lm_px, radius=2):
+    for i in IRIS_IDX:
+        cv2.circle(canvas, tuple(lm_px[i].astype(int)), radius,
+                   COLOR_IRIS, -1, cv2.LINE_AA)
+    for i in PUPIL_IDX:
+        cv2.circle(canvas, tuple(lm_px[i].astype(int)), radius,
+                   COLOR_PUPIL, -1, cv2.LINE_AA)
+    for i in range(len(IRIS_IDX)):
+        p1 = tuple(lm_px[IRIS_IDX[i]].astype(int))
+        p2 = tuple(lm_px[IRIS_IDX[(i + 1) % len(IRIS_IDX)]].astype(int))
+        cv2.line(canvas, p1, p2, COLOR_IRIS, 1, cv2.LINE_AA)
+    for i in range(len(PUPIL_IDX)):
+        p1 = tuple(lm_px[PUPIL_IDX[i]].astype(int))
+        p2 = tuple(lm_px[PUPIL_IDX[(i + 1) % len(PUPIL_IDX)]].astype(int))
+        cv2.line(canvas, p1, p2, COLOR_PUPIL, 1, cv2.LINE_AA)
+
+
+def overlay_mask(canvas, mask_logits, x1, y1, x2, y2, color, alpha=0.35):
+    """Overlay a sigmoid-thresholded mask within a bounding box on canvas."""
+    prob = 1.0 / (1.0 + np.exp(-mask_logits))
+    crop_w, crop_h = x2 - x1, y2 - y1
+    prob = cv2.resize(prob, (crop_w, crop_h))
+    bin_mask = (prob > 0.5).astype(np.uint8)
+    if bin_mask.sum() == 0:
+        return
+    layer = canvas[y1:y2, x1:x2].copy()
+    color_arr = np.array(color, dtype=np.uint8)
+    layer[bin_mask == 1] = (
+        alpha * color_arr + (1 - alpha) * layer[bin_mask == 1]
+    ).astype(np.uint8)
+    canvas[y1:y2, x1:x2] = layer
+
+
+def draw_gaze_arrow(canvas, origin, gaze_vec, length=80, thickness=2):
+    """3D gaze vector → 2D arrow on canvas. CCS: x=right, y=down, z=forward."""
+    dx, dy, dz = gaze_vec[0], gaze_vec[1], gaze_vec[2]
+    scale = length / max(abs(dz), 0.1)
+    end = (int(origin[0] + dx * scale), int(origin[1] + dy * scale))
+    cv2.arrowedLine(canvas, (int(origin[0]), int(origin[1])), end,
+                    COLOR_GAZE, thickness, cv2.LINE_AA, tipLength=0.3)
+
+
+def draw_pose_axes(canvas, center, R_mat, axis_length=40, thickness=2):
+    origin = np.array(center, dtype=float)
+    for i, color in enumerate([COLOR_POSE_X, COLOR_POSE_Y, COLOR_POSE_Z]):
+        axis = R_mat[:, i]
+        end = origin + axis_length * np.array([axis[0], axis[1]])
+        cv2.arrowedLine(canvas,
+                        (int(origin[0]), int(origin[1])),
+                        (int(end[0]), int(end[1])),
+                        color, thickness, cv2.LINE_AA, tipLength=0.25)
+
+
+def draw_facebox(canvas, x1, y1, x2, y2, label='face'):
+    cv2.rectangle(canvas, (x1, y1), (x2, y2), COLOR_FACEBOX, 2)
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    cv2.rectangle(canvas, (x1, y1 - th - 6), (x1 + tw + 6, y1),
+                  COLOR_FACEBOX, -1)
+    cv2.putText(canvas, label, (x1 + 3, y1 - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+
+def draw_info_overlay(canvas, gaze_angles, pose_t, fps=None):
+    pitch_deg = math.degrees(gaze_angles[0])
+    yaw_deg = math.degrees(gaze_angles[1])
+    lines = [f"Gaze: pitch={pitch_deg:+.1f} yaw={yaw_deg:+.1f}"]
+    if pose_t is not None:
+        lines.append(f"Trans: x={pose_t[0]:+.2f} y={pose_t[1]:+.2f} "
+                     f"z={pose_t[2]:+.2f} m")
+    if fps is not None:
+        lines.append(f"FPS: {fps:.1f}")
+    y = 20
+    for line in lines:
+        (tw, th), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX,
+                                      0.5, 1)
+        cv2.rectangle(canvas, (8, y - th - 4), (12 + tw, y + 4),
+                      COLOR_BG, -1)
+        cv2.putText(canvas, line, (10, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_TEXT, 1,
+                    cv2.LINE_AA)
+        y += th + 12
+
+
+# ─── Visualisation pipeline ─────────────────────────────────────────
+
+def visualize(canvas, preds, x1, y1, x2, y2, feat_size=56,
+              show_masks=True):
+    """Annotate `canvas` with predictions for one face crop."""
+    crop_w, crop_h = x2 - x1, y2 - y1
+
+    if show_masks:
+        overlay_mask(canvas, preds['eyeball_mask'], x1, y1, x2, y2,
+                     COLOR_EYE_MASK, alpha=0.25)
+        overlay_mask(canvas, preds['iris_mask'], x1, y1, x2, y2,
+                     COLOR_IRIS_MASK, alpha=0.45)
+
+    # 14 landmarks: feature space (56) → crop space → frame space
+    sx = crop_w / feat_size
+    sy = crop_h / feat_size
+    lm_px = preds['landmarks'].copy()
+    lm_px[:, 0] = lm_px[:, 0] * sx + x1
+    lm_px[:, 1] = lm_px[:, 1] * sy + y1
+    draw_landmarks(canvas, lm_px, radius=max(2, int(crop_w / 80)))
+
+    eye_center = lm_px.mean(axis=0)
+    arrow_len = max(40, int(crop_w / 3))
+    draw_gaze_arrow(canvas, eye_center, preds['gaze_vector'],
+                    length=arrow_len, thickness=2)
+
+    R_mat = rotation_6d_to_matrix(preds['pose_6d'])
+    pose_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+    draw_pose_axes(canvas, pose_center, R_mat,
+                   axis_length=max(30, int(crop_w / 4)))
+
+    draw_facebox(canvas, x1, y1, x2, y2, label='face (input)')
+
+
+# ─── Drivers ────────────────────────────────────────────────────────
+
+def process_frame(model, device, frame, args):
+    canvas = frame.copy()
+    h, w = frame.shape[:2]
+
+    boxes = detect_faces(frame)
+    if not boxes:
+        cv2.putText(canvas, "No face detected", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2,
+                    cv2.LINE_AA)
+        return canvas, None
+
+    last_preds = None
+    for (fx, fy, fw, fh) in boxes:
+        x1, y1, x2, y2 = expand_to_square(fx, fy, fw, fh, w, h,
+                                          factor=args.crop_factor)
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+        tensor = preprocess_crop(crop)
+        face_bbox = mage_bbox_from_pixels(x1, y1, x2, y2, w, h)
+        preds = run_inference(model, tensor, device, face_bbox=face_bbox)
+        visualize(canvas, preds, x1, y1, x2, y2,
+                  show_masks=args.show_masks)
+        last_preds = preds
+
+    if last_preds is not None:
+        draw_info_overlay(canvas, last_preds['gaze_angles'],
+                          last_preds['pose_t'])
+    return canvas, last_preds
+
+
+def process_single_image(model, device, image_path, args):
+    image = cv2.imread(str(image_path))
+    if image is None:
+        print(f"Error: cannot read {image_path}")
+        return
+    canvas, _ = process_frame(model, device, image, args)
+    cv2.imshow('RayNet v5 Inference', canvas)
+    print("Press any key to close...")
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+    if args.output:
+        cv2.imwrite(str(args.output), canvas)
+        print(f"Saved to {args.output}")
+
+
 def process_video(model, device, source, args):
-    """Process video file or webcam stream."""
     if source == 'webcam':
         cap = cv2.VideoCapture(args.camera_id)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -422,7 +419,6 @@ def process_video(model, device, source, args):
         print(f"Error: cannot open {source}")
         return
 
-    # Video writer
     writer = None
     if args.output:
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -431,9 +427,7 @@ def process_video(model, device, source, args):
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         writer = cv2.VideoWriter(str(args.output), fourcc, fps, (w, h))
 
-    print("Press 'q' to quit, 'b' to toggle bridge, 'f' to toggle face detection")
-    use_bridge = args.use_bridge
-    use_face_det = args.face_detect
+    print("Keys: q=quit  m=toggle masks")
     fps_counter = 0
     fps_time = time.time()
     fps_display = 0.0
@@ -442,31 +436,8 @@ def process_video(model, device, source, args):
         ret, frame = cap.read()
         if not ret:
             break
+        canvas, _ = process_frame(model, device, frame, args)
 
-        canvas = frame.copy()
-
-        if use_face_det:
-            faces = detect_faces(frame)
-            h, w = frame.shape[:2]
-            for (fx, fy, fw, fh) in faces:
-                x1, y1, x2, y2 = expand_bbox(fx, fy, fw, fh, w, h)
-                crop = frame[y1:y2, x1:x2]
-                if crop.size == 0:
-                    continue
-                tensor = preprocess_image(crop)
-                lm, gaze, angles, p6d, pt = run_inference(
-                    model, tensor, device, use_bridge=use_bridge)
-                canvas = visualize_predictions(
-                    canvas, lm, gaze, angles, p6d, pt,
-                    crop_bbox=(x1, y1, x2, y2))
-        else:
-            tensor = preprocess_image(frame)
-            lm, gaze, angles, p6d, pt = run_inference(
-                model, tensor, device, use_bridge=use_bridge)
-            canvas = visualize_predictions(
-                canvas, lm, gaze, angles, p6d, pt)
-
-        # FPS counter
         fps_counter += 1
         elapsed = time.time() - fps_time
         if elapsed >= 1.0:
@@ -474,25 +445,22 @@ def process_video(model, device, source, args):
             fps_counter = 0
             fps_time = time.time()
 
-        # FPS + mode overlay
-        mode_text = f"FPS: {fps_display:.1f} | Bridge: {'ON' if use_bridge else 'OFF'} | FaceDet: {'ON' if use_face_det else 'OFF'}"
-        cv2.putText(canvas, mode_text, (10, canvas.shape[0] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_TEXT, 1, cv2.LINE_AA)
+        mode = (f"FPS: {fps_display:.1f} | Masks: "
+                f"{'ON' if args.show_masks else 'OFF'}")
+        cv2.putText(canvas, mode, (10, canvas.shape[0] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_TEXT, 1,
+                    cv2.LINE_AA)
 
-        cv2.imshow('RayNet Inference', canvas)
-
+        cv2.imshow('RayNet v5 Inference', canvas)
         if writer:
             writer.write(canvas)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
-        elif key == ord('b'):
-            use_bridge = not use_bridge
-            print(f"Bridge: {'ON' if use_bridge else 'OFF'}")
-        elif key == ord('f'):
-            use_face_det = not use_face_det
-            print(f"Face detection: {'ON' if use_face_det else 'OFF'}")
+        if key == ord('m'):
+            args.show_masks = not args.show_masks
+            print(f"Masks: {'ON' if args.show_masks else 'OFF'}")
 
     cap.release()
     if writer:
@@ -502,62 +470,51 @@ def process_video(model, device, source, args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='RayNet inference and visualization (OpenFace-style)',
+        description='RayNet v5 inference and visualization '
+                    '(Triple-M1 + AERI, embedded face detection)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    # Model architecture (no pretrained weights needed — checkpoint has everything)
-    parser.add_argument('--core_backbone', default='repnext_m3',
-                        help='Core backbone architecture name (default: repnext_m3)')
-    parser.add_argument('--pose_backbone', default='repnext_m1',
-                        help='Pose backbone architecture name (default: repnext_m1)')
-
-    # Checkpoint (local or MinIO)
     parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Path to local checkpoint file')
+                        help='Local checkpoint path')
     parser.add_argument('--run_id', type=str, default=None,
-                        help='MinIO run ID for checkpoint loading')
+                        help='MinIO run ID')
     parser.add_argument('--ckpt_file', type=str, default='best_model.pt',
-                        help='Checkpoint filename within the run (default: best_model.pt)')
-    parser.add_argument('--ckpt_bucket', type=str, default='raynet-checkpoints',
-                        help='MinIO bucket name')
+                        help='Checkpoint filename within run')
+    parser.add_argument('--ckpt_bucket', type=str,
+                        default='raynet-checkpoints',
+                        help='MinIO bucket')
     parser.add_argument('--minio_endpoint', type=str, default=None,
                         help='MinIO endpoint URL')
 
-    # Input
     parser.add_argument('--input', type=str, default=None,
-                        help='Path to image or video file')
+                        help='Image or video path')
     parser.add_argument('--webcam', action='store_true',
-                        help='Use webcam as input')
-    parser.add_argument('--camera_id', type=int, default=0,
-                        help='Camera device ID (default: 0)')
+                        help='Use webcam')
+    parser.add_argument('--camera_id', type=int, default=0)
 
-    # Output
     parser.add_argument('--output', type=str, default=None,
-                        help='Path to save output image or video')
+                        help='Save annotated image / video here')
 
-    # Options
-    parser.add_argument('--face_detect', action='store_true',
-                        help='Enable face detection (requires mediapipe or uses Haar)')
-    parser.add_argument('--use_bridge', action='store_true', default=True,
-                        help='Use LandmarkGazeBridge (default: True)')
-    parser.add_argument('--no_bridge', action='store_true',
-                        help='Disable LandmarkGazeBridge')
+    parser.add_argument('--show_masks', action='store_true', default=True,
+                        help='Overlay AERI iris+eyeball masks (default on)')
+    parser.add_argument('--no_masks', dest='show_masks',
+                        action='store_false',
+                        help='Disable AERI mask overlay')
+    parser.add_argument('--crop_factor', type=float, default=1.3,
+                        help='Square-crop expansion factor on the '
+                             'detected face box (default 1.3 — matches '
+                             'GazeGene face crop)')
 
     args = parser.parse_args()
-
-    if args.no_bridge:
-        args.use_bridge = False
 
     if not args.input and not args.webcam:
         parser.error("Provide --input (image/video) or --webcam")
 
-    # Load model
     print("Loading model...")
     model, device = load_model(args)
     print(f"Model loaded on {device}")
 
-    # Dispatch
     if args.webcam:
         process_video(model, device, 'webcam', args)
     elif args.input:
@@ -565,7 +522,6 @@ def main():
         if not path.exists():
             print(f"Error: {path} does not exist")
             sys.exit(1)
-
         ext = path.suffix.lower()
         if ext in ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'):
             process_single_image(model, device, path, args)
