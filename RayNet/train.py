@@ -102,7 +102,7 @@ PHASE_CONFIG = {
     # AERI seg weights raised to 1.0 so iris/eyeball masks are crisp
     # before HRFH-α consumes them in P2.
     1: {
-        'epochs': (1, 8),
+        'epochs': (1, 15),
         'lam_lm': 1.0,
         'lam_gaze': 0.0,        # gaze branch frozen
         'lam_gaze_sv': 0.0,
@@ -128,7 +128,7 @@ PHASE_CONFIG = {
     # because n_views == 1 means the single-view pathway IS the
     # supervision pathway — there is no CrossViewAttention to bypass.
     2: {
-        'epochs': (9, 18),
+        'epochs': (16, 30),
         'lam_lm': 0.0,          # landmark frozen
         'lam_gaze': 2.0,
         'lam_gaze_sv': 0.0,     # n_views==1 → pooled_sv == pooled, no SV side path
@@ -148,16 +148,26 @@ PHASE_CONFIG = {
         'freeze_set': 'face_only',  # freeze stem + landmark + pose
         'description': 'V5-P2: monocular gaze + AERI fine-tune (face frozen)',
     },
-    # ---- Phase 3 — full unfreeze, multi-view fusion at 5×–10× lower LR ----
+    # ---- Phase 3 — multi-view fusion at 5×–10× lower LR. Face frozen. ----
     # The cosine-decay-from-3e-4 schedule used in run_20260423_101115
     # over-shook the basin discovered in P2 (val_angular_deg climbed
     # from 12.43 at epoch 28 to 15.30 at epoch 35). We start from a
     # much lower LR; α stays at 0.7 — no ramp during fine-tune.
-    # Multi-view consistency ramps in via mv_weight = min(1, epoch/22)
-    # in train_one_epoch.
+    # Multi-view consistency ramps in via
+    #     mv_weight = min(1, max(0, (epoch - 30) / 5))
+    # in train_one_epoch — 5-epoch ramp anchored to the P3 start.
+    #
+    # Landmark fine-tune is intentionally OFF in P3:
+    #   - lam_lm = 0.0
+    #   - shared_stem + landmark_branch frozen via 'face_kept'
+    # Rationale: P1 already drove val_landmark_px to ≤2.2 px. Continuing
+    # to update the landmark branch in P3 risks pulling the shared stem
+    # in a direction that improves landmark sub-pixel error at the cost
+    # of the gaze representation. Pose still trains (it has no shared
+    # parameters with gaze beyond the detached s1 input).
     3: {
-        'epochs': (19, 35),
-        'lam_lm': 0.5,
+        'epochs': (31, 50),
+        'lam_lm': 0.0,          # landmark frozen — see freeze_set
         'lam_gaze': 2.0,
         'lam_gaze_sv': 1.0,     # close train/val gap when CrossViewAttn is on
         'lam_eyeball': 0.4,
@@ -173,8 +183,8 @@ PHASE_CONFIG = {
         'lr': 5e-5,             # 6× lower than P2 (was 3e-4)
         'sigma': 1.0,
         'multiview': True,
-        'freeze_set': 'none',
-        'description': 'V5-P3: multi-view fine-tune (all unfrozen, low LR)',
+        'freeze_set': 'face_kept',  # freeze stem + landmark, keep pose trainable
+        'description': 'V5-P3: multi-view gaze + pose (lm/stem frozen, low LR)',
     },
 }
 
@@ -208,7 +218,19 @@ FREEZE_SETS = {
             'pose_branch',
         ],
     },
-    # P3 — nothing frozen.
+    # P3 — landmark + shared stem frozen, pose stays trainable.
+    # Used when lam_lm == 0: keeping landmark/stem in train mode would
+    # let BN buffers drift on every forward pass without supervision,
+    # eroding the val_landmark_px earned in P1. Pose has no shared params
+    # with the gaze branch (s1 is detached on entry to both pose and
+    # gaze), so leaving it trainable does not destabilise gaze.
+    'face_kept': {
+        'freeze_modules': [
+            'shared_stem',
+            'landmark_branch',
+        ],
+    },
+    # Fully-unfrozen ablation set (kept for completeness / experiments).
     'none': {
         'freeze_modules': [],
     },
@@ -280,21 +302,21 @@ def get_scheduled_alpha(epoch):
     """
     Three-region AERI-α schedule aligned with the branch-staged curriculum.
 
-      - Phase 1 (epochs 1-8):  α = 0.4 — gaze branch is frozen, value is moot
-        but kept low to keep the (training-only) AERI losses from being
-        gated. Masks are still being learned.
-      - Phase 2 ramp (epochs 9-11): α linearly interpolated 0.4 → 0.7 over
-        the first 3 epochs of gaze training — small, deliberate ARI window
-        BEFORE LR cosine decay, not during fine-tune.
-      - Phase 2 fine-tune + Phase 3 (epochs 12+): α = 0.7 held constant.
+      - Phase 1 (epochs 1-15):  α = 0.4 — gaze branch is frozen, value is
+        moot but kept low to keep the (training-only) AERI losses from
+        being gated. Masks are still being learned.
+      - Phase 2 ramp (epochs 16-18): α linearly interpolated 0.4 → 0.7
+        over the first 3 epochs of gaze training — small, deliberate ARI
+        window BEFORE LR cosine decay, not during fine-tune.
+      - Phase 2 fine-tune + Phase 3 (epochs 19+): α = 0.7 held constant.
         The 0.4→0.9 ramp during cosine LR decay caused validation drift in
         triple_m1_aeri_iris_eyeball_500spc_run_20260423_101115 (val_angular
         12.4° → 15.3° from epoch 28 to 35). Hold α flat through fine-tune.
     """
     alpha_p1 = 0.4
     alpha_p2 = 0.7
-    ramp_start_epoch = 9   # first epoch of Phase 2
-    ramp_end_epoch = 12    # first epoch of constant α = alpha_p2
+    ramp_start_epoch = 16  # first epoch of Phase 2
+    ramp_end_epoch = 19    # first epoch of constant α = alpha_p2
 
     if epoch < ramp_start_epoch:
         return alpha_p1
@@ -522,7 +544,11 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                     lam_shape=cfg['lam_mask'],
                 )
                 if torch.isfinite(mv_loss):
-                    mv_weight = min(1.0, epoch / 10.0)  # smooth ramp
+                    # Smooth ramp from 0 → 1 over the first 5 epochs of P3
+                    # (epochs 31-35). Multi-view consistency only fires when
+                    # cfg['multiview'] is True, which is P3-only — so the
+                    # ramp window is anchored to the P3 start (epoch 30).
+                    mv_weight = min(1.0, max(0.0, (epoch - 30) / 5.0))
                     loss = loss + mv_weight * mv_loss
 
             # Scale loss by accumulation steps

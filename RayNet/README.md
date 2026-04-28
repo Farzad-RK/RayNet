@@ -75,15 +75,15 @@ The schedule is now interpreted as a **branch-staged curriculum** rather than pa
 
 | Phase | Epochs | Active branches | Frozen | LR | Multi-view |
 |-------|--------|-----------------|--------|----|------------|
-| 1 | 1–8 | landmark + AERI iris/eyeball seg + headpose | gaze branch (encoder, fusion, head) | 5e-4 | off |
-| 2 | 9–18 | gaze branch + AERI fine-tune | shared stem + landmark + pose | 3e-4 | off (monocular only) |
-| 3 | 19–35 | all branches, multi-view fusion + ray consistency | none | 3e-5 — 5e-5 | on |
+| 1 | 1–15 | landmark + AERI iris/eyeball seg + headpose | gaze branch (encoder, fusion, head) | 5e-4 | off |
+| 2 | 16–30 | gaze branch + AERI fine-tune | shared stem + landmark + pose | 3e-4 | off (monocular only) |
+| 3 | 31–50 | gaze + pose + AERI + multi-view fusion | shared stem + landmark | 5e-5 | on (5-epoch ramp) |
 
-**Phase 1** establishes the landmark foundation (val_landmark_px ≤ 2.2 px) and crisp iris/eyeball masks (val seg loss ≤ 0.005 / 0.012). The gaze loss is OFF (`lam_gaze = lam_eyeball = lam_pupil = lam_geom_angular = 0`); seg weights are lifted to 1.0 to drive masks to convergence before HRFH-α consumes them.
+**Phase 1** establishes the landmark foundation (val_landmark_px ≤ 2.2 px) and crisp iris/eyeball masks (val seg loss ≤ 0.005 / 0.012). The gaze loss is OFF (`lam_gaze = lam_eyeball = lam_pupil = lam_geom_angular = 0`); seg weights are lifted to 1.0 to drive masks to convergence before HRFH-α consumes them. P1 was extended from 8 to 15 epochs because under-trained landmarks cap downstream gaze quality — the gaze branch consumes `s1` (and the AERI head sits on the same shared stem), so any sub-pixel error in P1 propagates.
 
-**Phase 2** trains gaze monocularly. Hold `aeri_alpha = 0.7` constant — do NOT ramp during fine-tune. Mask dropout is disabled so train and val see the same gating function. `lam_iris_seg = lam_eyeball_seg = 0.5` keeps the masks stable while gaze adapts. CrossViewAttention is short-circuited (`n_views=1`); use a single-view dataloader.
+**Phase 2** trains gaze monocularly. `aeri_alpha` ramps 0.4 → 0.7 over the first 3 epochs of P2 (epochs 16-18), then holds at 0.7 — do NOT ramp during fine-tune. `lam_iris_seg = lam_eyeball_seg = 0.5` keeps the masks stable while gaze adapts. CrossViewAttention is short-circuited (`n_views=1`); use a single-view dataloader.
 
-**Phase 3** unfreezes everything at a much lower LR (5×–10× lower than P2) for 2 epochs of monocular settling, then turns on `multiview=True`, `lam_reproj=0.1`, `lam_mask=0.05`. Early-stop on `val_angular_deg` with patience=3. `aeri_alpha` stays constant at the P2 value — the ARI ramp belongs in P1→P2, not in fine-tune.
+**Phase 3** turns on `multiview=True`, `lam_reproj=0.1`, `lam_mask=0.05`, with `mv_weight = min(1, max(0, (epoch − 30) / 5))` ramping the consistency loss in over the first 5 epochs. The shared stem and landmark branch are frozen (`freeze_set='face_kept'`) and `lam_lm = 0` — landmark fine-tune in P3 risks pulling the shared stem in a direction that helps sub-pixel landmark error at the cost of the gaze representation. Pose stays trainable (no shared params with gaze). `aeri_alpha` stays constant at 0.7.
 
 Phase transitions preserve optimizer momentum and rebuild only the `CosineAnnealingLR` for the new phase window. Gradient clipping is `max_norm=5.0` in phase 1 and `max_norm=2.0` afterwards. AMP uses GradScaler only when dtype is fp16; bf16 skips the scaler.
 
@@ -93,8 +93,9 @@ Fork/warmstart/resume machinery is preserved for cross-architecture migrations v
 
 α controls how much the saliency mask gates gaze features vs. the uniform field. `scheduled_mask = α·saliency + (1−α)·1`.
 
-  - `α = 0.4` (Phases 1, P2 epochs 1-3) — moderate reliance, lets the gaze head see global features while masks are fresh.
-  - `α = 0.7` (Phase 2 fine-tune) — held constant after the gaze head has committed to the saliency-conditioned features.
+  - `α = 0.4` (Phase 1, epochs 1-15) — gaze branch is frozen, value is moot but kept low to avoid suppressing AERI seg supervision on training-only masks.
+  - `α = 0.4 → 0.7` linear ramp over P2 epochs 16-18 (3 epochs).
+  - `α = 0.7` (P2 fine-tune + Phase 3, epochs 19+) — held constant.
   - The previously-shipped `0.4 → 0.9` linear ramp during the cosine LR decay caused validation drift in `triple_m1_aeri_iris_eyeball_500spc_run_20260423_101115` (val_angular climbs from 12.4° at epoch 28 to 15.3° at epoch 35 as α approaches 0.9). Hold α constant during fine-tune.
 
 ## Data Loaders
