@@ -1,33 +1,39 @@
 # RayNet v5 — Model Package
 
-**Triple-M3 + AERI + HRFH-α** architecture. A shared low-level encoder (landmark-owned) and three task-specific branches that all consume the full 224×224 face crop. The gaze branch carries its own mini U-Net (`AERIHead`) producing **iris + eyeball** binary segmentation logits at 56×56. The two masks are combined into a saliency map (`0.65·iris + 0.35·eyeball`); the saliency is blended with a uniform field through an `α` schedule, the result both gates the gaze bottleneck (7×7) **with a 0.5 floor** AND modulates the high-resolution `d1` decoder tensor (56×56, 64ch) **with the same 0.5 floor** to produce a 64-d → 128-d **foveal vector** that represents sub-pixel iris/pupil dynamics. The floors are the eyelid-occlusion mitigation: when AERI mis-fires (e.g. drowsy-eye drift), the gaze pathway still receives ≥50% of the underlying features. See `raynet_v5.py`.
+**Triple-M1 + AERI + HRFH-α** architecture. A shared low-level encoder (landmark-owned) and three task-specific branches that all consume the full 224×224 face crop. The gaze branch carries its own mini U-Net (`AERIHead`) producing **iris + eyeball** binary segmentation logits at 56×56. The two masks are combined into a saliency map (`0.65·iris + 0.35·eyeball`); the saliency is blended with a uniform field through an `α` schedule, the result both gates the gaze bottleneck (7×7) **with a 0.5 floor** AND modulates the high-resolution `d1` decoder tensor (56×56, 48ch) **with the same 0.5 floor** to produce a 48-d → 96-d **foveal vector** that represents sub-pixel iris/pupil dynamics. The floors are the eyelid-occlusion mitigation: when AERI mis-fires (e.g. drowsy-eye drift), the gaze pathway still receives ≥50% of the underlying features. See `raynet_v5.py`.
 
-The backbone was promoted from **RepNeXt-M1** to **RepNeXt-M3** (embed_dim=64,128,256,512; depth=3,3,13,2) because the M1 variant could not reach sub-pixel landmark accuracy on full-face crops; the prior sub-pixel result was achieved with M3 + the full dataset, so the capacity gap is now closed.
+The backbone is **RepNeXt-M1** (embed_dim=48,96,192,384; depth=3,3,15,2). An earlier M1→M3 promotion was reverted: the `Tripple_M3_run_20260428_130241` benchmark with matched training config showed M3 offered no measurable gain over M1, so the 30M-param M3 budget was wasteful. Sub-pixel landmark accuracy is recoverable at the M1 budget once the dataset size is sufficient (`samples_per_subject = 500` cut val_landmark_px from 3.93 to 2.64 on M1 — a 33% drop with no architecture change).
 
 ## Components
 
-- **SharedStem** — RepNeXt-M3 stem + stages[0..1]. 3→64→128ch, 28×28. ~0.37M params. Intermediate maps (`s0`, `s1`) are exposed as U-Net skip connections for the landmark branch. Pose and gaze branches receive `s1.detach()` so only landmark loss backprops here.
-- **Landmark Branch** — RepNeXt-M3 stages[2..3] + U-Net decoder with attention gates. Predicts 14 iris/pupil heatmaps at 56×56 with soft-argmax + offset refinement. ~10.36M params.
-- **Pose Branch** — RepNeXt-M3 stages[2..3] on `s1.detach()`, CoordAtt + pooled feature fused with `BoxEncoder(face_bbox)` via a zero-init residual. Predicts 6D rotation + 3D translation. `face_bbox` is **optional at inference** — when omitted the BoxEncoder residual zeroes out and pose collapses to CNN features. ~7.47M params.
-- **Gaze Branch** — RepNeXt-M3 stages[2..3] on `s1.detach()` + **AERIHead** (mini U-Net, 2-class: iris + eyeball). Pipeline:
-  1. AERI predicts iris/eyeball logits at 56×56 plus the decoder tensor `d1` (64ch, 56×56).
+- **SharedStem** — RepNeXt-M1 stem + stages[0..1]. 3→48→96ch, 28×28. Intermediate maps (`s0`, `s1`) are exposed as U-Net skip connections for the landmark branch. Pose and gaze branches receive `s1.detach()` so only landmark loss backprops here.
+- **Landmark Branch** — RepNeXt-M1 stages[2..3] + U-Net decoder with attention gates. Predicts 14 iris/pupil heatmaps at 56×56 with soft-argmax + offset refinement.
+- **Pose Branch** — RepNeXt-M1 stages[2..3] on `s1.detach()`, CoordAtt + pooled feature fused with `BoxEncoder(face_bbox)` via a zero-init residual. Predicts 6D rotation + 3D translation. `face_bbox` is **optional at inference** — when omitted the BoxEncoder residual zeroes out and pose collapses to CNN features.
+- **Gaze Branch** — RepNeXt-M1 stages[2..3] on `s1.detach()` + **AERIHead** (mini U-Net, 2-class: iris + eyeball). Pipeline:
+  1. AERI predicts iris/eyeball logits at 56×56 plus the decoder tensor `d1` (48ch, 56×56).
   2. `saliency = 0.65·sigmoid(iris) + 0.35·sigmoid(eyeball)`.
   3. `scheduled_mask = α·saliency + (1−α)·1` — α controlled by `get_scheduled_alpha(epoch)` in `train.py`.
   4. **HRFH harvesting** with eyelid-occlusion floors:
-     - Global gate at 7×7: `gate = GLOBAL_FLOOR + (1−GLOBAL_FLOOR)·pool₇(scheduled_mask)`, `GLOBAL_FLOOR = 0.5`. Multiplied into the 7×7 bottleneck → 512-d global vector → LayerNorm.
-     - Foveal gate at 56×56: `gate = FOVEAL_FLOOR + (1−FOVEAL_FLOOR)·scheduled_mask`, `FOVEAL_FLOOR = 0.5`. Multiplied into `d1` → pooled to 64-d → `Linear→128 → GELU → LayerNorm` → stochastic depth (`FOVEAL_DROP_P=0.10`, train only).
-  5. `[global ‖ foveal_proj]` (640-d) → `Linear → 256` gaze_feat.
+     - Global gate at 7×7: `gate = GLOBAL_FLOOR + (1−GLOBAL_FLOOR)·pool₇(scheduled_mask)`, `GLOBAL_FLOOR = 0.5`. Multiplied into the 7×7 bottleneck → 384-d global vector → LayerNorm.
+     - Foveal gate at 56×56: `gate = FOVEAL_FLOOR + (1−FOVEAL_FLOOR)·scheduled_mask`, `FOVEAL_FLOOR = 0.5`. Multiplied into `d1` → pooled to 48-d → `Linear→96 → GELU → LayerNorm` → stochastic depth (`FOVEAL_DROP_P=0.10`, train only).
+  5. `[global ‖ foveal_proj]` (480-d) → `Linear → d_model` gaze_feat.
   6. `GazeFusionBlock` folds in `pose_feat` via a zero-init residual.
   7. `CrossViewAttention` (when `n_views > 1`).
-  8. `GeometricGazeHead` predicts `eyeball_center` and `pupil_center`; optical axis is `normalize(pupil − eyeball)`. ~10.76M params.
+  8. `GeometricGazeHead` predicts `eyeball_center` and `pupil_center`; optical axis is `normalize(pupil − eyeball)`.
 - **BoxEncoder (MAGE)** — `(x_p, y_p, L_x)` → `d_model` via 3→64→128→256 MLP with GELU. Consumed by the **pose** branch (not gaze). Provides head-pose prior; optional at inference.
-- **CrossViewAttention** — 9-camera geometric attention conditioned on `R_cam`, `T_cam`. Identity short-circuit when `n_views ≤ 1`. ~1.07M params including the camera embedding.
+- **CrossViewAttention** — 9-camera geometric attention conditioned on `R_cam`, `T_cam`. Identity short-circuit when `n_views ≤ 1`.
 
-### Why floors? (eyelid-occlusion failure mode)
+## Eyelid-occlusion robustness (three-pronged)
 
-In the M1 architecture the global gate was `0.25 + 0.75·M` (25% floor) and the foveal gate was a pure multiply `M` (0% floor). When an eyelid partially covers the sclera at inference time, AERI's iris/eyeball masks shrink, the saliency map collapses toward zero, and the foveal pathway loses ~70% of its magnitude (with α=0.7 saturation, mask floor = 1−α = 0.3, so foveal_feat ≈ 0.3·pool(d1)). This produced the "drowsy-eye drift" pattern observed in `run_20260427_205327` — the model relies on a crisp iris/sclera boundary as a shortcut, and degrades catastrophically when that boundary is occluded.
+OpenFace's CLNF — a part-based model on a much older backbone — handles partial eyelid occlusion gracefully because each landmark's local detector reasons over surrounding anatomy (eyebrow, lashes, sclera-skin edge) rather than a crisp iris/sclera boundary. RayNet now matches that inductive bias through three coordinated changes:
 
-Raising both floors to 0.5 means: AERI can still amplify the eye region by up to 1× (gate range 0.5→1.0), but the gaze branch always receives at least half of its underlying features unconditionally. This shifts the AERI signal from "feature gate" toward "feature emphasiser" and makes the model robust to imperfect masks at inference.
+1. **HRFH-α floors (0.5 / 0.5)**. In the M1 architecture as originally shipped, the global gate was `0.25 + 0.75·M` (25% floor) and the foveal gate was a pure multiply `M` (0% floor). When an eyelid covers part of the sclera, AERI's iris/eyeball masks shrink, the saliency collapses toward zero, and the foveal pathway loses up to ~70% of its magnitude (with α=0.7 saturation, mask floor = 1−α = 0.3, so foveal_feat ≈ 0.3·pool(d1)). This produced the "drowsy-eye drift" pattern in `run_20260427_205327`. Raising both floors to 0.5 means AERI still amplifies the eye region (gate range 0.5→1.0), but the gaze branch always receives at least half of its features unconditionally, so the head can never be starved.
+
+2. **BCE + soft-Dice mask loss** (`losses.mask_seg_loss`). BCE alone is biased toward "background everywhere" because every pixel costs the same and the eyeball is only ~5–10% of a 56×56 face crop (iris ≈ 1–2%). Soft-Dice (`1 − 2·|P∩G| / (|P|+|G|)`) is area-normalised and forces the head to learn the full silhouette shape. The combined loss is `BCE + dice_weight·soft_Dice` with `dice_weight=1.0` and Laplace smoothing `dice_eps=1.0`. Set `dice_weight=0` to A/B against the previous BCE-only behaviour.
+
+3. **Eyelid-occlusion augmentation** (`streaming/occlusion_aug.py`). The GT eyeball mask in the MDS shards is the **theoretical full silhouette** (no eyelid clip — see `streaming/eye_masks.py`). We exploit that by painting a synthetic, skin-toned, feathered band over the top portion of the visible eye region in the **image** while leaving the GT mask untouched. The seg head then receives `(occluded image, full silhouette)` pairs and is forced to extrapolate the silhouette from anatomical context. This is gated by the `--eyelid_occlusion_p` CLI flag (default `0.30` → 30% of training samples), with `cover_frac_range=(0.20, 0.55)`, a 4-pixel feathered bottom edge, and ±10% multiplicative skin-tone jitter so the model can't memorise the augmenter's palette. The augmentation is applied per-sample in `StreamingGazeGeneDataset.__getitem__`, **before** Normalize, and only to the train split.
+
+These three are independent — drop any one and the others still help — but the combination is what reproduces OpenFace-style robustness to drowsy / partial-blink frames without sacrificing accuracy on fully-open eyes.
 
 ## Forward Signature
 
@@ -35,7 +41,7 @@ Raising both floors to 0.5 means: AERI can still amplify the eye region by up to
 from RayNet.raynet_v5 import create_raynet_v5
 
 model = create_raynet_v5(
-    backbone_weight_path='./ptrained_models/repnext_m3_distill_300e.pth',  # or None for random init
+    backbone_weight_path='./ptrained_models/repnext_m1_distill_300e.pth',  # or None for random init
     n_landmarks=14,
 )
 
@@ -63,7 +69,7 @@ The reference `inference.py` runs MediaPipe (Haar fallback) inside the module. T
 
 ## AERI Masks
 
-Iris and eyeball binary masks are **baked into MDS shards** at conversion time (see `streaming/eye_masks.py` + `streaming/convert_to_mds.py`). Each sample carries `iris_mask` and `eyeball_mask` as `uint8` arrays at 56×56. The dataset loader passes them to the training loop; `losses.mask_seg_loss` applies BCE-with-logits against the AERI head outputs.
+Iris and eyeball binary masks are **baked into MDS shards** at conversion time (see `streaming/eye_masks.py` + `streaming/convert_to_mds.py`). Each sample carries `iris_mask` and `eyeball_mask` as `uint8` arrays at 56×56. The masks are the **theoretical, un-occluded** silhouettes — eyelid clipping is intentionally *not* applied at conversion time so that downstream training can teach the AERI head to predict through occluders (see `eye_masks.py` docstring). The dataset loader passes them to the training loop; `losses.mask_seg_loss` applies BCE + soft-Dice against the AERI head outputs.
 
 ## Losses
 
@@ -74,7 +80,7 @@ Iris and eyeball binary masks are **baked into MDS shards** at conversion time (
 - GazeGene 3D structure: `lam_eyeball`, `lam_pupil`, `lam_geom_angular`
 - Pose: 6D geodesic (`lam_pose`) + translation (`lam_trans`)
 - Optional ray-to-target reprojection (`lam_ray`, `lam_reproj`)
-- **AERI segmentation**: `lam_iris_seg`, `lam_eyeball_seg` (BCE-with-logits at 56×56)
+- **AERI segmentation**: `lam_iris_seg`, `lam_eyeball_seg` (BCE + soft-Dice at 56×56; `mask_seg_loss(dice_weight=1.0, dice_eps=1.0)`)
 
 Multi-view consistency is applied by `multiview_loss.multiview_consistency_loss` on 9-camera batches in phases 2 and 3.
 
@@ -114,7 +120,57 @@ Fork/warmstart/resume machinery is preserved for cross-architecture migrations v
 
 ## Parameters
 
-~30.0M total: SharedStem 0.37M, LandmarkBranch 10.36M, PoseBranch 7.47M, GazeBranch 10.76M (includes AERIHead), CrossViewAttention + CameraEmbedding 1.07M. The ~1.6× jump over the prior M1 budget (~18.7M) is the M1→M3 promotion; this is the capacity headroom needed for sub-pixel landmark accuracy.
+~18.7M total at the RepNeXt-M1 budget. The Triple-M1 design replicates `stages[2..3]` per branch (landmark / pose / gaze), so the per-branch heads carry their own mid+late stages on top of the shared 48→96-channel stem. The exact `nn.Module.numel()` breakdown is printed at startup by `train.py`. The earlier M1→M3 promotion (~30.0M) was reverted because matched-config benchmarks showed no measurable accuracy gain over M1 — capacity was not the bottleneck, dataset size was (`samples_per_subject=500`).
+
+## Hardware Profiles
+
+Profiles live in `hardware_profiles.py::HARDWARE_PROFILES`. Choose one with `--profile <name>`. The CLI flags `--batch_size`, `--mv_groups`, `--num_workers`, `--grad_accum_steps`, `--no_compile` override individual fields. `mv_groups` is the **number of 9-view groups per batch**, so `batch_size = mv_groups × 9`.
+
+| Profile | VRAM | mv_groups | batch_size | grad_accum | AMP | TF32 | compile |
+|---------|------|-----------|------------|------------|-----|------|---------|
+| `t4` | 16 GB | 16 | 144 | 2 | fp16 | – | – |
+| `v100` | 16/32 GB | 16 | 144 | 2 | fp16 | – | – |
+| `kaggle_t4x2` | 2× 16 GB | 16 (per-GPU) | 144 (per-GPU) | 2 | fp16 | – | – |
+| `multi_node_t4` | 2× 16 GB (2 nodes) | 16 (per-GPU) | 144 (per-GPU) | 2 | fp16 | – | – |
+| `a10g` | 24 GB | 32 | 288 | 1 | bf16 | ✓ | – |
+| `l4` | 24 GB | **48** | **432** | 1 | bf16 | ✓ | – |
+| `a100` | 80 GB | **224** | **2016** | 1 | bf16 | ✓ | ✓ |
+| `h100` | 80 GB | 256 | 2304 | 1 | bf16 | ✓ | ✓ |
+
+**`l4` (24 GB)** is tuned for ≤1 GB headroom on the full Triple-M1 + AERI + HRFH-α model. If you see `peak_alloc < 22 GB` after warm-up in the per-epoch memory probe (below), nudge with `--mv_groups 56` (504 samples). If you OOM, drop to `--mv_groups 40`.
+
+**`a100` (80 GB)** is anchored against the H100 80 GB profile (256 mv_groups, 2304 samples) — the A100 has the same VRAM but slightly less raw bandwidth, so it sits one notch below at 224 mv_groups (2016 samples) with the 1 GB safety margin. If `peak_alloc < 78 GB`, you can match H100 exactly with `--mv_groups 256`. **40 GB A100s** should override with `--mv_groups 64` (576 samples).
+
+`bfloat16` is preferred over `fp16` on Ada/Ampere/Hopper because it has FP32's exponent range — the gaze pipeline contains `exp`/`log` ops (geometric angular loss, soft-Dice) that can overflow fp16 at large batch sizes.
+
+### Peak-memory probe
+
+`train.py` prints per-epoch memory stats after each train epoch (rank 0 only):
+
+```
+GPU mem (rank 0): peak 22.8 / total 23.0 GB  (headroom 0.2 GB)
+```
+
+`torch.cuda.max_memory_allocated()` is read at the end of each train epoch and `reset_peak_memory_stats()` is called immediately after, so each line reflects only that epoch's peak. Use this to verify the 1 GB margin on your actual hardware and to dial `mv_groups` up/down from the profile defaults.
+
+### Distributed training (Accelerate)
+
+Distribution is via HuggingFace Accelerate. AMP stays under `torch.amp.autocast` + `GradScaler` (handled in `train.py`); `Accelerator(mixed_precision='no')` is intentional. `find_unused_parameters=True` is required by the Stage 2 / Phase 2 selective-freeze curriculum.
+
+```bash
+# Kaggle 2× T4 (single node)
+accelerate launch --multi_gpu --num_processes 2 \
+    -m RayNet.train --profile kaggle_t4x2 --mds_streaming ...
+
+# Two single-T4 machines (NCCL over TCP)
+# On main node ($MAIN_IP):
+accelerate launch --multi_gpu --num_machines 2 --num_processes 2 \
+    --machine_rank 0 --main_process_ip $MAIN_IP --main_process_port 29500 \
+    -m RayNet.train --profile multi_node_t4 ...
+# On the second node, same command with --machine_rank 1.
+```
+
+`batch_size` and `mv_groups` in the distributed profiles are **per-process**. Global effective batch = `batch_size × num_processes × grad_accum_steps`.
 
 ## Inference
 

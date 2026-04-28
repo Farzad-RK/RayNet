@@ -47,10 +47,15 @@ class StreamingGazeGeneDataset(_Base):
     via mosaicml-streaming.
     """
 
-    def __init__(self, transform=None,samples_per_subject=None  , **kwargs):
+    def __init__(self, transform=None, samples_per_subject=None,
+                 eyelid_occlusion_p=0.0, **kwargs):
         super().__init__(**kwargs)
         self.transform = transform
         self.samples_per_subject = samples_per_subject
+        # Eyelid-occlusion augmentation probability (per-sample, train only).
+        # 0.0 disables it entirely; values in [0.2, 0.4] are a reasonable
+        # range for AERI robustness tuning. See streaming/occlusion_aug.py.
+        self.eyelid_occlusion_p = float(eyelid_occlusion_p)
 
     def __getitem__(self, idx):
         raw = super().__getitem__(idx)
@@ -73,6 +78,17 @@ class StreamingGazeGeneDataset(_Base):
 
         # 4. Convert to Torch Tensor (H, W, C) -> (C, H, W)
         img = torch.from_numpy(img_np).permute(2, 0, 1).contiguous().float().div(255.0)
+
+        # 4a. Eyelid-occlusion augmentation (BEFORE Normalize). Uses the
+        # GT eyeball_mask to find the eye bbox; the GT mask itself is
+        # NOT modified — the seg head must learn to predict the full
+        # silhouette through the synthetic occluder. See
+        # streaming/occlusion_aug.py for the rationale.
+        if self.eyelid_occlusion_p > 0 and 'eyeball_mask' in raw:
+            from RayNet.streaming.occlusion_aug import random_eyelid_occlusion
+            eb_tensor = torch.from_numpy(np.ascontiguousarray(raw['eyeball_mask']))
+            img = random_eyelid_occlusion(img, eb_tensor,
+                                          p=self.eyelid_occlusion_p)
 
         if self.transform is not None:
             img = self.transform(img)
@@ -201,6 +217,7 @@ def create_streaming_dataloaders(
     prefetch_factor=2,
     persistent_workers=False,
     samples_per_subject=None,
+    eyelid_occlusion_p=0.0,
     **streaming_kwargs,
 ):
     """
@@ -248,6 +265,7 @@ def create_streaming_dataloaders(
         shuffle=shuffle_train,
         batch_size=batch_size,
         samples_per_subject=samples_per_subject,
+        eyelid_occlusion_p=eyelid_occlusion_p,
         **streaming_kwargs,
     )
 
@@ -259,6 +277,7 @@ def create_streaming_dataloaders(
         shuffle=False,
         batch_size=batch_size,
         samples_per_subject=samples_per_subject,
+        eyelid_occlusion_p=0.0,            # never augment val
         **streaming_kwargs,
     )
 
@@ -299,6 +318,7 @@ def create_multiview_streaming_dataloaders(
     prefetch_factor=2,
     persistent_workers=False,
     samples_per_subject=None,
+    eyelid_occlusion_p=0.0,
     **streaming_kwargs,
 ):
     """
@@ -343,6 +363,7 @@ def create_multiview_streaming_dataloaders(
         prefetch_factor=prefetch_factor,
         persistent_workers=persistent_workers,
         samples_per_subject=samples_per_subject,
+        eyelid_occlusion_p=eyelid_occlusion_p,
         **streaming_kwargs,
     )
 

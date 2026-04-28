@@ -1,7 +1,7 @@
 """
 RayNet v5 inference and visualization tool.
 
-Triple-M3 + AERI architecture (raynet_v5). Embedded face detection: the
+Triple-M1 + AERI architecture (raynet_v5). Embedded face detection: the
 caller passes a full frame, the module detects the face internally
 (MediaPipe with Haar cascade fallback), crops to 224x224, and runs the
 v5 model. Visualizes:
@@ -64,7 +64,7 @@ COLOR_EYE_MASK = (0, 255, 255)
 
 def load_model(args):
     """
-    Build RayNet v5 (Triple-M3) and load the trained state dict from the
+    Build RayNet v5 (Triple-M1) and load the trained state dict from the
     checkpoint. Backbone .pth weights are NOT required at inference —
     every parameter is in the checkpoint.
     """
@@ -471,7 +471,7 @@ def process_video(model, device, source, args):
 def main():
     parser = argparse.ArgumentParser(
         description='RayNet v5 inference and visualization '
-                    '(Triple-M3 + AERI, embedded face detection)',
+                    '(Triple-M1 + AERI, embedded face detection)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 

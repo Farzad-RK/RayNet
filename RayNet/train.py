@@ -1533,9 +1533,18 @@ def train(args):
                   f"Val: loss={val_losses['total']:.4f} lm_px={val_losses['landmark_px']:.2f}px "
                   f"ang={val_losses['angular_deg']:.2f}deg")
 
-            if hw['amp'] and device.type == 'cuda':
-                mem_gb = torch.cuda.max_memory_allocated() / 1e9
-                print(f"  GPU memory peak (rank 0): {mem_gb:.1f} GB")
+            if device.type == 'cuda':
+                gpu_idx = device.index if device.index is not None else 0
+                peak_gb = torch.cuda.max_memory_allocated() / 1e9
+                total_gb = torch.cuda.get_device_properties(
+                    gpu_idx).total_memory / 1e9
+                headroom_gb = total_gb - peak_gb
+                print(f"  GPU mem (rank 0): peak {peak_gb:.1f} / "
+                      f"total {total_gb:.1f} GB  "
+                      f"(headroom {headroom_gb:.1f} GB)")
+                # Reset so each epoch reports its own peak; the worst
+                # epoch over the run is what determines the safe batch.
+                torch.cuda.reset_peak_memory_stats()
 
             csv_writer.writerow([
                 epoch, phase, f"{current_lr:.2e}",
@@ -1742,6 +1751,7 @@ def _create_mds_mv_loader(args, hw):
         prefetch_factor=hw['prefetch_factor'],
         persistent_workers=hw['persistent_workers'],
         samples_per_subject=args.samples_per_subject,
+        eyelid_occlusion_p=args.eyelid_occlusion_p,
     )
     return train_loader_mv, val_loader_mv
 
@@ -1758,6 +1768,14 @@ def parse_args():
                         help='Output directory for checkpoints and logs')
     parser.add_argument('--samples_per_subject', type=int, default=200)
     parser.add_argument('--eye', type=str, default='L', choices=['L', 'R'])
+    parser.add_argument('--eyelid_occlusion_p', type=float, default=0.30,
+                        help='Per-sample probability of synthetic eyelid '
+                             'occlusion in the train transform. The GT '
+                             'eyeball/iris masks are NOT modified — the '
+                             'AERI head is supervised to predict the full '
+                             'silhouette through the occluder, which is '
+                             'what gives OpenFace-style robustness to '
+                             'partial blinks at inference. 0.0 disables.')
 
     # MDS streaming (MosaicML + MinIO)
     parser.add_argument('--mds_streaming', action='store_true',
@@ -1767,10 +1785,10 @@ def parse_args():
     parser.add_argument('--mds_val', type=str, default=None,
                         help='MDS shard URL for validation (e.g. s3://gazegene/val)')
 
-    # Model — v5 uses RepNeXt-M3 for all branches (shared stem + 3 branches)
+    # Model — v5 uses RepNeXt-M1 for all branches (shared stem + 3 branches)
     parser.add_argument('--core_backbone_weight_path', type=str, default=None,
-                        help='Path to pretrained RepNeXt-M3 weights '
-                             '(loaded into all 4 M3 instances: shared + landmark + gaze + pose). '
+                        help='Path to pretrained RepNeXt-M1 weights '
+                             '(loaded into all 4 M1 instances: shared + landmark + gaze + pose). '
                              'Pass None / empty to train from random init.')
 
     # Hardware profile

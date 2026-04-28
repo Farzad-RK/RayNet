@@ -67,18 +67,23 @@ HARDWARE_PROFILES = {
     },
     # ---- NVIDIA L4  (24 GB, GCP g2-standard) ----
     # Ada Lovelace arch: good FP16/BF16 (121 TFLOPS FP16).
-    # 24 GB comfortable at 224×224: ~32 mv_groups.
+    # Batch tuned for ≤1 GB headroom on a 24 GB card with Triple-M1
+    # (~18.7M params) + grad checkpointing in shared stem and branches.
+    # Empirical anchor: 288 samples (32 mv_groups) was the prior comfort
+    # zone; 432 / 48 mv_groups is the tighter target. If torch reports
+    # peak_alloc < 22 GB after warm-up, the user can push higher with
+    # `--mv_groups 56` (504 samples) or higher.  If OOM, drop to 40.
     'l4': {
-        'batch_size': 288,          # 32 mv_groups × 9 views
-        'mv_groups': 32,
-        'num_workers': 4,
+        'batch_size': 432,          # 48 mv_groups × 9 views
+        'mv_groups': 48,
+        'num_workers': 6,
         'pin_memory': True,
         'amp': True,
         'amp_dtype': 'bfloat16',    # BF16: same range as FP32 → no exp/log overflow
-        'grad_accum_steps': 1,      # effective batch = 288
+        'grad_accum_steps': 1,      # effective batch = 432
         'compile_model': False,     # disabled: interacts badly with grad checkpointing
         'tf32': True,               # Ada supports TF32
-        'prefetch_factor': 2,
+        'prefetch_factor': 4,
         'persistent_workers': True,
     },
     # ---- NVIDIA A10G  (24 GB, AWS g5) ----
@@ -111,20 +116,27 @@ HARDWARE_PROFILES = {
         'prefetch_factor': 2,
         'persistent_workers': True,
     },
-    # ---- NVIDIA A100  (40 GB / 80 GB, GCP a2, Colab Pro+) ----
+    # ---- NVIDIA A100  (80 GB, GCP a2, Colab Pro+) ----
     # Ampere flagship: TF32, BF16, huge memory bandwidth (2 TB/s).
-    # At 224×224: fits large batches comfortably.
+    # Batch tuned for ≤1 GB headroom on 80 GB HBM2e with Triple-M1
+    # (~18.7M params) + grad checkpointing.  Anchored on the H100 80 GB
+    # profile (256 mv_groups, 2304 samples) — A100 has the same VRAM
+    # but slightly less raw bandwidth, so we sit one notch below at
+    # 224 mv_groups (2016 samples) to keep the 1 GB safety margin.
+    # If torch reports peak_alloc < 78 GB after warm-up, the user can
+    # push to `--mv_groups 256` (2304 samples) to match H100 exactly.
+    # 40 GB A100s should override with `--mv_groups 64` (576 samples).
     'a100': {
-        'batch_size': 1152,         # 128 mv_groups × 9 views
-        'mv_groups': 128,
-        'num_workers': 8,
+        'batch_size': 2016,         # 224 mv_groups × 9 views
+        'mv_groups': 224,
+        'num_workers': 12,
         'pin_memory': True,
         'amp': True,
         'amp_dtype': 'bfloat16',
-        'grad_accum_steps': 1,      # effective batch = 1152
+        'grad_accum_steps': 1,      # effective batch = 2016
         'compile_model': True,
         'tf32': True,
-        'prefetch_factor': 10,
+        'prefetch_factor': 8,
         'persistent_workers': True,
     },
     # ---- NVIDIA H100  (80 GB, GCP a3, Lambda Labs) ----

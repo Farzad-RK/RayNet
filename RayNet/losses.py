@@ -298,24 +298,54 @@ def geometric_angular_loss(pred_eyeball, pred_pupil, gt_optical_axis):
     return angle.mean()
 
 
-def mask_seg_loss(pred_logits, gt_mask_uint8):
+def mask_seg_loss(pred_logits, gt_mask_uint8, dice_weight=1.0, dice_eps=1.0):
     """
-    Binary segmentation BCE-with-logits for AERI iris / eyeball masks.
+    Binary segmentation loss for AERI iris / eyeball masks.
+
+    BCE-with-logits + soft-Dice. The soft-Dice term directly optimises
+    overlap (1 − 2|P∩G| / (|P|+|G|)), which BCE-alone fails at when the
+    positive class is small relative to the image (eyeball ≈ 5-10% of a
+    56×56 face crop, iris ≈ 1-2%). BCE alone biases toward "background
+    everywhere" because flipping a positive pixel costs the same as
+    flipping a background pixel; Dice fixes this by normalising the
+    overlap by the mask area.
+
+    Why this matters for occlusion robustness:
+      The GT eyeball mask in the shards is the THEORETICAL silhouette
+      (no eyelid clip, see streaming/eye_masks.py docstring). The model
+      must therefore predict the un-occluded eyeball even when the
+      eyelid covers a portion of the sclera. BCE under-trains exactly
+      the boundary regions where eyelid/iris ambiguity lives; Dice's
+      area-normalised overlap forces the head to learn the full shape
+      from anatomical context (eyebrow, lashes, sclera-skin edge).
 
     GT masks are stored as uint8 {0, 255} in the shards (see
-    RayNet.streaming.eye_masks). They're normalised to float {0, 1} here
-    before BCE. Pred shape (B, H, W), GT shape (B, H, W); both are
-    single-channel binary masks at 56x56.
+    RayNet.streaming.eye_masks). They're normalised to float {0, 1} here.
 
     Args:
-        pred_logits: (B, H, W) raw logits from AERIHead.
-        gt_mask_uint8: (B, H, W) GT mask in uint8 {0, 255}.
+        pred_logits   : (B, H, W) raw logits from AERIHead.
+        gt_mask_uint8 : (B, H, W) GT mask in uint8 {0, 255}.
+        dice_weight   : weight on the Dice term added to BCE (1.0 → equal).
+                        Set to 0 to fall back to pure BCE for an A/B.
+        dice_eps      : Laplace-smoothing constant in numerator/denominator;
+                        keeps gradient finite when both pred and GT are 0.
 
     Returns:
-        loss: scalar BCE-with-logits (mean over all pixels).
+        loss: scalar (BCE + dice_weight * soft_Dice), mean over the batch.
     """
     gt = gt_mask_uint8.to(pred_logits.dtype) / 255.0
-    return F.binary_cross_entropy_with_logits(pred_logits, gt)
+    bce = F.binary_cross_entropy_with_logits(pred_logits, gt)
+
+    if dice_weight <= 0:
+        return bce
+
+    prob = torch.sigmoid(pred_logits)
+    dims = (-2, -1)
+    intersection = (prob * gt).sum(dim=dims)
+    cardinality = prob.sum(dim=dims) + gt.sum(dim=dims)
+    dice_score = (2.0 * intersection + dice_eps) / (cardinality + dice_eps)
+    dice_loss = (1.0 - dice_score).mean()
+    return bce + dice_weight * dice_loss
 
 
 def angular_error(pred_gaze, gt_gaze):

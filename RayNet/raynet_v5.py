@@ -1,25 +1,25 @@
 """
-RayNet v5 — Triple-M3 architecture with full-face branches + AERI gaze.
+RayNet v5 — Triple-M1 architecture with full-face branches + AERI gaze.
 
 Three task-specific branches, all consuming the 224x224 full-face crop
 through a single shared stem:
 
   Landmark branch (OWNS the shared stem):
-    SharedStem (M3 stem+s0+s1) → LandmarkBranchEncoder (M3 s2+s3)
+    SharedStem (M1 stem+s0+s1) → LandmarkBranchEncoder (M1 s2+s3)
       → U-Net decoder (56x56) → 14 landmark heatmaps + soft-argmax.
     Only task whose gradient backpropagates into the shared stem —
     pose and gaze both detach() their stem input so the low-level
     representation is steered by landmark loss alone.
 
   Pose branch (gradient-isolated from stem + fuses MAGE bbox):
-    s1.detach() → PoseBranchEncoder (M3 s2+s3) → coord-att + pool + proj
+    s1.detach() → PoseBranchEncoder (M1 s2+s3) → coord-att + pool + proj
     ⊕ BoxEncoder(face_bbox)   (zero-init residual)
       → pose_feat (d_model), 6D rotation, 3D translation.
     BoxEncoder lives inside PoseBranch now — the face bbox is
     head-pose information, not gaze information.
 
   Gaze branch (gradient-isolated + AERI):
-    s1.detach() → GazeBranchEncoder (M3 s2+s3)
+    s1.detach() → GazeBranchEncoder (M1 s2+s3)
       → AERIHead (mini U-Net → iris + eyeball mask logits @ 56x56)
       → AERI attention: predicted eyeball mask gates the gaze feature
          map so the pooled vector is dominated by eye-region features
@@ -41,14 +41,15 @@ the predicted mask to modulate its own feature map. Benefits:
   - The segmentation head is a clean MSGazeNet-style auxiliary signal:
     iris + eyeball BCE at 56x56.
 
-Triple-M3 means three branch-specific RepNeXt-M3 s2+s3 encoders plus
-one shared stem (which is structurally stem+s0+s1 of a fourth M3).
+Triple-M1 means three branch-specific RepNeXt-M1 s2+s3 encoders plus
+one shared stem (which is structurally stem+s0+s1 of a fourth M1).
 Weights are loaded identically into all four instances; gradients
 diverge during training through task-specific losses and the pose/gaze
-detach(). The M3 backbone (embed_dim=(64,128,256,512), depth=(3,3,13,2))
-replaces the previous M1 (embed_dim=(48,96,192,384), depth=(3,3,15,2))
-to give the model the parameter capacity needed to reach sub-pixel
-landmark accuracy on full-face crops, which the M1 variant could not.
+detach(). RepNeXt-M1 (embed_dim=(48,96,192,384), depth=(3,3,15,2)) is
+deliberately the smaller variant: an A/B comparison against M3 in
+docs/experiments/Tripple_M3_run_20260428_130241 vs the equivalent M1
+run showed no convergence advantage from the ~1.6× parameter budget,
+so dataset size — not capacity — is the constraint that matters.
 
 GazeGene 3D Eyeball Structure losses:
   1. L1 on eyeball_center_3d
@@ -76,20 +77,20 @@ from RayNet.coordatt import CoordinateAttention
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# RepNeXt-M3: embed_dim=(64, 128, 256, 512), depth=(3, 3, 13, 2)
-M3_CHANNELS = [64, 128, 256, 512]
+# RepNeXt-M1: embed_dim=(48, 96, 192, 384), depth=(3, 3, 15, 2)
+M1_CHANNELS = [48, 96, 192, 384]
 
 
 # ─── Shared Stem ────────────────────────────────────────────────────
 
 class SharedStem(nn.Module):
     """
-    Shared low-level encoder: RepNeXt-M3 stem + stages[0] + stages[1].
+    Shared low-level encoder: RepNeXt-M1 stem + stages[0] + stages[1].
 
     Extracts edges, textures, and low-level facial features shared by
     all three task branches. Output:
-        s0: (B, 64, 56, 56)  — skip for U-Net decoders
-        s1: (B, 128, 28, 28) — input to every branch encoder
+        s0: (B, 48, 56, 56)  — skip for U-Net decoders
+        s1: (B, 96, 28, 28)  — input to every branch encoder
 
     Only the landmark branch's backward pass reaches the stem —
     pose and gaze detach s1 (and s0, when used as a decoder skip) —
@@ -113,12 +114,12 @@ class SharedStem(nn.Module):
 
 class BranchEncoder(nn.Module):
     """
-    Task-specific encoder: RepNeXt-M3 stages[2] + stages[3].
+    Task-specific encoder: RepNeXt-M1 stages[2] + stages[3].
 
-    Takes shared stem output (128ch, 28x28) and produces task-specific
+    Takes shared stem output (96ch, 28x28) and produces task-specific
     features at two scales:
-        s2: 256ch at 14x14
-        s3: 512ch at 7x7
+        s2: 192ch at 14x14
+        s3: 384ch at 7x7
     """
 
     def __init__(self, stage2, stage3):
@@ -210,7 +211,7 @@ class UNetLandmarkBranch(nn.Module):
     """
     Landmark detection via U-Net encoder-decoder with attention gates.
 
-    Encoder: BranchEncoder on SharedStem s1 output (256ch@14, 512ch@7).
+    Encoder: BranchEncoder on SharedStem s1 output (192ch@14, 384ch@7).
     Decoder: 7→14→28→56 with skip connections from s2, s1, s0.
     Output: 14 heatmaps @ 56x56 + soft-argmax coordinates + subpixel
     offset refinement.
@@ -223,21 +224,21 @@ class UNetLandmarkBranch(nn.Module):
         self.encoder = None  # set by factory
         self.n_landmarks = n_landmarks
 
-        self.dec3 = UNetDecoderBlock(in_ch=512, skip_ch=256, out_ch=256)
-        self.dec2 = UNetDecoderBlock(in_ch=256, skip_ch=128, out_ch=128)
-        self.dec1 = UNetDecoderBlock(in_ch=128, skip_ch=64,  out_ch=64)
+        self.dec3 = UNetDecoderBlock(in_ch=384, skip_ch=192, out_ch=192)
+        self.dec2 = UNetDecoderBlock(in_ch=192, skip_ch=96,  out_ch=96)
+        self.dec1 = UNetDecoderBlock(in_ch=96,  skip_ch=48,  out_ch=48)
 
         self.heatmap = nn.Sequential(
-            nn.Conv2d(64, 48, 3, padding=1, bias=False),
-            nn.BatchNorm2d(48),
+            nn.Conv2d(48, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
             nn.GELU(),
-            nn.Conv2d(48, n_landmarks, 1),
+            nn.Conv2d(32, n_landmarks, 1),
         )
         self.offset = nn.Sequential(
-            nn.Conv2d(64, 48, 3, padding=1, bias=False),
-            nn.BatchNorm2d(48),
+            nn.Conv2d(48, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
             nn.GELU(),
-            nn.Conv2d(48, n_landmarks * 2, 1),
+            nn.Conv2d(32, n_landmarks * 2, 1),
         )
 
     def forward(self, s0, s1, s2, s3):
@@ -294,10 +295,10 @@ class AERIHead(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.dec3 = UNetDecoderBlock(in_ch=512, skip_ch=256, out_ch=256)
-        self.dec2 = UNetDecoderBlock(in_ch=256, skip_ch=128, out_ch=128)
-        self.dec1 = UNetDecoderBlock(in_ch=128, skip_ch=64,  out_ch=64)
-        self.head = nn.Conv2d(64, 2, 1)
+        self.dec3 = UNetDecoderBlock(in_ch=384, skip_ch=192, out_ch=192)
+        self.dec2 = UNetDecoderBlock(in_ch=192, skip_ch=96,  out_ch=96)
+        self.dec1 = UNetDecoderBlock(in_ch=96,  skip_ch=48,  out_ch=48)
+        self.head = nn.Conv2d(48, 2, 1)
 
     def forward(self, s0, s1, s2, s3):
         d3 = self.dec3(s3, s2)
@@ -382,17 +383,17 @@ class GazeBranch(nn.Module):
       s0.detach(), s1.detach() from SharedStem
       s1.detach() → BranchEncoder → gaze_s2 (14x14), gaze_s3 (7x7)
       AERIHead(s0, s1, gaze_s2, gaze_s3)
-        → iris_logits, eyeball_logits, d1 (B,64,56,56)
+        → iris_logits, eyeball_logits, d1 (B,48,56,56)
       saliency = SALIENCY_IRIS_W * sigmoid(iris)
                + SALIENCY_EYE_W  * sigmoid(eye)
       scheduled_mask = α * saliency + (1 - α) * 1
       Global path: gaze_s3 * (GLOBAL_FLOOR + (1-GLOBAL_FLOOR) * pool₇(scheduled_mask))
-                   → CoordAtt → pool → 512-d → LayerNorm
+                   → CoordAtt → pool → 384-d → LayerNorm
       Foveal path: pool(d1 * (FOVEAL_FLOOR + (1-FOVEAL_FLOOR) * scheduled_mask))
-                   → 64-d → Linear→128 → GELU → LayerNorm
+                   → 48-d → Linear→96 → GELU → LayerNorm
                    → stochastic depth (training only, FOVEAL_DROP_P)
                    — identity at val.
-      [global ‖ foveal_proj] (640-d) → Linear → 256-d gaze_feat
+      [global ‖ foveal_proj] (480-d) → Linear → 256-d gaze_feat
       GazeFusionBlock(gaze_feat, pose_feat)  (zero-init residual)
       CrossViewAttention (when n_views > 1)
       GeometricGazeHead → eyeball_center, pupil_center, optical_axis
@@ -431,25 +432,25 @@ class GazeBranch(nn.Module):
         self.encoder = None  # set by factory (BranchEncoder)
         self.aeri = AERIHead()
 
-        # M3 s3 = 512 channels at 7x7
-        self.coord_att = CoordinateAttention(512)
+        # M1 s3 = 384 channels at 7x7
+        self.coord_att = CoordinateAttention(384)
         self.pool = nn.AdaptiveAvgPool2d(1)
 
         # --- AERI / HRFH-α fusion ---
-        # The 64-d raw foveal vector (M3 d1=64ch) is projected to 128-d
-        # before being concatenated with the 512-d global vector. The
-        # 128/(512+128) ≈ 20% foveal share preserves the sub-pixel iris
+        # The 48-d raw foveal vector (M1 d1=48ch) is projected to 96-d
+        # before being concatenated with the 384-d global vector. The
+        # 96/(384+96) = 20% foveal share preserves the sub-pixel iris
         # signal HRFH was designed to extract while keeping the global
         # context dominant. Each path is normalised separately so the
         # global stats don't drown the foveal stats inside a shared LN.
         self.foveal_proj = nn.Sequential(
-            nn.Linear(64, 128),
+            nn.Linear(48, 96),
             nn.GELU(),
         )
-        self.global_norm = nn.LayerNorm(512)
-        self.foveal_norm = nn.LayerNorm(128)
-        # 512 (global) + 128 (foveal_proj) = 640
-        self.proj = nn.Linear(640, d_model)
+        self.global_norm = nn.LayerNorm(384)
+        self.foveal_norm = nn.LayerNorm(96)
+        # 384 (global) + 96 (foveal_proj) = 480
+        self.proj = nn.Linear(480, d_model)
         # --- AERI / HRFH-α fusion ---
 
         self.fusion_block = GazeFusionBlock(d_model)
@@ -490,7 +491,7 @@ class GazeBranch(nn.Module):
         global_feat = self.pool(self.coord_att(gaze_s3_gated)).flatten(1)
         global_feat = self.global_norm(global_feat)
 
-        # 5. Foveal path — gate d1 at 56x56 then pool to 64-d.
+        # 5. Foveal path — gate d1 at 56x56 then pool to 48-d.
         #    FOVEAL_FLOOR matches GLOBAL_FLOOR so the high-resolution
         #    iris/pupil signal degrades gracefully (not catastrophically)
         #    when AERI mis-fires under eyelid occlusion. The previous
@@ -560,10 +561,10 @@ class PoseBranch(nn.Module):
     def __init__(self, d_model=256):
         super().__init__()
         self.encoder = None  # set by factory (BranchEncoder)
-        # M3 s3 = 512 channels at 7x7
-        self.coord_att = CoordinateAttention(512)
+        # M1 s3 = 384 channels at 7x7
+        self.coord_att = CoordinateAttention(384)
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.proj = nn.Linear(512, d_model)
+        self.proj = nn.Linear(384, d_model)
 
         self.box_encoder = BoxEncoder(d_model)
         self.fuse = nn.Sequential(
@@ -647,7 +648,7 @@ class CameraEmbedding(nn.Module):
 
 class RayNetV5(nn.Module):
     """
-    RayNet v5 Triple-M3: full-face branches + AERI gaze + parallel MTL.
+    RayNet v5 Triple-M1: full-face branches + AERI gaze + parallel MTL.
     """
 
     def __init__(self, shared_stem, landmark_branch, gaze_branch,
@@ -729,46 +730,47 @@ class RayNetV5(nn.Module):
 
 # ─── Factory Functions ──────────────────────────────────────────────
 
-def _split_m3_backbone(m3):
-    return m3.stem, m3.stages[0], m3.stages[1], m3.stages[2], m3.stages[3]
+def _split_m1_backbone(m1):
+    return m1.stem, m1.stages[0], m1.stages[1], m1.stages[2], m1.stages[3]
 
 
 def create_raynet_v5(backbone_weight_path=None, cross_view_cfg=None,
                      n_landmarks=14):
     """
-    Triple-M3 factory.
+    Triple-M1 factory.
 
-    Four RepNeXt-M3 instances are created and split:
-      - m3_shared   → stem + s0 + s1          (SharedStem)
-      - m3_landmark → s2 + s3                  (LandmarkBranch enc)
-      - m3_pose     → s2 + s3                  (PoseBranch enc)
-      - m3_gaze     → s2 + s3                  (GazeBranch enc)
-    "Triple-M3" refers to the three task-specific s2+s3 branches above
+    Four RepNeXt-M1 instances are created and split:
+      - m1_shared   → stem + s0 + s1          (SharedStem)
+      - m1_landmark → s2 + s3                  (LandmarkBranch enc)
+      - m1_pose     → s2 + s3                  (PoseBranch enc)
+      - m1_gaze     → s2 + s3                  (GazeBranch enc)
+    "Triple-M1" refers to the three task-specific s2+s3 branches above
     the single shared stem. Each branch produces its own 7x7 / 14x14
     feature pyramid, so training doesn't force one set of features
     to satisfy three objectives at once.
 
-    M3 (embed_dim=64,128,256,512; depth=3,3,13,2) replaces the prior
-    M1 backbone — the M1 variant could not reach sub-pixel landmark
-    accuracy under the full-face crop regime, so we trade ~2.4× backbone
-    parameters for the capacity to capture sub-pixel iris/pupil detail.
+    M1 (embed_dim=48,96,192,384; depth=3,3,15,2) is the deliberately
+    smaller variant — the M3 A/B (Tripple_M3_run_20260428_130241)
+    showed no convergence advantage from the larger backbone, so the
+    bottleneck is dataset size, not capacity. Stick with M1 unless an
+    A/B confirms otherwise.
     """
 
-    def _make_m3(weight_path):
+    def _make_m1(weight_path):
         if weight_path:
             from backbone.repnext_utils import load_pretrained_repnext
-            return load_pretrained_repnext('repnext_m3', weight_path)
-        return create_repnext('repnext_m3', pretrained=False)
+            return load_pretrained_repnext('repnext_m1', weight_path)
+        return create_repnext('repnext_m1', pretrained=False)
 
-    m3_shared = _make_m3(backbone_weight_path)
-    m3_landmark = _make_m3(backbone_weight_path)
-    m3_pose = _make_m3(backbone_weight_path)
-    m3_gaze = _make_m3(backbone_weight_path)
+    m1_shared = _make_m1(backbone_weight_path)
+    m1_landmark = _make_m1(backbone_weight_path)
+    m1_pose = _make_m1(backbone_weight_path)
+    m1_gaze = _make_m1(backbone_weight_path)
 
-    stem, s0, s1, _, _ = _split_m3_backbone(m3_shared)
-    _, _, _, lm_s2, lm_s3 = _split_m3_backbone(m3_landmark)
-    _, _, _, ps_s2, ps_s3 = _split_m3_backbone(m3_pose)
-    _, _, _, gz_s2, gz_s3 = _split_m3_backbone(m3_gaze)
+    stem, s0, s1, _, _ = _split_m1_backbone(m1_shared)
+    _, _, _, lm_s2, lm_s3 = _split_m1_backbone(m1_landmark)
+    _, _, _, ps_s2, ps_s3 = _split_m1_backbone(m1_pose)
+    _, _, _, gz_s2, gz_s3 = _split_m1_backbone(m1_gaze)
 
     shared_stem = SharedStem(stem, s0, s1)
 
@@ -794,7 +796,7 @@ def create_raynet_v5(backbone_weight_path=None, cross_view_cfg=None,
         return sum(p.numel() for p in module.parameters()) / 1e6
 
     total = _count(model)
-    print(f"RayNet v5 (Triple-M3, AERI gaze) created:")
+    print(f"RayNet v5 (Triple-M1, AERI gaze) created:")
     print(f"  SharedStem:      {_count(shared_stem):.2f}M")
     print(f"  LandmarkBranch:  {_count(landmark_branch):.2f}M "
           f"(encoder {_count(landmark_branch.encoder):.2f}M + U-Net decoder)")
