@@ -342,6 +342,50 @@ def _unwrap_raynet(model):
     return m
 
 
+def _rebuild_scheduler_for_resume(optimizer, start_epoch, log_fn=print):
+    """
+    Rebuild the LR scheduler from the CURRENT PHASE_CONFIG, advanced to
+    the cosine position implied by `start_epoch`. Always called after
+    a resume / continuation-fork — never trust the saved scheduler state.
+
+    Why: torch's CosineAnnealingLR persists `T_max` and `last_epoch` in
+    its state_dict. If PHASE_CONFIG epoch counts changed between runs,
+    the loaded T_max becomes stale; `last_epoch` then increments past
+    the stale T_max and `cos(pi * last_epoch / T_max)` wraps past pi —
+    LR bounces back UP from 0 toward peak. This was the root cause of
+    the inverted-cosine pattern in run_20260427_205327 (P1 LR went
+    0 → 4.81e-4 over epochs 8 → 15 because the loaded T_max=8 from a
+    pre-edit checkpoint clashed with the new T_max=15 P1 budget).
+
+    Resets `pg['lr']` and `pg['initial_lr']` from cfg before rebuilding
+    so the new cosine has the correct amplitude for the current phase.
+    """
+    cfg = get_phase_config(start_epoch)
+    phase_start, phase_end = cfg['epochs']
+    T_max = phase_end - phase_start + 1
+    base_lr = cfg['lr']
+
+    for pg in optimizer.param_groups:
+        pg['lr'] = base_lr
+        pg['initial_lr'] = base_lr
+
+    scheduler = CosineAnnealingLR(optimizer, T_max=T_max)
+    # After init, last_epoch=0 and lr==base_lr. We need to advance to the
+    # position within the current phase. start_epoch is the NEXT epoch to
+    # run; the cosine value used during that epoch is at last_epoch =
+    # (start_epoch - phase_start) — i.e. one cosine.step() per already-
+    # completed epoch within this phase.
+    offset = max(0, start_epoch - phase_start)
+    for _ in range(offset):
+        scheduler.step()
+
+    log_fn(f"  [scheduler] rebuilt from current PHASE_CONFIG: "
+           f"phase epochs=({phase_start},{phase_end}), T_max={T_max}, "
+           f"base_lr={base_lr:.2e}, advanced {offset} step(s) → "
+           f"lr={optimizer.param_groups[0]['lr']:.2e}")
+    return scheduler
+
+
 def _filter_compatible_state(src_sd, target_sd):
     """
     Keep only (key, tensor) pairs from src_sd that have matching shape
@@ -979,30 +1023,69 @@ def train(args):
 
     # CSV loggers — main process only. Non-main ranks keep these as None
     # and all write sites check `is not None` before writing.
+    #
+    # Append mode when resuming so the previous run's history survives
+    # across restarts. The header is only written if the file is new
+    # (or empty) — otherwise we'd inject a header row mid-file which
+    # would break downstream parsers. `is_resuming` covers --resume,
+    # --fork_from (continuation), and --warmstart_from cases where a
+    # prior log may already exist under the same output_dir.
     csv_path = batch_csv_path = None
     csv_file = batch_csv_file = None
     csv_writer = batch_csv_writer = None
+    is_resuming = bool(args.resume or args.fork_from or args.warmstart_from)
     if is_main:
         csv_path = os.path.join(output_dir, 'training_log.csv')
-        csv_file = open(csv_path, 'w', newline='')
-        csv_writer = csv.writer(csv_file)
-        csv_writer.writerow([
-            'epoch', 'phase', 'lr',
-            'train_total', 'train_landmark', 'train_angular_deg',
-            'train_reproj', 'train_mask', 'train_ray_target', 'train_pose',
-            'train_translation', 'train_iris_seg', 'train_eyeball_seg',
-            'val_total', 'val_landmark', 'val_angular_deg', 'val_landmark_px',
-            'val_iris_seg', 'val_eyeball_seg',
-        ])
-
         batch_csv_path = os.path.join(output_dir, 'batch_log.csv')
-        batch_csv_file = open(batch_csv_path, 'w', newline='')
+
+        # On --resume, hydrate local log files from MinIO before opening
+        # in append mode. Without this, resuming on a fresh machine
+        # would write a single-row "new" log and the next upload would
+        # overwrite the run's full history. Only --resume continues
+        # under the same run_id; --fork_from / --warmstart_from create
+        # a new run_id with no prior log to preserve.
+        if args.resume and ckpt_mgr is not None:
+            for local_path in (csv_path, batch_csv_path):
+                if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+                    continue
+                log_key = (f"{args.ckpt_prefix}/{ckpt_mgr.run_id}/"
+                           f"{os.path.basename(local_path)}")
+                try:
+                    ckpt_mgr._client.fget_object(
+                        args.ckpt_bucket, log_key, local_path)
+                    print(f"  Hydrated {os.path.basename(local_path)} "
+                          f"from MinIO ({os.path.getsize(local_path)} bytes)")
+                except Exception as e:
+                    print(f"  No prior {os.path.basename(local_path)} "
+                          f"in MinIO ({e}); starting fresh log")
+
+        write_header = not (is_resuming
+                            and os.path.exists(csv_path)
+                            and os.path.getsize(csv_path) > 0)
+        csv_file = open(csv_path, 'a' if is_resuming else 'w', newline='')
+        csv_writer = csv.writer(csv_file)
+        if write_header:
+            csv_writer.writerow([
+                'epoch', 'phase', 'lr',
+                'train_total', 'train_landmark', 'train_angular_deg',
+                'train_reproj', 'train_mask', 'train_ray_target', 'train_pose',
+                'train_translation', 'train_iris_seg', 'train_eyeball_seg',
+                'val_total', 'val_landmark', 'val_angular_deg', 'val_landmark_px',
+                'val_iris_seg', 'val_eyeball_seg',
+            ])
+
+        write_batch_header = not (is_resuming
+                                   and os.path.exists(batch_csv_path)
+                                   and os.path.getsize(batch_csv_path) > 0)
+        batch_csv_file = open(batch_csv_path,
+                              'a' if is_resuming else 'w', newline='')
         batch_csv_writer = csv.writer(batch_csv_file)
-        batch_csv_writer.writerow([
-            'epoch', 'batch', 'loss', 'landmark', 'angular_deg',
-            'gaze_consist', 'shape', 'ray_target', 'pose', 'translation',
-            'iris_seg', 'eyeball_seg', 'lr',
-        ])
+        if write_batch_header:
+            batch_csv_writer.writerow([
+                'epoch', 'batch', 'loss', 'landmark', 'angular_deg',
+                'gaze_consist', 'shape', 'ray_target', 'pose', 'translation',
+                'iris_seg', 'eyeball_seg', 'lr',
+            ])
 
     # Training loop with phase transitions
     best_val_loss = float('inf')
@@ -1018,15 +1101,20 @@ def train(args):
     if args.resume and ckpt_mgr is not None:
         if is_main:
             print(f"Resuming from run {ckpt_mgr.run_id} ...")
-        # We need optimizer & scheduler to exist before resume_state.
-        # Create them for the starting phase; resume will overwrite state.
-        # Each rank runs this independently so all ranks end up with the
-        # same optimizer/scheduler state (they read the same checkpoint).
-        resume_phase_cfg = get_phase_config(1)
-        optimizer = optim.AdamW(model.parameters(), lr=resume_phase_cfg['lr'],
-                                betas=(0.5, 0.95), weight_decay=1e-4)
-        phase_start, phase_end = resume_phase_cfg['epochs']
-        scheduler = CosineAnnealingLR(optimizer, T_max=phase_end - phase_start + 1)
+        # We need an optimizer to exist before resume_state. Build a
+        # bare AdamW; the LR will be reset to the correct phase value by
+        # `_rebuild_scheduler_for_resume` below — the value passed here
+        # is irrelevant.
+        # NOTE: scheduler is intentionally NOT created here and NOT
+        # passed to resume_state. The saved scheduler state can be stale
+        # if PHASE_CONFIG epoch counts changed between runs (T_max in the
+        # checkpoint clashes with the new T_max, causing the cosine to
+        # wrap past pi — see _rebuild_scheduler_for_resume docstring).
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=get_phase_config(1)['lr'],
+            betas=(0.5, 0.95), weight_decay=1e-4,
+        )
 
         resume_file = getattr(args, 'resume_from', None)
         # resume_state loads into the unwrapped model so DDP wrapping
@@ -1037,9 +1125,15 @@ def train(args):
         # this concurrently races on MinIO's .part.minio temp file.
         with accelerator.main_process_first():
             start_epoch, resume_ckpt = ckpt_mgr.resume_state(
-                unwrapped, optimizer, scheduler=scheduler, scaler=scaler,
+                unwrapped, optimizer, scheduler=None, scaler=scaler,
                 map_location=device, filename=resume_file,
             )
+        # Always rebuild the scheduler from the *current* PHASE_CONFIG
+        # so changes to phase epoch budgets between runs take effect.
+        scheduler = _rebuild_scheduler_for_resume(
+            optimizer, start_epoch,
+            log_fn=(print if is_main else (lambda *_: None)),
+        )
         current_phase = get_phase(resume_ckpt['epoch'])
         best_val_loss = resume_ckpt.get('val_metrics', {}).get('total', best_val_loss)
         # Restore EMA shadow weights so resume picks up the smoothed
@@ -1161,13 +1255,10 @@ def train(args):
             start_epoch = src_epoch + 1
             current_phase = get_phase(src_epoch)
             fork_phase_cfg = get_phase_config(src_epoch)
-            phase_start, phase_end = fork_phase_cfg['epochs']
 
             optimizer = optim.AdamW(model.parameters(),
                                     lr=fork_phase_cfg['lr'],
                                     betas=(0.5, 0.95), weight_decay=1e-4)
-            scheduler = CosineAnnealingLR(
-                optimizer, T_max=phase_end - phase_start + 1)
 
             # Same guard as the cross-stage path — if the model changed
             # shape the saved optimizer state can't load.
@@ -1178,8 +1269,13 @@ def train(args):
             elif is_main:
                 print("  [fork] optimizer param count mismatch — "
                       "starting with fresh AdamW state.")
-            if 'scheduler_state_dict' in fork_state:
-                scheduler.load_state_dict(fork_state['scheduler_state_dict'])
+            # Scheduler is rebuilt from current PHASE_CONFIG below, NOT
+            # loaded from the fork checkpoint — same stale-T_max bug as
+            # the resume path. See _rebuild_scheduler_for_resume.
+            scheduler = _rebuild_scheduler_for_resume(
+                optimizer, start_epoch,
+                log_fn=(print if is_main else (lambda *_: None)),
+            )
             if scaler is not None and 'scaler_state_dict' in fork_state:
                 scaler.load_state_dict(fork_state['scaler_state_dict'])
 
@@ -1671,10 +1767,11 @@ def parse_args():
     parser.add_argument('--mds_val', type=str, default=None,
                         help='MDS shard URL for validation (e.g. s3://gazegene/val)')
 
-    # Model — v5 uses RepNeXt-M1 for all branches (shared stem + 3 branches)
+    # Model — v5 uses RepNeXt-M3 for all branches (shared stem + 3 branches)
     parser.add_argument('--core_backbone_weight_path', type=str, default=None,
-                        help='Path to pretrained RepNeXt-M1 weights '
-                             '(loaded into all 4 M1 instances: shared + landmark + gaze + pose)')
+                        help='Path to pretrained RepNeXt-M3 weights '
+                             '(loaded into all 4 M3 instances: shared + landmark + gaze + pose). '
+                             'Pass None / empty to train from random init.')
 
     # Hardware profile
     parser.add_argument('--profile', type=str, default='default',
