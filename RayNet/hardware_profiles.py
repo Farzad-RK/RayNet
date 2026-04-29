@@ -118,14 +118,18 @@ HARDWARE_PROFILES = {
     },
     # ---- NVIDIA A100  (80 GB, GCP a2, Colab Pro+) ----
     # Ampere flagship: TF32, BF16, huge memory bandwidth (2 TB/s).
-    # Batch tuned for ≤1 GB headroom on 80 GB HBM2e with Triple-M1
-    # (~18.7M params) + grad checkpointing.  Anchored on the H100 80 GB
-    # profile (256 mv_groups, 2304 samples) — A100 has the same VRAM
-    # but slightly less raw bandwidth, so we sit one notch below at
-    # 224 mv_groups (2016 samples) to keep the 1 GB safety margin.
-    # If torch reports peak_alloc < 78 GB after warm-up, the user can
-    # push to `--mv_groups 256` (2304 samples) to match H100 exactly.
-    # 40 GB A100s should override with `--mv_groups 64` (576 samples).
+    # Empirically peaks at ~54 GB / 80 GB with Triple-M1 (~18.7M params)
+    # + grad checkpointing + BF16 at 224 mv_groups (2016 samples). The
+    # earlier comment that this profile was tuned to 78 GB was wrong —
+    # grad-checkpointing + BF16 activations are smaller than predicted,
+    # so the 80 GB card stays well under-filled. To trade headroom for
+    # throughput, override with `--mv_groups 320` (2880 samples) which
+    # should land near 75 GB peak; check the rank-0 "GPU mem" line at
+    # the end of epoch 1 and bump up further if headroom > 5 GB.
+    # 40 GB A100s should use the dedicated `a100_40gb` profile below
+    # (NOT `a100 --mv_groups 64`, which keeps the 12-worker/8-prefetch
+    # CPU pipeline tuned for 80 GB — that is what stalls 40 GB notebook
+    # boxes after the first batch).
     'a100': {
         'batch_size': 2016,         # 224 mv_groups × 9 views
         'mv_groups': 224,
@@ -137,6 +141,38 @@ HARDWARE_PROFILES = {
         'compile_model': True,
         'tf32': True,
         'prefetch_factor': 8,
+        'persistent_workers': True,
+    },
+    # ---- NVIDIA A100  (40 GB, Colab Pro / Kaggle / GCP a2-highgpu-1g-40) ----
+    # Same Ampere silicon as the 80 GB SKU but half the HBM. Tuned for
+    # ≤2 GB headroom on 40 GB HBM2e with Triple-M1 (~18.7M params) +
+    # grad checkpointing + BF16 at 224×224. Empirical anchor: the 80 GB
+    # profile at 224 mv_groups peaks at ~54 GB → ~0.24 GB / mv_group, so
+    # 128 mv_groups (1152 samples) lands near ~31 GB peak with comfortable
+    # margin for transient activations and the optimizer step.
+    #
+    # CPU pipeline is deliberately gentler than the 80 GB profile:
+    #   - num_workers=6 (notebook A100 boxes typically expose 12 vCPUs;
+    #     12 workers × 8 prefetch × 1152 samples ≈ 110K in-flight images
+    #     would exceed Colab/Kaggle's ~80 GB CPU RAM and stall on /dev/shm)
+    #   - prefetch_factor=4 (was 8 in the 80 GB profile)
+    #   - persistent_workers=True (keep MDS shard caches warm across epochs)
+    # If you see "stuck after first batch", try --num_workers 4 first.
+    #
+    # compile_model=False because torch.compile interacts badly with the
+    # grad-checkpointed shared stem (the same reason the L4 / A10G
+    # profiles disable it).
+    'a100_40gb': {
+        'batch_size': 1152,         # 128 mv_groups × 9 views
+        'mv_groups': 128,
+        'num_workers': 6,
+        'pin_memory': True,
+        'amp': True,
+        'amp_dtype': 'bfloat16',    # BF16: same range as FP32
+        'grad_accum_steps': 1,      # effective batch = 1152
+        'compile_model': False,
+        'tf32': True,
+        'prefetch_factor': 4,
         'persistent_workers': True,
     },
     # ---- NVIDIA H100  (80 GB, GCP a3, Lambda Labs) ----
