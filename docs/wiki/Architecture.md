@@ -186,10 +186,6 @@ Replaces the v5.0 "all losses on from epoch 1" parallel-MTL schedule. The detach
 
 DDP's default reducer expects every parameter to receive a gradient every step, so `hardware_profiles.build_accelerator()` constructs the `Accelerator` with `DistributedDataParallelKwargs(find_unused_parameters=True)`.
 
-## Validation EMA
-
-Validation runs through a `torch.optim.swa_utils.AveragedModel` (weight EMA, decay `--ema_decay`, default 0.999). Only parameters are EMA'd; BN running stats are mirrored from the live model after every optimiser step so the shadow model uses consistent statistics. This smooths out per-step weight noise in the reported metrics.
-
 ## Inference
 
 `RayNet/inference.py` runs MediaPipe (Haar fallback) inside the module — the caller passes a full frame, the module detects, square-crops with a 1.3× expansion (matching the GazeGene crop convention), runs the v5 model, and visualises landmarks, AERI iris/eyeball masks, gaze arrow from the eye-center, RGB pose axes, and the bounding box that was actually fed to the model. `face_bbox` is synthesised from the detected pixels under a centred-principal-point assumption (`mage_bbox_from_pixels`).

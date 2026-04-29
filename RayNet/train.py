@@ -46,7 +46,6 @@ import logging
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.amp import GradScaler, autocast
 import numpy as np
 from datetime import datetime
@@ -423,36 +422,12 @@ def _optimizer_state_compatible(saved_state, new_optimizer):
     return True
 
 
-# ============== EMA helpers ==============
-
-def _ema_copy_buffers(src_module, ema_module):
-    """
-    Copy non-parameter buffers (BN running_mean/running_var, etc.) from
-    the live model into the EMA model.
-
-    AveragedModel only averages parameters by default. If we left the
-    EMA model's BN buffers at their init-time values, validation through
-    the EMA would use stale BN statistics and silently degrade. The
-    standard fix (timm's ModelEmaV2, MoCo, etc.) is to mirror buffers
-    directly rather than EMA them — BN stats are already a running
-    average inside the live model, so smoothing them again is double
-    momentum and slows BN tracking unnecessarily.
-    """
-    src_buffers = dict(src_module.named_buffers())
-    for name, buf in ema_module.named_buffers():
-        # AveragedModel wraps the model as `self.module.<name>`; strip
-        # the leading "module." prefix when looking up in src.
-        key = name[len("module."):] if name.startswith("module.") else name
-        if key in src_buffers:
-            buf.data.copy_(src_buffers[key].data)
-
-
 # ============== Training Loop ==============
 
 def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                     scaler=None, grad_accum_steps=1, amp_enabled=False,
                     amp_dtype=torch.float16, batch_csv_writer=None,
-                    n_views=1, ema_model=None):
+                    n_views=1):
     """Run one training epoch with AMP and gradient accumulation support."""
     model.train()
     use_multiview = cfg.get('multiview', False)
@@ -617,14 +592,12 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
         # Optimizer step at accumulation boundary
         if (step + 1) % grad_accum_steps == 0:
             if has_accumulated:
-                did_step = False
                 if scaler is not None:
                     # FP16 path: scaler handles inf/nan detection internally
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
                     scaler.step(optimizer)
                     scaler.update()
-                    did_step = True
                 else:
                     # FP32 / BF16 path: manually check grad norm and skip step
                     # if non-finite (BF16 has no scaler to catch overflow/nan)
@@ -632,15 +605,10 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                         model.parameters(), max_norm=max_norm)
                     if torch.isfinite(total_norm):
                         optimizer.step()
-                        did_step = True
                     else:
                         log.warning("Epoch %d batch %d: non-finite grad norm "
                                     "(%s), skipping optimizer step",
                                     epoch, step + 1, total_norm.item())
-                if did_step and ema_model is not None:
-                    raynet = _unwrap_raynet(model)
-                    ema_model.update_parameters(raynet)
-                    _ema_copy_buffers(raynet, ema_model)
                 optimizer.zero_grad()
                 has_accumulated = False
             else:
@@ -713,23 +681,16 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
     # Flush any remaining gradients from incomplete accumulation
     if n_batches % grad_accum_steps != 0:
         if has_accumulated:
-            did_step = False
             if scaler is not None:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
                 scaler.step(optimizer)
                 scaler.update()
-                did_step = True
             else:
                 total_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), max_norm=max_norm)
                 if torch.isfinite(total_norm):
                     optimizer.step()
-                    did_step = True
-            if did_step and ema_model is not None:
-                raynet = _unwrap_raynet(model)
-                ema_model.update_parameters(raynet)
-                _ema_copy_buffers(raynet, ema_model)
             optimizer.zero_grad()
 
     for k in running_losses:
@@ -979,26 +940,6 @@ def train(args):
     # ranks start from identical parameters.
     model = accelerator.prepare(model)
 
-    # EMA shadow model for validation. Tracks a moving average of the
-    # live model's parameters; we run validation through it so the
-    # reported metric reflects a smoothed weight trajectory rather than
-    # the noisy step-by-step weights. Created from the unwrapped model
-    # so the EMA copy carries no DDP/torch.compile machinery — it's a
-    # plain RayNetV5 used only for forward passes during eval. BN
-    # buffers are mirrored from the live model after every optimizer
-    # step (see _ema_copy_buffers); only parameters are EMA'd.
-    ema_model = None
-    ema_restored_from_ckpt = False
-    if args.ema_decay > 0:
-        ema_model = AveragedModel(
-            accelerator.unwrap_model(model),
-            multi_avg_fn=get_ema_multi_avg_fn(args.ema_decay),
-        )
-        ema_model.to(device)
-        ema_model.eval()
-        if is_main:
-            print(f"EMA enabled (decay={args.ema_decay})")
-
     # --- Data loading ---
     # Multi-view is always active. Train + val both use 9-grouped batches so
     # CrossViewAttention, cam_embed, and PoseEncoder fusion are exercised at
@@ -1136,15 +1077,6 @@ def train(args):
         )
         current_phase = get_phase(resume_ckpt['epoch'])
         best_val_loss = resume_ckpt.get('val_metrics', {}).get('total', best_val_loss)
-        # Restore EMA shadow weights so resume picks up the smoothed
-        # trajectory rather than re-EMAing from current weights (which
-        # would discard ~all previous decay history and bias val toward
-        # noisy weights for a few hundred steps).
-        if ema_model is not None and 'ema_state_dict' in resume_ckpt:
-            ema_model.load_state_dict(resume_ckpt['ema_state_dict'])
-            ema_restored_from_ckpt = True
-            if is_main:
-                print("  Restored EMA shadow weights from checkpoint")
         if is_main:
             print(f"  Resumed at epoch {start_epoch} (phase {current_phase}), "
                   f"best_val_loss={best_val_loss:.4f}")
@@ -1281,22 +1213,6 @@ def train(args):
 
             best_val_loss = fork_state.get(
                 'val_metrics', {}).get('total', best_val_loss)
-            # Same-stage fork: architecture is unchanged so the EMA state
-            # is meaningful — load it. Cross-stage fork (above) leaves
-            # EMA fresh because the architecture may have changed and
-            # any saved EMA tensors that survive the shape filter would
-            # be of a different epoch's task distribution.
-            if ema_model is not None and 'ema_state_dict' in fork_state:
-                ema_sd = fork_state['ema_state_dict']
-                ema_target_sd = ema_model.state_dict()
-                ema_filtered, ema_dropped = _filter_compatible_state(
-                    ema_sd, ema_target_sd)
-                ema_model.load_state_dict(ema_filtered, strict=False)
-                ema_restored_from_ckpt = True
-                if is_main:
-                    print(f"  [fork] EMA state loaded "
-                          f"({len(ema_filtered)} kept, "
-                          f"{len(ema_dropped)} dropped)")
             if is_main:
                 print(f"  Fork: loaded full state from epoch "
                       f"{src_epoch} (phase {current_phase}). New run "
@@ -1372,23 +1288,6 @@ def train(args):
                 print(f"  Warmstart phase override: starting from "
                       f"phase {args.warmstart_phase} (epoch {start_epoch})")
 
-
-    # Seed the EMA shadow from the live model whenever no EMA was
-    # restored from a checkpoint. EMA was created right after
-    # accelerator.prepare, BEFORE warmstart/fork loaded the actual
-    # starting weights — leaving it at random init would mean the
-    # first ~1/(1-decay) ≈ 1000 updates produce a validation model
-    # that's a mix of random init and trained weights. Copying the
-    # current live state into the EMA shadow makes it identical to
-    # the live model at step 0 and decays correctly from there.
-    if ema_model is not None and not ema_restored_from_ckpt:
-        live_sd = _unwrap_raynet(model).state_dict()
-        ema_inner_sd = ema_model.module.state_dict()
-        for k in ema_inner_sd:
-            if k in live_sd and ema_inner_sd[k].shape == live_sd[k].shape:
-                ema_inner_sd[k].data.copy_(live_sd[k].data)
-        if is_main:
-            print("  EMA shadow seeded from current live weights")
 
     for epoch in range(start_epoch, args.epochs + 1):
         phase = get_phase(epoch)
@@ -1486,7 +1385,6 @@ def train(args):
             amp_dtype=amp_dtype,
             batch_csv_writer=batch_csv_writer,
             n_views=active_n_views,
-            ema_model=ema_model,
         )
         if batch_csv_file is not None:
             batch_csv_file.flush()
@@ -1497,13 +1395,8 @@ def train(args):
         # uninformative val gaze metrics. The val loader now delivers
         # 9-grouped batches (see _create_mds_mv_loader), so the reshape
         # inside CrossViewAttention is well-defined.
-        # Validate through the EMA shadow when enabled. EMA tracks the
-        # smoothed weight trajectory so val metrics are not contaminated
-        # by single-batch weight oscillation. Falls back to the live
-        # model when --ema_decay 0 was passed.
-        val_model = ema_model if ema_model is not None else model
         val_losses = validate(
-            val_model, active_val_loader, device, epoch, cfg,
+            model, active_val_loader, device, epoch, cfg,
             amp_enabled=hw['amp'],
             amp_dtype=amp_dtype,
             n_views=active_n_views,
@@ -1572,13 +1465,8 @@ def train(args):
             save_model = accelerator.unwrap_model(model)
 
             # Build the extras blob once per epoch — picked up by both
-            # save_best and the periodic save below. EMA state ships in
-            # `ema_state_dict` so resume can restore the smoothed weights;
-            # without this, resume would EMA-from-init and lose the
-            # smoothing benefit for the rest of training.
+            # save_best and the periodic save below.
             ckpt_extras = {'profile': args.profile}
-            if ema_model is not None:
-                ckpt_extras['ema_state_dict'] = ema_model.state_dict()
 
             # Save best model
             if val_losses['total'] < best_val_loss:
@@ -1601,8 +1489,6 @@ def train(args):
                         'val_angular_deg': val_losses['angular_deg'],
                         'profile': args.profile,
                     }
-                    if ema_model is not None:
-                        save_dict['ema_state_dict'] = ema_model.state_dict()
                     torch.save(save_dict, os.path.join(output_dir, 'best_model.pt'))
                 print(f"  -> Saved best model (val_loss={best_val_loss:.4f})")
 
@@ -1859,12 +1745,6 @@ def parse_args():
                         help='Force fork to reset epoch counter to 1 under '
                              'the current phase schedule. Optimizer momentum '
                              'and scaler state are still preserved.')
-    parser.add_argument('--ema_decay', type=float, default=0.999,
-                        help='EMA decay for validation weights (default 0.999). '
-                             'Set 0 to disable EMA. The EMA model tracks a '
-                             'moving average of the trainable parameters and '
-                             'is what validation runs through; the live model '
-                             'is what gets gradient updates.')
     args = parser.parse_args()
 
     if not args.mds_streaming and args.data_dir is None:
