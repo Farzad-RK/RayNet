@@ -1,15 +1,22 @@
 """
-RayNet v5 — Triple-M1 architecture with full-face branches + AERI gaze.
+RayNet v5 — Triple-M1 architecture with full-face branches + FPANet
+landmark + AERI gaze.
 
 Three task-specific branches, all consuming the 224x224 full-face crop
 through a single shared stem:
 
   Landmark branch (OWNS the shared stem):
     SharedStem (M1 stem+s0+s1) → LandmarkBranchEncoder (M1 s2+s3)
-      → U-Net decoder (56x56) → 14 landmark heatmaps + soft-argmax.
+      → FeaturePyramidNetwork (PANet) over [s0, s1, s2, s3]
+      → fused P2 (fpn_ch × 56 × 56) → refine + heatmap + offset heads
+      → soft-argmax → 14 sub-pixel landmark coords.
     Only task whose gradient backpropagates into the shared stem —
     pose and gaze both detach() their stem input so the low-level
-    representation is steered by landmark loss alone.
+    representation is steered by landmark loss alone. The PANet
+    top-down + bottom-up fusion is what gives the head sub-pixel
+    resolution; the prior single-stage U-Net decoder plateaued well
+    above 1 px and could not see global facial geometry while
+    resolving the iris contour.
 
   Pose branch (gradient-isolated from stem + fuses MAGE bbox):
     s1.detach() → PoseBranchEncoder (M1 s2+s3) → coord-att + pool + proj
@@ -20,7 +27,9 @@ through a single shared stem:
 
   Gaze branch (gradient-isolated + AERI):
     s1.detach() → GazeBranchEncoder (M1 s2+s3)
-      → AERIHead (mini U-Net → iris + eyeball mask logits @ 56x56)
+      → FPNAERIHead — its own PANet over [s0_det, s1_det, gz_s2, gz_s3]
+         producing iris + eyeball mask logits @ 56×56 plus a
+         fpn_ch-wide d1 for HRFH harvesting.
       → AERI attention: predicted eyeball mask gates the gaze feature
          map so the pooled vector is dominated by eye-region features
          without any geometric cropping.
@@ -160,101 +169,182 @@ class BoxEncoder(nn.Module):
         return self.mlp(bbox)
 
 
-# ─── U-Net Landmark Branch ──────────────────────────────────────────
+# ─── Feature Pyramid (PANet) ───────────────────────────────────────
 
-class AttentionGate(nn.Module):
-    """Attention gate for skip connections (Oktay et al., 2018)."""
-
-    def __init__(self, gate_ch, skip_ch, inter_ch):
-        super().__init__()
-        self.W_g = nn.Conv2d(gate_ch, inter_ch, 1, bias=False)
-        self.W_x = nn.Conv2d(skip_ch, inter_ch, 1, bias=False)
-        self.psi = nn.Sequential(
-            nn.GELU(),
-            nn.Conv2d(inter_ch, 1, 1, bias=False),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, gate, skip):
-        g = self.W_g(F.interpolate(gate, skip.shape[2:],
-                                   mode='bilinear', align_corners=False))
-        x = self.W_x(skip)
-        att = self.psi(g + x)
-        return skip * att
+# FPN_CHANNELS sets the uniform pyramid width. 128 is the working
+# default — enough capacity for sub-pixel landmark regression while
+# keeping P2 activations (fpn_ch * 56 * 56) at ~1 GB per branch under
+# bf16 + the a100_40gb batch (1152 samples). The FPANet whitepaper /
+# user spec is 256ch; bumping to 256 quadruples activation memory and
+# pushes the 40 GB profile out of headroom — switch only if running on
+# 80 GB or larger, by passing `fpn_ch=256` through the factory.
+FPN_CHANNELS = 128
 
 
-class UNetDecoderBlock(nn.Module):
-    """U-Net decoder block: upsample + attention-gated skip + double conv."""
-
-    def __init__(self, in_ch, skip_ch, out_ch):
-        super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear',
-                              align_corners=False)
-        self.att_gate = AttentionGate(in_ch, skip_ch, inter_ch=skip_ch // 2)
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch + skip_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.GELU(),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.GELU(),
-        )
-
-    def forward(self, x, skip):
-        x = self.up(x)
-        skip = self.att_gate(x, skip)
-        x = torch.cat([x, skip], dim=1)
-        return self.conv(x)
-
-
-class UNetLandmarkBranch(nn.Module):
+class FeaturePyramidNetwork(nn.Module):
     """
-    Landmark detection via U-Net encoder-decoder with attention gates.
+    Path Aggregation Network (PANet) over four backbone strides.
 
-    Encoder: BranchEncoder on SharedStem s1 output (192ch@14, 384ch@7).
-    Decoder: 7→14→28→56 with skip connections from s2, s1, s0.
-    Output: 14 heatmaps @ 56x56 + soft-argmax coordinates + subpixel
-    offset refinement.
+    Inputs are P2..P5 (strides 4, 8, 16, 32 for a 224×224 face crop):
+      P2  s0 / shared stem stage[0]      48ch @ 56×56
+      P3  s1 / shared stem stage[1]      96ch @ 28×28
+      P4  s2 / branch encoder stage[2]  192ch @ 14×14
+      P5  s3 / branch encoder stage[3]  384ch @  7× 7
+
+    Two passes — the multi-scale fusion that 1-stage U-Net decoders
+    lack:
+
+      1. Top-down (FPN, semantic injection):
+           T_5 = smooth(lat(P_5))
+           T_i = smooth(lat(P_i) + Upsample(T_{i+1}))   for i = 4, 3, 2
+
+      2. Bottom-up (PAN, high-resolution amplification):
+           B_2 = T_2
+           B_i = smooth(T_i + Downsample(B_{i-1}))      for i = 3, 4, 5
+
+    All convs are Conv-BN-SiLU. The lateral 1×1 reprojects each input
+    to `out_ch`; the smoothing and downsampling 3×3s build the pyramid.
+    Returns [B_2, B_3, B_4, B_5] at strides 4, 8, 16, 32 — heads pick
+    whichever level they need (landmark + AERI both use B_2).
+    """
+
+    def __init__(self, in_channels, out_ch=FPN_CHANNELS):
+        super().__init__()
+        self.out_ch = out_ch
+        self.lateral = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(c, out_ch, 1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.SiLU(inplace=True),
+            )
+            for c in in_channels
+        ])
+        # Top-down smoothing — applied after lateral + upsample sum.
+        # The deepest level (T_5) also passes through one 3×3 for symmetry.
+        self.smooth_td = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.SiLU(inplace=True),
+            )
+            for _ in in_channels
+        ])
+        # Stride-2 3×3 downsampling for the bottom-up path. One per
+        # level transition (P2→P3, P3→P4, P4→P5).
+        self.downsample = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(out_ch, out_ch, 3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.SiLU(inplace=True),
+            )
+            for _ in range(len(in_channels) - 1)
+        ])
+        # Bottom-up smoothing on each fused level above P2.
+        self.smooth_bu = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.SiLU(inplace=True),
+            )
+            for _ in range(len(in_channels) - 1)
+        ])
+
+    def forward(self, feats):
+        # feats: [P2, P3, P4, P5] — low-stride to high-stride.
+        L = [self.lateral[i](f) for i, f in enumerate(feats)]
+        n = len(L)
+
+        # Top-down: P5 → P4 → P3 → P2.
+        T = [None] * n
+        T[n - 1] = self.smooth_td[n - 1](L[n - 1])
+        for i in range(n - 2, -1, -1):
+            up = F.interpolate(T[i + 1], size=L[i].shape[2:],
+                               mode='bilinear', align_corners=False)
+            T[i] = self.smooth_td[i](L[i] + up)
+
+        # Bottom-up: P2 → P3 → P4 → P5.
+        B = [None] * n
+        B[0] = T[0]
+        for i in range(1, n):
+            down = self.downsample[i - 1](B[i - 1])
+            B[i] = self.smooth_bu[i - 1](T[i] + down)
+        return B  # [P2, P3, P4, P5] all at out_ch.
+
+
+# ─── FPN-based Landmark Branch ─────────────────────────────────────
+
+class FPNLandmarkBranch(nn.Module):
+    """
+    Landmark detection driven by PANet multi-scale fusion.
+
+    Pipeline:
+      BranchEncoder(s1) → (s2, s3)
+      FPN([s0, s1, s2, s3]) → [P2, P3, P4, P5]   (all `fpn_ch`)
+      P2 (fpn_ch × 56 × 56) → 2× Conv-BN-SiLU refine
+      → heatmap (n_landmarks × 56 × 56)
+      → offset  (n_landmarks·2 × 56 × 56)
+      → soft-argmax + offset refinement → 14 sub-pixel coords.
+
+    The fused P2 is what the old U-Net's d1 used to be, but augmented
+    with the global semantic context that P5 injects through the
+    top-down path and the high-resolution emphasis that the bottom-up
+    path adds — that combination is what we attribute the
+    sub-pixel accuracy of the earlier FPANet runs to.
 
     14 landmarks = 10 iris contour + 4 pupil boundary, GazeGene Sec 4.1.
     """
 
-    def __init__(self, n_landmarks=14):
+    def __init__(self, n_landmarks=14, fpn_ch=FPN_CHANNELS):
         super().__init__()
         self.encoder = None  # set by factory
         self.n_landmarks = n_landmarks
+        self.fpn = FeaturePyramidNetwork(M1_CHANNELS, out_ch=fpn_ch)
 
-        self.dec3 = UNetDecoderBlock(in_ch=384, skip_ch=192, out_ch=192)
-        self.dec2 = UNetDecoderBlock(in_ch=192, skip_ch=96,  out_ch=96)
-        self.dec1 = UNetDecoderBlock(in_ch=96,  skip_ch=48,  out_ch=48)
-
-        self.heatmap = nn.Sequential(
-            nn.Conv2d(48, 32, 3, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.GELU(),
-            nn.Conv2d(32, n_landmarks, 1),
+        self.refine = nn.Sequential(
+            nn.Conv2d(fpn_ch, fpn_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(fpn_ch),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(fpn_ch, fpn_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(fpn_ch),
+            nn.SiLU(inplace=True),
         )
-        self.offset = nn.Sequential(
-            nn.Conv2d(48, 32, 3, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.GELU(),
-            nn.Conv2d(32, n_landmarks * 2, 1),
-        )
+        self.heatmap = nn.Conv2d(fpn_ch, n_landmarks, 1)
+        self.offset = nn.Conv2d(fpn_ch, n_landmarks * 2, 1)
 
     def forward(self, s0, s1, s2, s3):
-        d3 = self.dec3(s3, s2)
-        d2 = self.dec2(d3, s1)
-        d1 = self.dec1(d2, s0)
-
-        hm = self.heatmap(d1)
-        off = self.offset(d1)
+        feats = self.fpn([s0, s1, s2, s3])
+        x = self.refine(feats[0])  # P2 fused
+        hm = self.heatmap(x)
+        off = self.offset(x)
         coords = self._soft_argmax(hm, off)
         return coords, hm
 
     def _soft_argmax(self, hm, off):
+        # Canonical soft-argmax (Integral Pose Regression, Sun et al.):
+        # interpret softmax(logits) as a probability map and take the
+        # expected value of (x, y) under that distribution. With
+        # temperature β = 1 the gradient through the softmax is
+        # well-distributed, so the L1 coord loss back-propagates into
+        # the heatmap itself — that's what makes the coords
+        # differentiable down to sub-pixel resolution.
+        #
+        # The previous implementation used β = 100, which collapses the
+        # softmax to a near-hard argmax: softmax derivatives saturate
+        # at ~0, the coord L1 only ever updates the offset head, and
+        # the heatmap is supervised solely by its MSE term. Sub-pixel
+        # accuracy then depends entirely on the offset head learning
+        # the integer→float residual at the argmax cell. Dropping β
+        # to 1 lets the heatmap distribution itself encode the
+        # sub-pixel signal.
+        #
+        # The offset head is retained as a residual refinement: at the
+        # cell nearest the soft-argmax expectation, look up a small
+        # (dx, dy) correction. This is now a fine-grained tweak on top
+        # of an already-continuous base coord, not the sole source of
+        # sub-pixel precision.
         B, N, H, W = hm.shape
         flat = hm.view(B, N, -1)
-        weight = F.softmax(flat * 100.0, dim=-1).view(B, N, H, W)
+        weight = F.softmax(flat, dim=-1).view(B, N, H, W)
 
         gx = torch.arange(W, dtype=torch.float32, device=hm.device)
         gy = torch.arange(H, dtype=torch.float32, device=hm.device)
@@ -270,42 +360,46 @@ class UNetLandmarkBranch(nn.Module):
         return torch.stack([x + dx, y + dy], dim=-1)
 
 
-# ─── AERI Segmentation Head ────────────────────────────────────────
+# ─── FPN-based AERI Segmentation Head ──────────────────────────────
 
-class AERIHead(nn.Module):
+class FPNAERIHead(nn.Module):
     """
-    Anatomical Eye Region Isolation head (MSGazeNet-style).
+    Anatomical Eye Region Isolation head built on PANet fusion.
 
-    Mini U-Net built on the gaze branch's own feature pyramid,
-    producing two binary-segmentation logit maps at 56x56:
-      - iris_logits    (channel 0)
-      - eyeball_logits (channel 1)
+    Replaces the previous mini-U-Net AERI decoder. Operates on the
+    gaze branch's own four-level pyramid (s0, s1, gaze_s2, gaze_s3) —
+    the gaze branch detaches s0/s1 upstream so AERI loss never leaks
+    into the landmark-owned shared stem.
 
-    The decoder reuses the landmark-style UNetDecoderBlock, with s0/s1
-    from the shared stem as detached skips (the same tensors landmark
-    uses, but with gradient blocked so AERI loss doesn't leak into the
-    stem — the stem is landmark-owned).
+    Pipeline:
+      FPN([s0, s1, gaze_s2, gaze_s3]) → [P2, P3, P4, P5]
+      P2 (fpn_ch × 56 × 56) → Conv-BN-SiLU refine → d1
+      d1 → 1×1 Conv → 2 logit channels (iris, eyeball) @ 56×56
 
-    Supervised by iris + eyeball binary masks baked into the MDS
-    shards (see RayNet.streaming.eye_masks). The predicted eyeball
-    mask is also used inside GazeBranch as a soft attention gate on
-    the 7x7 gaze feature map, making the pooled gaze vector
-    eye-region-dominant without any geometric cropping.
+    Returns:
+      iris_logits     (B, 56, 56)
+      eyeball_logits  (B, 56, 56)
+      d1              (B, fpn_ch, 56, 56) — the fused, refined P2; what
+        HRFH-α harvests for the foveal pathway. Wider than the legacy
+        48-channel U-Net d1, with multi-scale context injected by the
+        top-down + bottom-up pyramid passes.
     """
 
-    def __init__(self):
+    def __init__(self, fpn_ch=FPN_CHANNELS):
         super().__init__()
-        self.dec3 = UNetDecoderBlock(in_ch=384, skip_ch=192, out_ch=192)
-        self.dec2 = UNetDecoderBlock(in_ch=192, skip_ch=96,  out_ch=96)
-        self.dec1 = UNetDecoderBlock(in_ch=96,  skip_ch=48,  out_ch=48)
-        self.head = nn.Conv2d(48, 2, 1)
+        self.fpn = FeaturePyramidNetwork(M1_CHANNELS, out_ch=fpn_ch)
+        self.refine = nn.Sequential(
+            nn.Conv2d(fpn_ch, fpn_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(fpn_ch),
+            nn.SiLU(inplace=True),
+        )
+        self.head = nn.Conv2d(fpn_ch, 2, 1)
 
     def forward(self, s0, s1, s2, s3):
-        d3 = self.dec3(s3, s2)
-        d2 = self.dec2(d3, s1)
-        d1 = self.dec1(d2, s0)
-        logits = self.head(d1)                # (B, 2, 56, 56)
-        iris = logits[:, 0]                   # (B, 56, 56)
+        feats = self.fpn([s0, s1, s2, s3])
+        d1 = self.refine(feats[0])
+        logits = self.head(d1)
+        iris = logits[:, 0]
         eyeball = logits[:, 1]
         return iris, eyeball, d1
 
@@ -382,15 +476,15 @@ class GazeBranch(nn.Module):
     Pipeline (operating on gradient-isolated shared-stem features):
       s0.detach(), s1.detach() from SharedStem
       s1.detach() → BranchEncoder → gaze_s2 (14x14), gaze_s3 (7x7)
-      AERIHead(s0, s1, gaze_s2, gaze_s3)
-        → iris_logits, eyeball_logits, d1 (B,48,56,56)
+      FPNAERIHead(s0, s1, gaze_s2, gaze_s3)
+        → iris_logits, eyeball_logits, d1 (B, fpn_ch, 56, 56)
       saliency = SALIENCY_IRIS_W * sigmoid(iris)
                + SALIENCY_EYE_W  * sigmoid(eye)
       scheduled_mask = α * saliency + (1 - α) * 1
       Global path: gaze_s3 * (GLOBAL_FLOOR + (1-GLOBAL_FLOOR) * pool₇(scheduled_mask))
                    → CoordAtt → pool → 384-d → LayerNorm
       Foveal path: pool(d1 * (FOVEAL_FLOOR + (1-FOVEAL_FLOOR) * scheduled_mask))
-                   → 48-d → Linear→96 → GELU → LayerNorm
+                   → fpn_ch-d → Linear→96 → GELU → LayerNorm
                    → stochastic depth (training only, FOVEAL_DROP_P)
                    — identity at val.
       [global ‖ foveal_proj] (480-d) → Linear → 256-d gaze_feat
@@ -427,24 +521,27 @@ class GazeBranch(nn.Module):
     FOVEAL_FLOOR = 0.50   # was effectively 0.00 (gate = M; pure suppression)
     # ── Eyelid-occlusion robustness floors ───────────────────────────
 
-    def __init__(self, d_model=256):
+    def __init__(self, d_model=256, fpn_ch=FPN_CHANNELS):
         super().__init__()
         self.encoder = None  # set by factory (BranchEncoder)
-        self.aeri = AERIHead()
+        self.aeri = FPNAERIHead(fpn_ch=fpn_ch)
 
         # M1 s3 = 384 channels at 7x7
         self.coord_att = CoordinateAttention(384)
         self.pool = nn.AdaptiveAvgPool2d(1)
 
         # --- AERI / HRFH-α fusion ---
-        # The 48-d raw foveal vector (M1 d1=48ch) is projected to 96-d
-        # before being concatenated with the 384-d global vector. The
-        # 96/(384+96) = 20% foveal share preserves the sub-pixel iris
-        # signal HRFH was designed to extract while keeping the global
-        # context dominant. Each path is normalised separately so the
-        # global stats don't drown the foveal stats inside a shared LN.
+        # The fpn_ch-d raw foveal vector (FPNAERIHead d1) is projected
+        # to 96-d before being concatenated with the 384-d global
+        # vector. The 96/(384+96) = 20% foveal share preserves the
+        # sub-pixel iris signal HRFH was designed to extract while
+        # keeping the global context dominant. Each path is normalised
+        # separately so the global stats don't drown the foveal stats
+        # inside a shared LN. The legacy mini-U-Net used a 48-channel
+        # d1; the FPN d1 is wider (`fpn_ch`, default 128) and carries
+        # multi-scale context from the top-down + bottom-up passes.
         self.foveal_proj = nn.Sequential(
-            nn.Linear(48, 96),
+            nn.Linear(fpn_ch, 96),
             nn.GELU(),
         )
         self.global_norm = nn.LayerNorm(384)
@@ -774,7 +871,7 @@ def create_raynet_v5(backbone_weight_path=None, cross_view_cfg=None,
 
     shared_stem = SharedStem(stem, s0, s1)
 
-    landmark_branch = UNetLandmarkBranch(n_landmarks=n_landmarks)
+    landmark_branch = FPNLandmarkBranch(n_landmarks=n_landmarks)
     landmark_branch.encoder = BranchEncoder(lm_s2, lm_s3)
 
     pose_branch = PoseBranch(d_model=256)
@@ -796,15 +893,16 @@ def create_raynet_v5(backbone_weight_path=None, cross_view_cfg=None,
         return sum(p.numel() for p in module.parameters()) / 1e6
 
     total = _count(model)
-    print(f"RayNet v5 (Triple-M1, AERI gaze) created:")
+    print(f"RayNet v5 (Triple-M1, FPANet landmark + AERI gaze) created:")
     print(f"  SharedStem:      {_count(shared_stem):.2f}M")
     print(f"  LandmarkBranch:  {_count(landmark_branch):.2f}M "
-          f"(encoder {_count(landmark_branch.encoder):.2f}M + U-Net decoder)")
+          f"(encoder {_count(landmark_branch.encoder):.2f}M + PANet "
+          f"+ heatmap/offset heads)")
     print(f"  PoseBranch:      {_count(pose_branch):.2f}M "
           f"(encoder + CoordAtt + BoxEncoder + head)")
     print(f"  GazeBranch:      {_count(gaze_branch):.2f}M "
-          f"(encoder {_count(gaze_branch.encoder):.2f}M + AERI U-Net + "
-          f"CoordAtt + fusion + geometric head)")
+          f"(encoder {_count(gaze_branch.encoder):.2f}M + FPN-AERI "
+          f"+ CoordAtt + fusion + geometric head)")
     print(f"  CrossView+Cam:   "
           f"{_count(model.cross_view_attn) + _count(model.camera_embedding):.2f}M")
     print(f"  Total:           {total:.1f}M params")

@@ -2,7 +2,7 @@
 
 Multi-task deep learning for gaze estimation, iris/pupil landmarks, head pose, and **anatomical eye-region segmentation** on the [GazeGene](https://github.com/gazegene) dataset. Trained with multi-view geometric supervision and parallel MTL from epoch 1.
 
-## Architecture (v5 Triple-M1, AERI gaze)
+## Architecture (v5 Triple-M1, FPANet landmark + AERI gaze)
 
 ```
 Input: (3, 224, 224) GazeGene face crop + (3,) face bbox (x_p, y_p, L_x)
@@ -15,17 +15,17 @@ SharedStem  (RepNeXt-M1 stem + stages[0..1])    48→96ch, 28x28   ~0.21M
   ▼               ▼ (s1.detach)       ▼ (s1.detach)
 Landmark Branch   Pose Branch         Gaze Branch
 (M1 s2+s3)        (M1 s2+s3)          (M1 s2+s3)
-U-Net decoder     CoordAtt+pool       ┌────────────────────┐
-+ attention       ⊕ BoxEncoder(bbox)  │ AERIHead (mini-UNet)│
-gates             (zero-init residual)│ → iris_logits       │
+PANet (P2..P5)    CoordAtt+pool       ┌────────────────────┐
+→ P2 refine +     ⊕ BoxEncoder(bbox)  │ FPNAERIHead (PANet) │
+  heatmap+offset  (zero-init residual)│ → iris_logits       │
 14 pts @56×56     → pose_feat         │ → eyeball_logits    │
                   → 6D rot + 3D t     │   (both @ 56×56)    │
                                       └────────────────────┘
                                                  │
                                        eyeball mask gates
                                        the 7×7 gaze map:
-                                       gaze_s3 *= (0.25 +
-                                         0.75 · sigmoid(eyeball))
+                                       gaze_s3 *= (GLOBAL_FLOOR +
+                                         (1−GLOBAL_FLOOR) · pool₇(M))
                                                  │
                                                  ▼
                                        GazeFusion(gaze, pose_feat)
@@ -38,12 +38,13 @@ gates             (zero-init residual)│ → iris_logits       │
 ```
 
 - Backbone: **RepNeXt-M1** (~4.8M per instance). One shared stem + three independent `s2+s3` branches.
-- Total: **~18.7M params** (SharedStem 0.21M, LandmarkBranch 6.18M, PoseBranch 4.69M, GazeBranch 6.53M, CrossView+Cam 1.07M).
+- Total: **~18.7M params** (SharedStem 0.21M, LandmarkBranch 6.21M, PoseBranch 4.69M, GazeBranch 6.47M, CrossView+Cam 1.07M).
 - **Triple-M1** refers to the three task-specific branches above a single shared stem — not an eye-crop encoder. There is no pixel-level cropping anywhere in the forward path.
 
 ## Key Design
 
-- **AERI (Anatomical Eye Region Isolation)**: the gaze branch carries its own mini U-Net (`AERIHead`) that produces binary iris + eyeball segmentation logits at 56×56. The predicted eyeball mask is downsampled to 7×7 and used as a soft attention gate on the gaze bottleneck (`0.25 + 0.75·sigmoid(·)`), so the pooled gaze vector is eye-region-dominant without any geometric crop. Masks are baked into the MDS shards from GazeGene anatomy (see `RayNet/streaming/eye_masks.py`).
+- **PANet multi-scale fusion** for landmark and AERI: each branch carries its own `FeaturePyramidNetwork` that fuses all four backbone strides (P2..P5) to a uniform `fpn_ch` width via 1×1 lateral + top-down + bottom-up passes, all Conv-BN-SiLU. The landmark and AERI heads consume the fused P2 (`fpn_ch` × 56 × 56). Replaces the prior single-stage U-Net decoders that plateaued above 1 px on landmark sub-pixel accuracy.
+- **AERI (Anatomical Eye Region Isolation)**: the gaze branch's `FPNAERIHead` produces binary iris + eyeball segmentation logits at 56×56 plus a `fpn_ch`-channel `d1` tensor. The predicted eyeball mask is downsampled to 7×7 and used as a soft attention gate on the gaze bottleneck (with `GLOBAL_FLOOR = 0.5`), so the pooled gaze vector is eye-region-dominant without any geometric crop. Masks are baked into the MDS shards from GazeGene anatomy (see `RayNet/streaming/eye_masks.py`).
 - **Landmark-owned stem + full gradient isolation**: pose and gaze both read `s1.detach()` (and `s0.detach()` where used as a skip), so gaze/pose gradients never reach the shared low-level encoder. Landmark loss is the sole driver of `SharedStem`.
 - **Parallel MTL from epoch 1**: no sequential freeze stages. Landmark + pose + gaze + AERI segmentation + head translation are all active from the first step. Phase transitions adjust loss weights and LR only.
 - **Explicit 3D eyeball geometry**: predict `eyeball_center` + `pupil_center`, derive `optical_axis = normalize(pupil − eyeball)` (GazeGene Sec 4.2.2). Supervised with L1 on centers + angular loss on the derived axis.

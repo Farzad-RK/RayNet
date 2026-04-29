@@ -1,12 +1,12 @@
 # Architecture
 
-RayNet v5 (current) — **Triple-M1 + AERI + HRFH-α**. Three task-specific RepNeXt-M1 stage-2/3 encoders (landmark, pose, gaze) sit on a shared stem (RepNeXt-M1 stem + stages[0..1]). The gaze branch carries a private mini U-Net (`AERIHead`) that produces iris and eyeball binary masks at 56×56 plus a 48-channel decoder tensor `d1`. The masks are combined into a saliency, blended with a uniform field through an α schedule, and used twice: once at 7×7 to gate the gaze bottleneck (global features), once at 56×56 to gate `d1` (foveal features). The two pooled vectors are concatenated and projected into the 256-d gaze feature consumed by `GazeFusionBlock`. Source: `RayNet/raynet_v5.py`, `RayNet/streaming/eye_masks.py`.
+RayNet v5 (current) — **Triple-M1 + FPANet landmark + AERI + HRFH-α**. Three task-specific RepNeXt-M1 stage-2/3 encoders (landmark, pose, gaze) sit on a shared stem (RepNeXt-M1 stem + stages[0..1]). The landmark branch and the gaze branch's AERI head each carry a private **PANet** (`FeaturePyramidNetwork`) that fuses all four backbone strides — P2 (s0, 56×56) through P5 (s3, 7×7) — to a uniform `fpn_ch` width via 1×1 lateral + 3×3 top-down (semantic injection) + 3×3 bottom-up (high-resolution amplification). The landmark head consumes the fused P2; the AERI head consumes the same fused P2 to emit iris + eyeball binary masks at 56×56 plus an `fpn_ch`-channel decoder tensor `d1`. The masks are combined into a saliency, blended with a uniform field through an α schedule, and used twice: once at 7×7 to gate the gaze bottleneck (global features), once at 56×56 to gate `d1` (foveal features). The two pooled vectors are concatenated and projected into the 256-d gaze feature consumed by `GazeFusionBlock`. Source: `RayNet/raynet_v5.py`, `RayNet/streaming/eye_masks.py`.
 
 ## Why Triple-M1 + AERI replaced Quad-M1
 
 The earlier Quad-M1 cascade (eye-crop branch + landmark refinement head, see `docs/experiments/raynet_QUAd-M1_Stage2_New_Arch_500_samples_per_subject/`) had the differentiable affine eye-crop generating interpolation artefacts on val (train/val distribution gap from the affine grid being deterministic in train but operating on jittered landmark predictions in val), and the landmark refinement head was operating on a feature pyramid that already had to satisfy gaze. The eye crop itself drove a hard 9-13° val_angular floor that loss reweighting did not move.
 
-**AERI** removes the differentiable crop and replaces it with a soft mask gate at 56×56. The gaze branch shares the full-face crop with landmark/pose, so train and val see the same input distribution. Iris/eyeball segmentation is a clean MSGazeNet-style auxiliary signal supervised by per-frame masks baked into the MDS shards. **HRFH-α** then harvests the high-resolution `d1` tensor (48ch × 56² = 16× the token density of the 384ch × 7² bottleneck), gates it with the same scheduled saliency, and produces a 48-d foveal vector that captures sub-pixel iris/pupil dynamics — the part Quad-M1 was getting from its dedicated landmark refinement head.
+**AERI** removes the differentiable crop and replaces it with a soft mask gate at 56×56. The gaze branch shares the full-face crop with landmark/pose, so train and val see the same input distribution. Iris/eyeball segmentation is a clean MSGazeNet-style auxiliary signal supervised by per-frame masks baked into the MDS shards. **HRFH-α** then harvests the high-resolution `d1` tensor (`fpn_ch` × 56² = 16× the token density of the 384ch × 7² bottleneck), gates it with the same scheduled saliency, and produces a 96-d foveal vector that captures sub-pixel iris/pupil dynamics — the part Quad-M1 was getting from its dedicated landmark refinement head. Switching the AERI decoder from a mini U-Net to a PANet was driven by the same architectural argument as the landmark branch: a multi-scale fusion pathway lets the segmentation logits resolve the iris/sclera limbus at high resolution while remaining anchored to the global facial geometry encoded at P5.
 
 The progressive-training advantage that Quad-M1 enjoyed (pose-only Phase 1 → full Phase 2 with reproj/mask) is now replicated by the **branch-staged curriculum** in `train.py`: Phase 1 freezes the gaze branch and trains landmark + AERI seg + headpose; Phase 2 freezes everything except gaze + AERI for monocular gaze; Phase 3 unfreezes all branches and turns on multi-view fusion at a 5×–10× lower LR than P2. See `RayNet/README.md` for the schedule table.
 
@@ -14,16 +14,17 @@ The progressive-training advantage that Quad-M1 enjoyed (pose-only Phase 1 → f
 
 A standard architecture regresses gaze from the stride-32 bottleneck (`(B, 384, 7, 7)`), where the iris occupies 1-3 cells. That ceiling appeared as a stubborn ~20° val_angular asymptote in the v5.0 Triple-M1 fork. HRFH harvests features at 56×56 instead and does so on a clean (segmented) eye region:
 
-1. **AERIHead** decodes the gaze branch's pyramid (s3=384@7, s2=192@14) up to 56×56 with attention-gated U-Net blocks. It emits two binary mask logits (iris, eyeball) and exposes the 48-channel `d1` decoder tensor.
-2. **Saliency**: `0.8·sigmoid(iris) + 0.2·sigmoid(eyeball)` — iris-centric, prioritising the high-entropy pupil/iris boundary.
+1. **FPNAERIHead** runs a private PANet over the gaze branch's four-level pyramid (s0=48@56, s1=96@28, gaze_s2=192@14, gaze_s3=384@7), producing a fused P2 of `fpn_ch` channels at 56×56. A 3×3 Conv-BN-SiLU refines it into the `d1` tensor; a 1×1 head emits the iris and eyeball logit channels. `s0/s1` enter detached so AERI loss does not leak into the landmark-owned shared stem.
+2. **Saliency**: `0.65·sigmoid(iris) + 0.35·sigmoid(eyeball)` — iris-centric, prioritising the high-entropy pupil/iris boundary while keeping enough eyeball context for the geometric head to localise `eyeball_center`.
 3. **α schedule** (`get_scheduled_alpha(epoch)` in `train.py`): `scheduled_mask = α·saliency + (1−α)·1`. Low α at warmup keeps the gaze pathway looking at the global field; α is held constant in fine-tune (the previously-shipped 0.4→0.9 ramp during the cosine LR decay caused validation drift; see `docs/experiments/triple_m1_aeri_iris_eyeball_500spc_run_20260423_101115`).
-4. **Stochastic mask dropout** (training only, 10% of batches): replace the scheduled mask with the uniform field. Prevents the gaze head from overfitting to specific pixel-mask correlations.
-5. **Two-scale gating**:
-   - Pool the scheduled mask to 7×7 → multiply the gaze bottleneck `(384, 7, 7)` → CoordAtt → AdaptiveAvgPool → 384-d **global vector**.
-   - Multiply the 56×56 scheduled mask onto `d1` → AdaptiveAvgPool → 48-d **foveal vector**.
-6. Concatenate `[global ‖ foveal]` (432-d), `LayerNorm`, `Linear → 256` → `gaze_feat` consumed by `GazeFusionBlock`.
+4. **Two-scale gating with floors**:
+   - Pool the scheduled mask to 7×7 → multiply the gaze bottleneck `(384, 7, 7)` by `(GLOBAL_FLOOR + (1−GLOBAL_FLOOR)·gate)` → CoordAtt → AdaptiveAvgPool → LayerNorm → 384-d **global vector**.
+   - Multiply the 56×56 scheduled mask (with `FOVEAL_FLOOR` clamp) onto `d1` → AdaptiveAvgPool → `fpn_ch`-d → `Linear → 96` → GELU → LayerNorm → 96-d **foveal vector**.
+   - The floors (default 0.5/0.5) cap how much the saliency map can suppress each pathway, fixing the eyelid-occlusion / drowsy-eye drift mode where AERI mis-fires and the gate collapses.
+5. **Stochastic depth on the foveal vector** (training only, 10%): drop the foveal contribution with `FOVEAL_DROP_P` so the global pathway stays competent on its own; identity at val (no train/val asymmetry on the global gate).
+6. Concatenate `[global ‖ foveal]` (480-d), `Linear → 256` → `gaze_feat` consumed by `GazeFusionBlock`.
 
-The 16× higher token density of the foveal path (48 channels × 3136 cells vs. 384 channels × 49 cells) is what gives the gaze branch its sub-pixel iris signal — replacing the role the Quad-M1 LandmarkRefinementHead used to play.
+The combination of multi-scale PANet fusion at the AERI head and the high token density of the foveal path (`fpn_ch` channels × 3136 cells vs. 384 × 49 cells) is what gives the gaze branch its sub-pixel iris signal — replacing the role the Quad-M1 LandmarkRefinementHead used to play.
 
 ## Diagram
 
@@ -40,8 +41,8 @@ Input: (3, 224, 224) face crop  +  (3,) face bbox (x_p, y_p, L_x)  [optional at 
    ┌──────────────────┐  ┌─────────────────┐  ┌──────────────────────────┐
    │ LandmarkBranch   │  │ PoseBranch      │  │ GazeBranch               │
    │ M1 s2+s3 +       │  │ M1 s2+s3 +      │  │ M1 s2+s3 +               │
-   │ U-Net @56 +      │  │ CoordAtt +      │  │ AERIHead (mini U-Net) +  │
-   │ AttGates +       │  │ pool + proj +   │  │ HRFH-α gating @ 7 + 56 + │
+   │ PANet (P2..P5)   │  │ CoordAtt +      │  │ FPNAERIHead (PANet) +    │
+   │ → P2 refine +    │  │ pool + proj +   │  │ HRFH-α gating @ 7 + 56 + │
    │ heatmap+offset   │  │ BoxEncoder      │  │ CoordAtt + pool +        │
    │                  │  │ (zero-init      │  │ Concat[global,foveal] +  │
    │                  │  │  residual)      │  │ LN + Linear → 256        │
@@ -62,17 +63,23 @@ Input: (3, 224, 224) face crop  +  (3,) face bbox (x_p, y_p, L_x)  [optional at 
 
 ### SharedStem
 
-RepNeXt-M1 stem (3→48ch, stride 4, 56×56) + stage[0] (48→48ch, 56×56) + stage[1] (48→96ch, 28×28). Intermediate maps are exposed as skip connections for the landmark U-Net decoder. ~0.21M params.
+RepNeXt-M1 stem (3→48ch, stride 4, 56×56) + stage[0] (48→48ch, 56×56) + stage[1] (48→96ch, 28×28). The two outputs `s0` (P2) and `s1` (P3) are consumed both by the landmark branch's PANet and (in detached form) by the gaze branch's FPN-AERI head. ~0.21M params.
 
 ### Task Branches
 
-- **Landmark branch**: RepNeXt-M1 stages[2..3] + U-Net decoder with attention gates. Upsamples 7×7 → 56×56 with skips from shared-stem intermediates. Predicts 14 heatmaps → soft-argmax + learned offset refinement. **Owns the shared stem** — the only branch whose loss reaches `s0`/`s1`. ~6.18M params.
+- **Landmark branch**: RepNeXt-M1 stages[2..3] + private `FeaturePyramidNetwork` (PANet) over `[s0, s1, s2, s3]` → fused P2 → 2× Conv-BN-SiLU refine → heatmap + offset 1×1 heads → soft-argmax. **Owns the shared stem** — the only branch whose loss reaches `s0`/`s1`. ~6.21M params.
 - **Pose branch**: RepNeXt-M1 stages[2..3] on `s1.detach()`. CoordAtt + pool + projection, fused with `BoxEncoder(face_bbox)` via a zero-init residual. Predicts 6D rotation (Gram-Schmidt) + 3D translation. The `face_bbox` argument is **optional**: when `None` the BoxEncoder fork zeroes out and pose collapses to CNN features (see `PoseBranch.forward`). ~4.69M params.
-- **Gaze branch**: RepNeXt-M1 stages[2..3] on `s1.detach()` + `AERIHead` (mini U-Net) + HRFH-α gating + `GazeFusionBlock` + `CrossViewAttention` (when applicable) + `GeometricGazeHead`. ~6.53M params.
+- **Gaze branch**: RepNeXt-M1 stages[2..3] on `s1.detach()` + `FPNAERIHead` (private PANet over `[s0_det, s1_det, gaze_s2, gaze_s3]`) + HRFH-α gating + `GazeFusionBlock` + `CrossViewAttention` (when applicable) + `GeometricGazeHead`. ~6.47M params.
 
-### AERIHead
+### FeaturePyramidNetwork (PANet)
 
-Mini U-Net decoder operating on the gaze branch's own pyramid. Uses `s0.detach()` and `s1.detach()` from the shared stem as skip connections (gradient blocked so AERI loss does not leak into the landmark-owned stem). Returns `(iris_logits, eyeball_logits, d1)` where `d1` is the 48-channel 56×56 decoder tensor. Supervised by per-frame iris and eyeball binary masks baked into the MDS shards (`streaming/eye_masks.py`).
+Path Aggregation Network used at two sites: the landmark branch and the AERI head. Each instance has its own weights — gradients stay isolated to the owning branch. Input strides 4/8/16/32 are projected to `fpn_ch` (default 128) by 1×1 lateral convs, fused top-down (`T_5 = lat(P_5)`, `T_i = smooth(lat(P_i) + Upsample(T_{i+1}))`), then bottom-up (`B_i = smooth(T_i + Downsample(B_{i-1}))`). All convs are Conv-BN-SiLU. Returns four feature maps `[B_2, B_3, B_4, B_5]` at uniform width; both the landmark and AERI heads currently consume `B_2` only, but the higher levels are produced and available for later additions.
+
+The default of 128 channels keeps P2 activations (`fpn_ch · 56² = 401K` per sample) and the FPN parameter budget compatible with the `a100_40gb` profile (1152-sample batch). 256 — the value referenced in the FPANet whitepaper — quadruples activation memory; switch with `fpn_ch=256` only on 80 GB or larger devices.
+
+### FPNAERIHead
+
+PANet operating on the gaze branch's own pyramid (`s0.detach()`, `s1.detach()`, `gaze_s2`, `gaze_s3`). The fused P2 is refined by one Conv-BN-SiLU into the `d1` tensor and then 1×1-projected to two logit channels. Returns `(iris_logits, eyeball_logits, d1)` where `d1` is `(B, fpn_ch, 56, 56)`. Supervised by per-frame iris and eyeball binary masks baked into the MDS shards (`streaming/eye_masks.py`).
 
 ### GazeFusionBlock
 
@@ -112,12 +119,11 @@ Internally (`RayNetV5.forward`):
 2. `landmark_coords, landmark_heatmaps = LandmarkBranch(s0, s1)` — only path that backprops into the stem.
 3. `pose_feat, pose_6d, pose_t = PoseBranch(s1.detach(), face_bbox)`.
 4. `cam_embed = CameraEmbedding(R_cam, T_cam) + pose_feat.detach()` (when extrinsics passed).
-5. `iris_logits, eyeball_logits, d1 = AERIHead(s0.detach(), s1.detach(), gaze_s2, gaze_s3)`.
-6. `scheduled_mask = α·(0.8·sigmoid(iris) + 0.2·sigmoid(eyeball)) + (1−α)·1`.
-7. Optional stochastic mask dropout (training only).
-8. `global = pool(CoordAtt(gaze_s3 · pool₇(scheduled_mask)·0.75 + 0.25))` — 384-d.
-9. `foveal = pool(d1 · scheduled_mask)` — 48-d.
-10. `gaze_feat = Linear(LayerNorm(Concat[global, foveal]))` — 256-d.
+5. `iris_logits, eyeball_logits, d1 = FPNAERIHead(s0.detach(), s1.detach(), gaze_s2, gaze_s3)` — `d1` is `(B, fpn_ch, 56, 56)`.
+6. `scheduled_mask = α·(0.65·sigmoid(iris) + 0.35·sigmoid(eyeball)) + (1−α)·1`.
+7. `global_gate = GLOBAL_FLOOR + (1−GLOBAL_FLOOR)·pool₇(scheduled_mask)` and `global = LN(pool(CoordAtt(gaze_s3 · global_gate)))` — 384-d.
+8. `foveal_gate = FOVEAL_FLOOR + (1−FOVEAL_FLOOR)·scheduled_mask` and `foveal = LN(GELU(Linear(pool(d1 · foveal_gate))))` — 96-d (training-only stochastic depth on this vector with `FOVEAL_DROP_P`).
+9. `gaze_feat = Linear(Concat[global, foveal])` — 256-d.
 11. `pooled_sv = GazeFusionBlock(gaze_feat, pose_feat)`.
 12. `pooled = CrossViewAttention(pooled_sv, n_views, cam_embed)`.
 13. `eyeball_center, pupil_center, optical_axis = GeometricGazeHead(pooled)` and (when `n_views > 1`) `sv_optical_axis = GeometricGazeHead(pooled_sv)`.
@@ -146,9 +152,11 @@ Internally (`RayNetV5.forward`):
 Shared stem      -> s0:(B,48,56,56), s1:(B,96,28,28)
 Branch stages[2] -> (B, 192, 14, 14)
 Branch stages[3] -> (B, 384,  7,  7)
-Landmark decoder -> (B, 14, 56, 56) heatmaps
-AERI decoder     -> iris/eyeball logits (B, 56, 56), d1 (B, 48, 56, 56)
-Gaze fusion      -> [global(384) ‖ foveal(48)] → LN → Linear → (B, 256)
+PANet (per branch) -> [B2(fpn_ch,56,56), B3(fpn_ch,28,28),
+                       B4(fpn_ch,14,14), B5(fpn_ch,7,7)]
+Landmark head    -> (B, 14, 56, 56) heatmaps
+AERI head        -> iris/eyeball logits (B, 56, 56), d1 (B, fpn_ch, 56, 56)
+Gaze fusion      -> [global(384) ‖ foveal(96)] → Linear → (B, 256)
 Pose head        -> (B, 6), (B, 3)
 Gaze head        -> (B, 3), (B, 3), (B, 3)
 ```
@@ -158,9 +166,9 @@ Gaze head        -> (B, 3), (B, 3), (B, 3)
 | Module | Params |
 |--------|--------|
 | SharedStem | 0.21M |
-| LandmarkBranch (M1 s2+s3 + U-Net + heads) | 6.18M |
+| LandmarkBranch (M1 s2+s3 + PANet + heatmap/offset heads) | 6.21M |
 | PoseBranch (M1 s2+s3 + CoordAtt + BoxEncoder + head) | 4.69M |
-| GazeBranch (M1 s2+s3 + AERIHead + HRFH fusion + GeometricGazeHead) | 6.53M |
+| GazeBranch (M1 s2+s3 + FPNAERIHead + HRFH fusion + GeometricGazeHead) | 6.47M |
 | CrossViewAttention + CameraEmbedding | 1.07M |
 | **Total** | **~18.7M** |
 
