@@ -115,7 +115,7 @@ PHASE_CONFIG = {
         'lam_trans': 0.5,
         'lam_iris_seg': 1.0,
         'lam_eyeball_seg': 1.0,
-        'lr': 5e-4,
+        'lr': 0.001,
         'sigma': 2.0,
         'multiview': False,
         'freeze_set': 'gaze_only',  # see apply_phase_freeze
