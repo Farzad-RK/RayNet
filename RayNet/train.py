@@ -65,6 +65,24 @@ from RayNet.raynet_v5 import create_raynet_v5
 log = logging.getLogger(__name__)
 
 
+# ============== TriCam camera selection ==============
+#
+# GazeGene ships 9 cameras. Empirical 3D-triangulation analysis of the
+# rig (see docs/camera_info.pkl + the analysis in run_20260430 review)
+# shows the historic horizontal triplet {3, 4, 5} is geometrically
+# near-degenerate for resolving eyeball-centre depth: those three cams
+# share z = -162 cm, so the cross-axis baseline collapses and the
+# triangulated 3D anchor drifts under sub-pixel detection error.
+#
+# The cam triplet {1, 6, 8} maximises 3D triangulation area (~85 k cm²
+# vs 16.7 k for {3,4,5}) while keeping cam 1 in the front ring (best
+# landmark visibility) and cams 6, 8 in the back ring (large z-baseline
+# for depth recovery). See the unit-grounded analysis in conversation
+# logs for the full ranking.
+TRICAM_IDS = (1, 6, 8)
+TRICAM_N_VIEWS = len(TRICAM_IDS)
+
+
 # ============== Staged Training Configuration ==============
 #
 # -----------------------------------------------------------------------------
@@ -77,29 +95,34 @@ log = logging.getLogger(__name__)
 #   CrossViewAttention itself is *always active during training* when
 #   --mv_groups > 1, regardless of the phase's `multiview` setting. This is
 #   because the MDS dataloader is constructed once before the phase loop,
-#   producing 9-grouped multi-view batches, and `active_n_views` is
-#   hardcoded to 9 at train.py:active_n_views (only suppressed by the
+#   producing TRICAM_N_VIEWS-grouped multi-view batches, and
+#   `active_n_views` is set to TRICAM_N_VIEWS (only suppressed by the
 #   --no_multiview CLI ablation flag).
 #
 #   Validation uses n_views=1, so CrossViewAttention, camera embeddings,
 #   and the PoseEncoder features ALL bypass during validation. This creates
-#   a deliberate train/val asymmetry: training sees fused 9-view geometry,
-#   val sees single-view — val metrics are therefore a strict lower bound
-#   on what the model is actually capable of at inference with multi-view.
+#   a deliberate train/val asymmetry: training sees fused multi-view
+#   geometry, val sees single-view — val metrics are therefore a strict
+#   lower bound on what the model is actually capable of at inference
+#   with multi-view.
 #
 #   If you truly want a "no multi-view fusion" phase, pass --no_multiview
 #   on the CLI (not the `multiview: False` config flag).
 # -----------------------------------------------------------------------------
 
 PHASE_CONFIG = {
-    # ---- Phase 1 — landmark + AERI seg + headpose. Gaze branch frozen. ----
-    # The shared stem is landmark-owned; pose + AERI train alongside.
-    # The gaze branch encoder, fusion block, and GeometricGazeHead are
-    # frozen (.eval() + requires_grad_(False)) by `apply_phase_freeze`
-    # below — this is the difference between this curriculum and the
-    # parallel-MTL schedule that shipped with v5.0.
-    # AERI seg weights raised to 1.0 so iris/eyeball masks are crisp
-    # before HRFH-α consumes them in P2.
+    # ---- Phase 1 — landmark + headpose only (skeleton geometry). ----
+    # Texture-decoupling: GazeGene supervises ONLY skeleton/anatomical
+    # features (sparse landmarks + 3D head pose). The dense AERI iris/
+    # eyeball masks have been removed from the GazeGene loss path —
+    # those will train exclusively on real OpenEDS IR masks in a future
+    # OpenEDS-only stage to avoid letting the model overfit MetaHuman
+    # foveal renderings. The AERI head is still constructed and produces
+    # masks for the saliency gate, but with both seg weights = 0 it
+    # receives no gradient on synthetic data and behaves as a frozen
+    # uniform-ish prior. The shared stem is landmark-owned; pose trains
+    # alongside. The gaze branch (encoder, fusion, GeometricGazeHead)
+    # is frozen (.eval() + requires_grad_(False)) by `apply_phase_freeze`.
     1: {
         'epochs': (1, 15),
         'lam_lm': 1.0,
@@ -113,23 +136,38 @@ PHASE_CONFIG = {
         'lam_mask': 0.0,
         'lam_pose': 0.5,
         'lam_trans': 0.5,
-        'lam_iris_seg': 1.0,
-        'lam_eyeball_seg': 1.0,
+        'lam_iris_seg': 0.0,    # foveal texture → OpenEDS-only stage
+        'lam_eyeball_seg': 0.0, # foveal texture → OpenEDS-only stage
+        # 3DGazeNet M-target — iris contour mesh in CCS. Off in P1
+        # because the gaze branch (which hosts the iris-mesh head) is
+        # frozen here; the head is constructed but receives no gradient.
+        'lam_iris_mesh': 0.0,
+        'lam_iris_edge': 0.0,
+        # Mean-of-two and visual-axis loss only fire when gaze unfreezes
+        'lam_gaze_geom': 0.0,
+        'lam_gaze_direct': 0.0,
+        'lam_gaze_visual': 0.0,
+        # Macro (head) gaze (`gaze_C`) is owned by the gaze branch, so
+        # its weight must follow the gaze freeze schedule. Off in P1.
+        'lam_gaze_macro': 0.0,
         'lr': 0.001,
         'sigma': 2.0,
         'multiview': False,
         'freeze_set': 'gaze_only',  # see apply_phase_freeze
-        'description': 'V5-P1: lm + AERI seg + headpose (gaze frozen)',
+        'description': 'V6-P1: skeleton geometry (landmark + pose). '
+                       'Foveal seg deferred to OpenEDS stage.',
     },
     # ---- Phase 2 — monocular gaze fine-tune. Stem/lm/pose frozen. ----
-    # Single-view only. AERI seg supervision held at 0.5 so masks stay
-    # stable while gaze adapts. lam_gaze_sv = 1.0 (== lam_gaze pathway)
-    # because n_views == 1 means the single-view pathway IS the
-    # supervision pathway — there is no CrossViewAttention to bypass.
+    # Single-view only. Skeleton geometry only: gaze direction +
+    # 3D eyeball / pupil anchors + optical-axis consistency. AERI seg
+    # losses are 0 — foveal texture is owned by the OpenEDS stage.
+    # lam_gaze_sv = 1.0 (== lam_gaze pathway) because n_views == 1 means
+    # the single-view pathway IS the supervision pathway — there is no
+    # CrossViewAttention to bypass.
     2: {
         'epochs': (16, 30),
         'lam_lm': 0.0,          # landmark frozen
-        'lam_gaze': 2.0,
+        'lam_gaze': 2.0,        # supervises the FUSED gaze (mean-of-two)
         'lam_gaze_sv': 0.0,     # n_views==1 → pooled_sv == pooled, no SV side path
         'lam_eyeball': 0.3,
         'lam_pupil': 0.3,
@@ -139,13 +177,33 @@ PHASE_CONFIG = {
         'lam_mask': 0.0,
         'lam_pose': 0.0,        # pose frozen
         'lam_trans': 0.0,
-        'lam_iris_seg': 0.5,
-        'lam_eyeball_seg': 0.5,
+        'lam_iris_seg': 0.0,    # foveal texture → OpenEDS-only stage
+        'lam_eyeball_seg': 0.0, # foveal texture → OpenEDS-only stage
+        # 3DGazeNet M-target — vertex L1 + edge length L2 (paper ratios).
+        'lam_iris_mesh': 0.1,   # 3DGazeNet λ_v
+        'lam_iris_edge': 0.01,  # 3DGazeNet λ_e
+        # Mean-of-two: supervise both sub-heads so neither collapses.
+        # Half the fused-gaze weight each, so the combined effective
+        # weight on direction (geom + direct + fused) is 2.0+0.5+0.5 = 3.0.
+        'lam_gaze_geom': 0.5,
+        'lam_gaze_direct': 0.5,
+        # Visual-axis (kappa-corrected) supervision on the GEOMETRIC
+        # branch only — applies kappa to optical (= gaze_geom) and
+        # supervises against gt_visual_axis. Off until P2 because
+        # gaze_geom only has signal once eyeball + pupil heads are
+        # warmed up.
+        'lam_gaze_visual': 0.5,
+        # Macro (head) gaze — GazeGene gaze_C. Trained alongside the
+        # micro signals; the MacroGazeHead consumes pose_feat + the
+        # predicted eyeball anchor (detached) and is otherwise
+        # independent of the optical/visual branches.
+        'lam_gaze_macro': 1.0,
         'lr': 3e-4,
         'sigma': 1.5,
         'multiview': False,
         'freeze_set': 'face_only',  # freeze stem + landmark + pose
-        'description': 'V5-P2: monocular gaze + AERI fine-tune (face frozen)',
+        'description': 'V6-P2: monocular gaze on skeleton anchors '
+                       '+ iris mesh + visual axis + macro gaze.',
     },
     # ---- Phase 3 — multi-view fusion at 5×–10× lower LR. Face frozen. ----
     # The cosine-decay-from-3e-4 schedule used in run_20260423_101115
@@ -167,7 +225,7 @@ PHASE_CONFIG = {
     3: {
         'epochs': (31, 50),
         'lam_lm': 0.0,          # landmark frozen — see freeze_set
-        'lam_gaze': 2.0,
+        'lam_gaze': 2.0,        # fused gaze
         'lam_gaze_sv': 1.0,     # close train/val gap when CrossViewAttn is on
         'lam_eyeball': 0.4,
         'lam_pupil': 0.4,
@@ -177,13 +235,23 @@ PHASE_CONFIG = {
         'lam_mask': 0.05,
         'lam_pose': 0.3,
         'lam_trans': 0.3,
-        'lam_iris_seg': 0.3,    # NOT 0.1 — keep masks supervised; HRFH consumes them
-        'lam_eyeball_seg': 0.3,
+        'lam_iris_seg': 0.0,    # foveal texture → OpenEDS-only stage
+        'lam_eyeball_seg': 0.0, # foveal texture → OpenEDS-only stage
+        # 3DGazeNet M-target — slightly lower than P2 to let multi-view
+        # consistency dominate.
+        'lam_iris_mesh': 0.05,
+        'lam_iris_edge': 0.005,
+        # Mean-of-two sub-supervisions held at P2 levels.
+        'lam_gaze_geom': 0.5,
+        'lam_gaze_direct': 0.5,
+        'lam_gaze_visual': 0.5,
+        'lam_gaze_macro': 1.0,
         'lr': 5e-5,             # 6× lower than P2 (was 3e-4)
         'sigma': 1.0,
         'multiview': True,
         'freeze_set': 'face_kept',  # freeze stem + landmark, keep pose trainable
-        'description': 'V5-P3: multi-view gaze + pose (lm/stem frozen, low LR)',
+        'description': 'V6-P3: TriCam multi-view + iris mesh + visual axis, '
+                       'skeleton-only supervision.',
     },
 }
 
@@ -487,6 +555,21 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
         if gt_eyeball_mask is not None:
             gt_eyeball_mask = gt_eyeball_mask.to(device, non_blocking=True)
 
+        # 3DGazeNet M-target ground truth — iris contour mesh in CCS.
+        # Falls back to None on shards that pre-date the schema bump
+        # (the iris mesh + visual axis loss heads no-op when GT absent).
+        gt_iris_mesh_3d = batch.get('iris_mesh_3d')
+        if gt_iris_mesh_3d is not None:
+            gt_iris_mesh_3d = gt_iris_mesh_3d.to(device, non_blocking=True)
+        # Per-subject kappa rotation and GT visual axis for the kappa-
+        # corrected visual-axis loss.
+        R_kappa = batch.get('R_kappa')
+        if R_kappa is not None:
+            R_kappa = R_kappa.to(device, non_blocking=True)
+        gt_visual_axis = batch.get('visual_axis')
+        if gt_visual_axis is not None:
+            gt_visual_axis = gt_visual_axis.to(device, non_blocking=True)
+
         mv_components = None
         # Forward pass with AMP autocast
         aeri_alpha = get_scheduled_alpha(epoch)
@@ -538,6 +621,25 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                 lam_eyeball_seg=cfg.get('lam_eyeball_seg', 0.0),
                 pred_eyeball_mask_logits=predictions.get('eyeball_mask_logits'),
                 gt_eyeball_mask=gt_eyeball_mask,
+                # 3DGazeNet M-target — iris contour mesh
+                lam_iris_mesh=cfg.get('lam_iris_mesh', 0.0),
+                pred_iris_mesh_3d=predictions.get('iris_mesh_3d'),
+                gt_iris_mesh_3d=gt_iris_mesh_3d,
+                lam_iris_edge=cfg.get('lam_iris_edge', 0.0),
+                # Mean-of-two gaze fusion sub-supervisions
+                lam_gaze_geom=cfg.get('lam_gaze_geom', 0.0),
+                pred_gaze_geom=predictions.get('gaze_geom'),
+                lam_gaze_direct=cfg.get('lam_gaze_direct', 0.0),
+                pred_gaze_direct=predictions.get('gaze_direct'),
+                # Visual-axis (kappa-corrected) supervision
+                lam_gaze_visual=cfg.get('lam_gaze_visual', 0.0),
+                pred_optical_axis=predictions.get('gaze_geom'),
+                R_kappa=R_kappa,
+                gt_visual_axis=gt_visual_axis,
+                # Macro (head) gaze — GazeGene gaze_C paradigm
+                lam_gaze_macro=cfg.get('lam_gaze_macro', 0.0),
+                pred_gaze_macro=predictions.get('gaze_macro'),
+                gt_gaze_c=gt_gaze_c,
             )
 
             # Single-view pathway supervision: direct gaze L1 on pre-CrossViewAttn
@@ -561,6 +663,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                     R_cam,
                     lam_gaze_consist=cfg['lam_reproj'],
                     lam_shape=cfg['lam_mask'],
+                    n_views=n_views,
                 )
                 if torch.isfinite(mv_loss):
                     # Smooth ramp from 0 → 1 over the first 5 epochs of P3
@@ -739,6 +842,29 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
         if gt_eyeball_mask is not None:
             gt_eyeball_mask = gt_eyeball_mask.to(device, non_blocking=True)
 
+        # New (v6) GT signals — gracefully None on legacy shards.
+        # The streaming reader emits NaN-tensors when the new columns
+        # (iris_mesh_3d, visual_axis) are missing from the shard; we
+        # promote those to None here so total_loss skips them entirely.
+        gt_iris_mesh_3d = batch.get('iris_mesh_3d')
+        if gt_iris_mesh_3d is not None:
+            gt_iris_mesh_3d = gt_iris_mesh_3d.to(device, non_blocking=True)
+            if torch.isnan(gt_iris_mesh_3d).any():
+                gt_iris_mesh_3d = None
+        R_kappa = batch.get('R_kappa')
+        if R_kappa is not None:
+            R_kappa = R_kappa.to(device, non_blocking=True)
+        gt_visual_axis = batch.get('visual_axis')
+        if gt_visual_axis is not None:
+            gt_visual_axis = gt_visual_axis.to(device, non_blocking=True)
+            if torch.isnan(gt_visual_axis).any():
+                gt_visual_axis = None
+        gt_gaze_c = batch.get('gaze_c')
+        if gt_gaze_c is not None:
+            gt_gaze_c = gt_gaze_c.to(device, non_blocking=True)
+            if torch.isnan(gt_gaze_c).any():
+                gt_gaze_c = None
+
         aeri_alpha = get_scheduled_alpha(epoch)
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             predictions = model(images, n_views=n_views,
@@ -766,6 +892,25 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
                 lam_eyeball_seg=cfg.get('lam_eyeball_seg', 0.0),
                 pred_eyeball_mask_logits=predictions.get('eyeball_mask_logits'),
                 gt_eyeball_mask=gt_eyeball_mask,
+                # 3DGazeNet M-target — iris contour mesh
+                lam_iris_mesh=cfg.get('lam_iris_mesh', 0.0),
+                pred_iris_mesh_3d=predictions.get('iris_mesh_3d'),
+                gt_iris_mesh_3d=gt_iris_mesh_3d,
+                lam_iris_edge=cfg.get('lam_iris_edge', 0.0),
+                # Mean-of-two gaze fusion sub-supervisions
+                lam_gaze_geom=cfg.get('lam_gaze_geom', 0.0),
+                pred_gaze_geom=predictions.get('gaze_geom'),
+                lam_gaze_direct=cfg.get('lam_gaze_direct', 0.0),
+                pred_gaze_direct=predictions.get('gaze_direct'),
+                # Visual-axis (kappa-corrected) supervision
+                lam_gaze_visual=cfg.get('lam_gaze_visual', 0.0),
+                pred_optical_axis=predictions.get('gaze_geom'),
+                R_kappa=R_kappa,
+                gt_visual_axis=gt_visual_axis,
+                # Macro (head) gaze — GazeGene gaze_C paradigm
+                lam_gaze_macro=cfg.get('lam_gaze_macro', 0.0),
+                pred_gaze_macro=predictions.get('gaze_macro'),
+                gt_gaze_c=gt_gaze_c,
             )
 
         img_size = images.shape[-1]
@@ -1374,7 +1519,7 @@ def train(args):
         if phase == 2 or args.no_multiview:
             active_n_views = 1
         else:
-            active_n_views = 9
+            active_n_views = TRICAM_N_VIEWS
 
         # Train
         train_losses = train_one_epoch(
@@ -1568,6 +1713,7 @@ def _create_local_loaders(args, hw):
         num_workers=hw['num_workers'],
         samples_per_subject=args.samples_per_subject,
         eye=args.eye,
+        camera_ids=list(TRICAM_IDS),
     )
 
     train_loader_standard, val_loader = create_dataloaders(
@@ -1624,7 +1770,12 @@ def _create_mds_mv_loader(args, hw):
     ])
     val_transform = normalize
 
-    print("Creating multi-view MDS streaming loaders (train + val)...")
+    # TriCam: keep only cams in TRICAM_IDS. The streaming loader fetches
+    # raw 9-per-group windows from shards (preserved order), then drops
+    # samples whose cam_id is outside the subset — so the effective
+    # batch carries TRICAM_N_VIEWS cams per group, matching active_n_views.
+    print(f"Creating multi-view MDS streaming loaders (train + val), "
+          f"TriCam={TRICAM_IDS}...")
     train_loader_mv, val_loader_mv = create_multiview_streaming_dataloaders(
         remote_train=args.mds_train,
         remote_val=args.mds_val,
@@ -1638,6 +1789,7 @@ def _create_mds_mv_loader(args, hw):
         persistent_workers=hw['persistent_workers'],
         samples_per_subject=args.samples_per_subject,
         eyelid_occlusion_p=args.eyelid_occlusion_p,
+        tricam_ids=TRICAM_IDS,
     )
     return train_loader_mv, val_loader_mv
 
@@ -1695,7 +1847,10 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--num_workers', type=int, default=None)
     parser.add_argument('--mv_groups', type=int, default=None,
-                        help='Multi-view batch groups (actual batch = mv_groups * 9)')
+                        help='Multi-view batch groups. Raw fetch = mv_groups * 9 '
+                             '(shards are stored 9-per-group); after the TriCam '
+                             f'filter ({TRICAM_IDS}) the effective batch size is '
+                             f'mv_groups * {TRICAM_N_VIEWS}.')
     parser.add_argument('--grad_accum_steps', type=int, default=None,
                         help='Gradient accumulation steps')
 

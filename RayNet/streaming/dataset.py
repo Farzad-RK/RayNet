@@ -48,7 +48,7 @@ class StreamingGazeGeneDataset(_Base):
     """
 
     def __init__(self, transform=None, samples_per_subject=None,
-                 eyelid_occlusion_p=0.0, **kwargs):
+                 eyelid_occlusion_p=0.0, tricam_ids=None, **kwargs):
         super().__init__(**kwargs)
         self.transform = transform
         self.samples_per_subject = samples_per_subject
@@ -56,6 +56,16 @@ class StreamingGazeGeneDataset(_Base):
         # 0.0 disables it entirely; values in [0.2, 0.4] are a reasonable
         # range for AERI robustness tuning. See streaming/occlusion_aug.py.
         self.eyelid_occlusion_p = float(eyelid_occlusion_p)
+        # TriCam filter: keep only the subset of GazeGene's 9 cameras whose
+        # cam_id is in `tricam_ids`. Shards remain stored as 9-per-(subject,
+        # frame) groups, so with shuffle=False the post-filter batch retains
+        # group ordering: a raw batch of mv_groups*9 samples becomes one of
+        # mv_groups*len(tricam_ids) after the empty-batch skipper drops the
+        # rest. None disables the filter (full 9-cam training).
+        self.tricam_ids = (
+            frozenset(int(c) for c in tricam_ids)
+            if tricam_ids is not None else None
+        )
 
     def __getitem__(self, idx):
         raw = super().__getitem__(idx)
@@ -63,6 +73,12 @@ class StreamingGazeGeneDataset(_Base):
         # Stateless and deterministic subsetting using frame_idx.
         if self.samples_per_subject is not None:
             if int(raw['frame_idx']) >= self.samples_per_subject:
+                return None
+
+        # TriCam filter: drop samples whose cam_id is outside the configured
+        # subset. The downstream NonEmptyBatchLoader collapses these Nones.
+        if self.tricam_ids is not None:
+            if int(raw['cam_id']) not in self.tricam_ids:
                 return None
 
         # 1. Get the JPEG bytes from MDS
@@ -120,6 +136,26 @@ class StreamingGazeGeneDataset(_Base):
             'pupil_center_3d': torch.from_numpy(
                 raw['pupil_center_3d'].astype(np.float32))
                 if 'pupil_center_3d' in raw else torch.zeros(3),
+            # 3DGazeNet M-target — iris contour mesh in CCS (cm), (100, 3).
+            # On legacy shards (pre-v6 schema) we emit a tensor with a
+            # NaN sentinel so the train loop can detect "no GT" via
+            # torch.isnan() and skip the loss without crashing the
+            # default collate path (None can't be stacked).
+            'iris_mesh_3d': torch.from_numpy(
+                raw['iris_mesh_3d'].astype(np.float32))
+                if 'iris_mesh_3d' in raw
+                else torch.full((100, 3), float('nan')),
+            # Visual axis GT (kappa-corrected gaze direction). Same
+            # NaN-sentinel convention as iris_mesh_3d.
+            'visual_axis': torch.from_numpy(
+                raw['visual_axis'].astype(np.float32))
+                if 'visual_axis' in raw
+                else torch.full((3,), float('nan')),
+            # Macro (head) gaze GT — GazeGene gaze_C
+            'gaze_c': torch.from_numpy(
+                raw['gaze_c'].astype(np.float32))
+                if 'gaze_c' in raw
+                else torch.full((3,), float('nan')),
             'head_R': torch.from_numpy(
                 raw['head_R'].astype(np.float32))
                 if 'head_R' in raw else torch.eye(3),
@@ -185,9 +221,10 @@ def _collate_fn(batch):
     collated = {}
     tensor_keys = [
         'image', 'landmark_coords', 'landmark_coords_px',
-        'optical_axis', 'R_kappa',
+        'optical_axis', 'visual_axis', 'gaze_c', 'R_kappa',
         'K', 'intrinsic_original', 'face_bbox_gt',
         'R_cam', 'T_cam', 'eyeball_center_3d', 'pupil_center_3d',
+        'iris_mesh_3d',
         'head_R', 'head_t', 'gaze_target', 'gaze_depth',
         'iris_mask', 'eyeball_mask',
     ]
@@ -218,6 +255,7 @@ def create_streaming_dataloaders(
     persistent_workers=False,
     samples_per_subject=None,
     eyelid_occlusion_p=0.0,
+    tricam_ids=None,
     **streaming_kwargs,
 ):
     """
@@ -266,6 +304,7 @@ def create_streaming_dataloaders(
         batch_size=batch_size,
         samples_per_subject=samples_per_subject,
         eyelid_occlusion_p=eyelid_occlusion_p,
+        tricam_ids=tricam_ids,
         **streaming_kwargs,
     )
 
@@ -278,6 +317,7 @@ def create_streaming_dataloaders(
         batch_size=batch_size,
         samples_per_subject=samples_per_subject,
         eyelid_occlusion_p=0.0,            # never augment val
+        tricam_ids=tricam_ids,
         **streaming_kwargs,
     )
 
@@ -294,12 +334,13 @@ def create_streaming_dataloaders(
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, **loader_kwargs)
 
-    # Wrap with empty-batch skipper when samples_per_subject filtering is on.
+    # Wrap with empty-batch skipper when ANY filter that can return None
+    # from __getitem__ is active (samples_per_subject OR tricam_ids).
     # Without this, fully-filtered batches reach the training loop and pollute
     # step counters, batch_log.csv row numbering, and gradient-accumulation
     # boundaries (they are handled via `continue`, but at the cost of wasted
     # iterations and confusing logs).
-    if samples_per_subject is not None:
+    if samples_per_subject is not None or tricam_ids is not None:
         train_loader = NonEmptyBatchLoader(train_loader)
         val_loader = NonEmptyBatchLoader(val_loader)
 
@@ -319,6 +360,7 @@ def create_multiview_streaming_dataloaders(
     persistent_workers=False,
     samples_per_subject=None,
     eyelid_occlusion_p=0.0,
+    tricam_ids=None,
     **streaming_kwargs,
 ):
     """
@@ -327,7 +369,11 @@ def create_multiview_streaming_dataloaders(
     Shards must have been created with multiview_grouped=True so that
     9 consecutive samples form one (subject, frame) group.
 
-    Batch size = mv_groups * 9.
+    Raw batch size = mv_groups * 9. If `tricam_ids` is set, the loader
+    drops samples whose cam_id is not in the subset, so the effective
+    batch shrinks to mv_groups * len(tricam_ids). Group ordering is
+    preserved because shards are stored in (subject, frame, cam_id)
+    order and shuffle is off.
 
     Args:
         remote_train: Remote path for training MDS shards.
@@ -364,6 +410,7 @@ def create_multiview_streaming_dataloaders(
         persistent_workers=persistent_workers,
         samples_per_subject=samples_per_subject,
         eyelid_occlusion_p=eyelid_occlusion_p,
+        tricam_ids=tricam_ids,
         **streaming_kwargs,
     )
 

@@ -32,6 +32,8 @@ MDS_COLUMNS = {
     'landmark_coords': 'ndarray',
     'landmark_coords_px': 'ndarray',
     'optical_axis': 'ndarray',
+    'visual_axis': 'ndarray',         # (3,) GT visual axis (kappa-corrected gaze)
+    'gaze_c': 'ndarray',              # (3,) GT macro (head) gaze — GazeGene gaze_C
     'R_kappa': 'ndarray',
     'K': 'ndarray',                   # K_cropped rescaled to 224
     'intrinsic_original': 'ndarray',  # K_orig (full camera) — for BoxEncoder GT / rederivation
@@ -40,6 +42,7 @@ MDS_COLUMNS = {
     'T_cam': 'ndarray',
     'eyeball_center_3d': 'ndarray',
     'pupil_center_3d': 'ndarray',
+    'iris_mesh_3d': 'ndarray',        # (100, 3) 3DGazeNet M-target — iris contour
     'head_R': 'ndarray',
     'head_t': 'ndarray',
     'gaze_target': 'ndarray',
@@ -59,6 +62,8 @@ def _sample_to_mds(sample):
         'landmark_coords': sample['landmark_coords'].numpy(),
         'landmark_coords_px': sample['landmark_coords_px'].numpy(),
         'optical_axis': sample['optical_axis'].numpy(),
+        'visual_axis': sample['visual_axis'].numpy(),
+        'gaze_c': sample['gaze_c'].numpy(),
         'R_kappa': sample['R_kappa'].numpy(),
         'K': sample['K'].numpy(),
         'intrinsic_original': sample['intrinsic_original'].numpy(),
@@ -67,6 +72,7 @@ def _sample_to_mds(sample):
         'T_cam': sample['T_cam'].numpy(),
         'eyeball_center_3d': sample['eyeball_center_3d'].numpy(),
         'pupil_center_3d': sample['pupil_center_3d'].numpy(),
+        'iris_mesh_3d': sample['iris_mesh_3d'].numpy(),
         'head_R': sample['head_R'].numpy(),
         'head_t': sample['head_t'].numpy(),
         'gaze_target': sample['gaze_target'].numpy(),

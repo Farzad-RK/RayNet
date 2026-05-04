@@ -369,6 +369,114 @@ def angular_error(pred_gaze, gt_gaze):
     return angle.mean()
 
 
+# ─── 3DGazeNet M-target: iris-mesh vertex + edge-length losses ──────
+
+def iris_mesh_loss(pred_verts, gt_verts):
+    """
+    3DGazeNet vertex L1 loss (Eq 1) for the iris contour mesh.
+
+    Args:
+        pred_verts: (B, N_v, 3) predicted iris vertices in CCS, cm.
+        gt_verts:   (B, N_v, 3) GT iris vertices in CCS, cm
+                    (GazeGene `iris_mesh_3D`, indexed for the active eye).
+
+    Returns:
+        loss: scalar L1 averaged over (batch, vertex, coord).
+
+    Why L1 and not L2: 3DGazeNet uses L1 (their Eq 1). L1 is more
+    robust to the occasional iris vertex that GazeGene's renderer
+    places at the limbus boundary where rasterization is ambiguous.
+    """
+    return F.l1_loss(pred_verts, gt_verts)
+
+
+def iris_edge_loss(pred_verts, gt_verts):
+    """
+    3DGazeNet edge-length L2 loss (Eq 2) for the iris contour ring.
+
+    The 100-vertex iris contour is a closed polygon; edge i connects
+    vertex i and vertex (i+1) mod N_v. Comparing edge lengths instead
+    of vertex positions is invariant to global translation and lets
+    the head learn the iris ring's local topology even when the
+    absolute 3D anchor is mildly off.
+
+    Args:
+        pred_verts: (B, N_v, 3) predicted iris vertices.
+        gt_verts:   (B, N_v, 3) GT iris vertices.
+
+    Returns:
+        loss: scalar L2 (MSE) averaged over (batch, edge).
+    """
+    # Roll by 1 along the vertex axis to pair (v_i, v_{i+1 mod N_v}).
+    pred_edges = (pred_verts - torch.roll(pred_verts, shifts=-1, dims=1)).norm(dim=-1)
+    gt_edges = (gt_verts - torch.roll(gt_verts, shifts=-1, dims=1)).norm(dim=-1)
+    return F.mse_loss(pred_edges, gt_edges)
+
+
+# ─── Macro (head) gaze loss — GazeGene gaze_C ───────────────────────
+
+def macro_gaze_loss(pred_gaze_macro: torch.Tensor,
+                    gt_gaze_c: torch.Tensor) -> torch.Tensor:
+    """
+    L1 loss on unit head-gaze vectors (GazeGene's `gaze_C` field).
+
+    GazeGene defines `gaze_C` as the unit vector from the subject's
+    head centre to the gaze target, expressed in CCS. This is a
+    *macro* signal — head-coordinate, kappa-free — distinct from
+    per-eye optical/visual axes which carry the micro foveal signal.
+
+    Decoupling the two paradigms (macro on synthetic GazeGene, micro
+    on real OpenEDS IR) is the v6.1 architectural choice; see
+    `Architecture-v6.md` for the rationale.
+
+    Args:
+        pred_gaze_macro: (B, 3) predicted unit head gaze.
+        gt_gaze_c:       (B, 3) GT unit head gaze (`gaze_C`).
+
+    Returns:
+        scalar L1.
+    """
+    return F.l1_loss(pred_gaze_macro, gt_gaze_c)
+
+
+# ─── Visual-axis (kappa-corrected) gaze loss ────────────────────────
+
+def visual_axis_loss(pred_optical_axis, R_kappa, gt_visual_axis):
+    """
+    Predicted optical axis → predicted visual axis (per-subject kappa
+    correction) → L1 against GazeGene `visual_axis_L/R`.
+
+    The optical axis is the eyeball-centre → cornea-centre / pupil
+    axis (anatomy). The visual axis is the line from the cornea centre
+    through the fovea, which is the line that actually defines where
+    the subject is looking. The two differ by a per-subject "kappa"
+    angle (typically ±1-2°). For medical-grade gaze precision the
+    distinction matters: a 1° error from collapsing the two is
+    comparable to a sub-arc-minute pupillometry budget.
+
+    GazeGene ships per-subject `L_kappa` / `R_kappa` Euler angles in
+    `subject_label.pkl`; `RayNet.kappa.build_R_kappa` converts them to
+    a 3×3 rotation matrix. The convention is:
+
+        visual_axis = R_kappa @ optical_axis
+
+    so we apply R_kappa to the predicted optical axis and supervise
+    against the GT visual axis (`visual_axis_L` or `_R`).
+
+    Args:
+        pred_optical_axis: (B, 3) predicted optical axis (unit, CCS).
+        R_kappa:           (B, 3, 3) per-sample kappa rotation.
+        gt_visual_axis:    (B, 3) GT visual axis (unit, CCS).
+
+    Returns:
+        loss: scalar L1 between predicted visual and GT visual axes.
+    """
+    # einsum over the rotation: visual_pred = R_kappa @ optical_pred
+    pred_visual = torch.einsum('bij,bj->bi', R_kappa, pred_optical_axis)
+    pred_visual = F.normalize(pred_visual, dim=-1)
+    return F.l1_loss(pred_visual, gt_visual_axis)
+
+
 def total_loss(
     pred_hm, pred_coords, pred_gaze,
     gt_coords, gt_gaze,
@@ -393,6 +501,24 @@ def total_loss(
     pred_iris_mask_logits=None, gt_iris_mask=None,
     lam_eyeball_seg=0.0,
     pred_eyeball_mask_logits=None, gt_eyeball_mask=None,
+    # 3DGazeNet M-target (iris contour mesh)
+    lam_iris_mesh=0.0,
+    pred_iris_mesh_3d=None, gt_iris_mesh_3d=None,
+    lam_iris_edge=0.0,
+    # Mean-of-two gaze fusion sub-supervisions
+    lam_gaze_geom=0.0,
+    pred_gaze_geom=None,
+    lam_gaze_direct=0.0,
+    pred_gaze_direct=None,
+    # Visual-axis (kappa-corrected) loss
+    lam_gaze_visual=0.0,
+    pred_optical_axis=None,
+    R_kappa=None,
+    gt_visual_axis=None,
+    # Macro (head) gaze — GazeGene gaze_C
+    lam_gaze_macro=0.0,
+    pred_gaze_macro=None,
+    gt_gaze_c=None,
 ):
     """
     Total training loss: landmarks + gaze + GazeGene 3D structure + pose.
@@ -489,6 +615,51 @@ def total_loss(
         eyeball_seg = mask_seg_loss(pred_eyeball_mask_logits, gt_eyeball_mask)
         total = total + lam_eyeball_seg * eyeball_seg
         components['eyeball_seg_loss'] = eyeball_seg.detach()
+
+    # 3DGazeNet M-target — iris contour mesh + edge-length regulariser.
+    # Skips silently if GT was not in the batch (older shards).
+    if (lam_iris_mesh > 0 and pred_iris_mesh_3d is not None
+            and gt_iris_mesh_3d is not None):
+        im_loss = iris_mesh_loss(pred_iris_mesh_3d, gt_iris_mesh_3d)
+        total = total + lam_iris_mesh * im_loss
+        components['iris_mesh_loss'] = im_loss.detach()
+
+        if lam_iris_edge > 0:
+            ie_loss = iris_edge_loss(pred_iris_mesh_3d, gt_iris_mesh_3d)
+            total = total + lam_iris_edge * ie_loss
+            components['iris_edge_loss'] = ie_loss.detach()
+
+    # Mean-of-two gaze fusion sub-supervisions.
+    # `lam_gaze` already supervises the fused gaze. These extra terms
+    # supervise gaze_geom and gaze_direct independently so neither
+    # sub-head collapses when its sibling provides a shortcut.
+    if lam_gaze_geom > 0 and pred_gaze_geom is not None:
+        gg_loss = gaze_loss(pred_gaze_geom, gt_gaze)
+        total = total + lam_gaze_geom * gg_loss
+        components['gaze_geom_loss'] = gg_loss.detach()
+    if lam_gaze_direct > 0 and pred_gaze_direct is not None:
+        gd_loss = gaze_loss(pred_gaze_direct, gt_gaze)
+        total = total + lam_gaze_direct * gd_loss
+        components['gaze_direct_loss'] = gd_loss.detach()
+
+    # Visual-axis (kappa-corrected) supervision.
+    # Predicted gaze is the optical axis; rotate by per-subject R_kappa
+    # to obtain the visual axis, then L1 against gt_visual_axis.
+    if (lam_gaze_visual > 0 and pred_optical_axis is not None
+            and R_kappa is not None and gt_visual_axis is not None):
+        va_loss = visual_axis_loss(pred_optical_axis, R_kappa, gt_visual_axis)
+        total = total + lam_gaze_visual * va_loss
+        components['gaze_visual_loss'] = va_loss.detach()
+
+    # Macro (head) gaze — GazeGene gaze_C paradigm.
+    # Owned exclusively by the GazeGene-trained MacroGazeHead which
+    # consumes pose_feat + predicted eyeball anchor. Independent of
+    # the optical/visual-axis branches above.
+    if (lam_gaze_macro > 0 and pred_gaze_macro is not None
+            and gt_gaze_c is not None):
+        gm_loss = macro_gaze_loss(pred_gaze_macro, gt_gaze_c)
+        total = total + lam_gaze_macro * gm_loss
+        components['gaze_macro_loss'] = gm_loss.detach()
 
     components['landmark_loss'] *= 1.0 / (feat_H * feat_W)
     components['total_loss'] = total.detach()

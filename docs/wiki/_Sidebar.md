@@ -1,7 +1,8 @@
-**RayNet v5 Wiki**
+**RayNet v6 Wiki**
 
 - [[Home]]
-- [[Architecture]]
+- [[Architecture v6]] ← current
+- [[Architecture]] (v5, archived)
 - [[Dataset]]
 - [[Training Guide]]
 - [[Loss Functions]]

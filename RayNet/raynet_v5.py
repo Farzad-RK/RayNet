@@ -433,12 +433,29 @@ class GazeFusionBlock(nn.Module):
 
 class GeometricGazeHead(nn.Module):
     """
-    GazeGene 3D Eyeball Structure Estimation head (Sec 4.2.2).
+    GazeGene 3D Eyeball Structure Estimation head (Sec 4.2.2) +
+    3DGazeNet-style mean-of-two gaze fusion.
 
-    Predicts two 3D points that geometrically define the optical axis:
+    Three gaze readouts:
+      - gaze_geom   = normalize(pupil_center - eyeball_center)
+        Derived purely from the predicted 3D anchors. Robust under
+        profile head pose because it inherits the geometric prior from
+        L_eyeball + L_pupil.
+      - gaze_direct: regressed by a sibling Linear head, then unit-
+        normalised. Robust on near-frontal / high-resolution faces
+        where the trunk has direct iris signal.
+      - gaze_fused  = normalize(0.5 * (gaze_geom + gaze_direct))
+        Mean-of-two as in 3DGazeNet (Sec 7, supplementary Fig 7d).
+        Used as the canonical training/inference signal once both
+        sub-heads have warmed up.
+
+    Predictions returned:
       - eyeball_center_3d (B, 3)
       - pupil_center_3d   (B, 3)
-    optical_axis = normalize(pupil_center - eyeball_center).
+      - gaze_geom         (B, 3) unit
+      - gaze_direct       (B, 3) unit
+      - gaze_fused        (B, 3) unit
+      - gaze_angles       (B, 2) pitch/yaw of gaze_fused
     """
 
     def __init__(self, d_model=256, hidden_dim=128):
@@ -453,18 +470,109 @@ class GeometricGazeHead(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 3),
         )
+        # Direct gaze regressor — operates on the same pooled feature
+        # that feeds eyeball/pupil. Output is a free 3-vector that gets
+        # unit-normalised post-hoc; the loss is on the normalised vector
+        # (consistent with `gaze_loss` in losses.py).
+        self.direct_fc = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 3),
+        )
 
     def forward(self, pooled):
         eyeball_center = self.eyeball_fc(pooled)
         pupil_center = self.pupil_fc(pooled)
 
-        optical_axis = F.normalize(pupil_center - eyeball_center, dim=-1)
+        gaze_geom = F.normalize(pupil_center - eyeball_center, dim=-1)
+        gaze_direct = F.normalize(self.direct_fc(pooled), dim=-1)
+        gaze_fused = F.normalize(gaze_geom + gaze_direct, dim=-1)
 
-        x, y, z = optical_axis[:, 0], optical_axis[:, 1], optical_axis[:, 2]
+        # gaze_angles uses the fused gaze (post-warmup canonical signal)
+        x, y, z = gaze_fused[:, 0], gaze_fused[:, 1], gaze_fused[:, 2]
         pitch = torch.asin((-y).clamp(-1 + 1e-6, 1 - 1e-6))
         yaw = torch.atan2(-x, -z)
         gaze_angles = torch.stack([pitch, yaw], dim=-1)
-        return eyeball_center, pupil_center, optical_axis, gaze_angles
+        return (eyeball_center, pupil_center,
+                gaze_geom, gaze_direct, gaze_fused, gaze_angles)
+
+
+class IrisMeshHead(nn.Module):
+    """
+    3DGazeNet-style M-target: regress N_v iris-contour vertices in CCS
+    (centimetres). GazeGene supplies `iris_mesh_3D` of shape
+    (N_v=100, 3) per eye, stored as (2 eyes, 100, 3) in `complex_label`.
+
+    The head predicts (B, N_v, 3) directly. Pairing it with the vertex
+    L1 + edge-length L2 losses (see losses.py:iris_mesh_loss /
+    iris_edge_loss) reproduces 3DGazeNet's M+V training target — the
+    single largest generalization win in their ablation (Tab 3, M+V vs
+    V alone). The supervision is geometric (synthetic-iris-mesh GT,
+    NOT iris-pixel texture), so it is consistent with our skeleton-
+    only GazeGene stage.
+    """
+
+    N_VERTICES = 100
+
+    def __init__(self, d_model=256, hidden_dim=256):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.N_VERTICES * 3),
+        )
+
+    def forward(self, pooled):
+        verts_flat = self.fc(pooled)
+        return verts_flat.view(-1, self.N_VERTICES, 3)
+
+
+class MacroGazeHead(nn.Module):
+    """
+    Macro (head) gaze head — GazeGene `gaze_C` paradigm.
+
+    GazeGene ships two gaze paradigms (per the CVPR2025 dataset doc):
+      1. **`gaze_C` — head gaze**: a unit vector from the head centre
+         to the gaze target, in CCS. Lives in *head* coordinates,
+         insensitive to per-eye optical-axis kappa offsets.
+      2. **`optic_axis_{L,R}` — optical axis**: per-eye line through
+         (eyeball_centre → cornea_centre / pupil), CCS.
+
+    v6 supervises both, with the v6.1 split assigning **macro gaze
+    (`gaze_C`) to GazeGene** (synthetic, photorealistic, large head-
+    pose distribution) and **micro gaze (visual axis from real iris
+    refraction) to OpenEDS** (real IR, sub-pixel iris boundaries).
+    The macro head fuses pose with the predicted 3D eyeball anchor:
+
+        pose_feat (B, d_model)        ← head pose embedding
+        eyeball_center_3d (B, 3)      ← regressed in CCS, cm
+                ↓ concat
+        Linear(d_model + 3 → hidden)
+                ↓ GELU
+        Linear(hidden → 3) → unit-normalise → gaze_macro
+
+    The 3D eyeball anchor enters the head explicitly so the macro
+    direction inherits the geometric prior from `eyeball_center_loss`,
+    not just the appearance-derived pose embedding.
+    """
+
+    def __init__(self, d_model: int = 256, hidden_dim: int = 128):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(d_model + 3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 3),
+        )
+
+    def forward(self, pose_feat: torch.Tensor,
+                eyeball_center_3d: torch.Tensor) -> torch.Tensor:
+        # Detach the eyeball anchor on the way in so the macro-gaze loss
+        # cannot back-propagate into the GeometricGazeHead's eyeball_fc
+        # via this side path. The eyeball_center is independently
+        # supervised by `eyeball_center_loss`; mixing gradients here
+        # would let macro gaze override the metric anchor regression.
+        x = torch.cat([pose_feat, eyeball_center_3d.detach()], dim=-1)
+        return F.normalize(self.fc(x), dim=-1)
 
 
 # ─── Gaze Branch ────────────────────────────────────────────────────
@@ -552,6 +660,10 @@ class GazeBranch(nn.Module):
 
         self.fusion_block = GazeFusionBlock(d_model)
         self.head = GeometricGazeHead(d_model)
+        # 3DGazeNet M-target — iris contour mesh in CCS (100 verts × 3)
+        self.iris_mesh_head = IrisMeshHead(d_model)
+        # GazeGene gaze_C — macro (head) gaze from pose + 3D eyeball anchor
+        self.macro_gaze_head = MacroGazeHead(d_model)
 
     def forward(self, s0_detached, s1_detached, pose_feat,
                     cross_view_attn=None, n_views=1, cam_embed=None,
@@ -624,18 +736,29 @@ class GazeBranch(nn.Module):
         if cross_view_attn is not None:
             pooled = cross_view_attn(pooled_sv, n_views, cam_embed)
 
-        eyeball_center, pupil_center, optical_axis, gaze_angles = \
-            self.head(pooled)
+        (eyeball_center, pupil_center,
+         gaze_geom, gaze_direct, gaze_fused, gaze_angles) = self.head(pooled)
+
+        # 3DGazeNet M-target — iris-contour mesh in CCS (B, 100, 3).
+        iris_mesh_3d = self.iris_mesh_head(pooled)
+
+        # Macro gaze (GazeGene gaze_C) — fused from head pose + 3D
+        # eyeball anchor. Independent of `gaze_geom` / `gaze_direct`
+        # so the optical-axis branch is not constrained by macro
+        # supervision (and vice versa).
+        gaze_macro = self.macro_gaze_head(pose_feat, eyeball_center)
 
         # Single-view gaze prediction (no CrossViewAttention).
         # Only computed when multi-view fusion is actually active (n_views > 1)
         # so there is no overhead in single-view inference / validation.
-        sv_optical_axis = None
+        sv_gaze_fused = None
         if n_views > 1:
-            _, _, sv_optical_axis, _ = self.head(pooled_sv)
+            _, _, _, _, sv_gaze_fused, _ = self.head(pooled_sv)
 
-        return (eyeball_center, pupil_center, optical_axis, gaze_angles,
-                iris_logits, eyeball_logits, sv_optical_axis)
+        return (eyeball_center, pupil_center,
+                gaze_geom, gaze_direct, gaze_fused, gaze_angles,
+                iris_mesh_3d, gaze_macro,
+                iris_logits, eyeball_logits, sv_gaze_fused)
 
 
 # ─── Pose Branch (now fuses BoxEncoder) ────────────────────────────
@@ -728,6 +851,18 @@ class CrossViewAttention(nn.Module):
 class CameraEmbedding(nn.Module):
     """Encode R_cam (3x3) + T_cam (3) → d_model embedding."""
 
+    # GazeGene T_vec is in centimetres (CVPR2025 dataset README) with rig
+    # positions of magnitude ~30-600 cm. R_cam entries are unit-norm in
+    # [-1, 1]. Concatenating raw values produces a 12-D vector where 3
+    # dims dominate by ~2-3 orders of magnitude, which (a) saturates the
+    # initial Linear(12, 64) post-ReLU on T_cam alone and (b) starves
+    # cross-view attention of rotation cues. Dividing T_cam by 100
+    # (cm → m) puts both modalities on a comparable [-6, 6] scale without
+    # changing any geometric semantics elsewhere — T_cam in cm is still
+    # what dataset.py, multiview_loss.py, and any future cross-view
+    # reprojection code see.
+    T_NORM_CM_PER_M = 100.0
+
     def __init__(self, d_model=256):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -737,7 +872,8 @@ class CameraEmbedding(nn.Module):
         )
 
     def forward(self, R_cam, T_cam):
-        x = torch.cat([R_cam.flatten(1), T_cam], dim=-1)
+        T_norm = T_cam / self.T_NORM_CM_PER_M
+        x = torch.cat([R_cam.flatten(1), T_norm], dim=-1)
         return self.mlp(x)
 
 
@@ -795,9 +931,11 @@ class RayNetV5(nn.Module):
         if R_cam is not None and T_cam is not None:
             cam_embed = self.camera_embedding(R_cam, T_cam) + pose_feat.detach()
 
-        (eyeball_center, pupil_center, optical_axis, gaze_angles,
+        (eyeball_center, pupil_center,
+         gaze_geom, gaze_direct, gaze_fused, gaze_angles,
+         iris_mesh_3d, gaze_macro,
          iris_mask_logits, eyeball_mask_logits,
-         sv_optical_axis) = self.gaze_branch(
+         sv_gaze_fused) = self.gaze_branch(
             s0.detach(), s1.detach(), pose_feat,
             cross_view_attn=self.cross_view_attn,
             n_views=n_views,
@@ -815,10 +953,21 @@ class RayNetV5(nn.Module):
             # Gaze (GazeGene 3D structure)
             'eyeball_center': eyeball_center,          # (B, 3) cm, CCS
             'pupil_center': pupil_center,              # (B, 3) cm, CCS
-            'gaze_vector': optical_axis,               # (B, 3) unit
+            # Three gaze readouts (3DGazeNet mean-of-two fusion).
+            # `gaze_vector` aliases the fused signal so existing call
+            # sites (multiview_loss, val metrics) consume the canonical
+            # output without code changes.
+            'gaze_geom': gaze_geom,                    # (B, 3) unit, from anchors
+            'gaze_direct': gaze_direct,                # (B, 3) unit, regressed
+            'gaze_fused': gaze_fused,                  # (B, 3) unit, mean-of-two
+            'gaze_vector': gaze_fused,                 # canonical alias
             'gaze_angles': gaze_angles,                # (B, 2) pitch/yaw
-            # Single-view gaze (pre-CrossViewAttention); None when n_views==1
-            'gaze_vector_sv': sv_optical_axis,         # (B, 3) unit or None
+            # 3DGazeNet M-target — iris-contour mesh in CCS, cm
+            'iris_mesh_3d': iris_mesh_3d,              # (B, 100, 3)
+            # GazeGene macro (head) gaze — fused from pose + eyeball anchor
+            'gaze_macro': gaze_macro,                  # (B, 3) unit, CCS
+            # Single-view fused gaze (pre-CrossViewAttention); None when n_views==1
+            'gaze_vector_sv': sv_gaze_fused,           # (B, 3) unit or None
             # Pose
             'pred_pose_6d': pred_pose_6d,              # (B, 6)
             'pred_pose_t': pred_pose_t,                # (B, 3) m

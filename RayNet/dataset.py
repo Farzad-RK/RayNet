@@ -313,6 +313,22 @@ class GazeGeneDataset(Dataset):
         # --- Iris landmarks: subsample 100 -> 10 + 4 pupil points ---
         iris_2d = np.array(s['iris_mesh_2D'][eye_idx], dtype=np.float64)  # (100, 2)
         iris_10 = iris_2d[IRIS_SUBSAMPLE_IDX]  # (10, 2)
+        # Full 100-vertex 3D iris contour for the active eye, in CCS (cm).
+        # Becomes the M-target for the IrisMeshHead (3DGazeNet vertex L1
+        # + edge length L2). Shape: (100, 3).
+        iris_mesh_3d_eye = np.array(s['iris_mesh_3D'][eye_idx], dtype=np.float64)
+
+        # --- Visual axis GT for the kappa-corrected gaze loss ---
+        # GazeGene ships per-eye `visual_axis_L/R`. For the active eye:
+        visual_key = f'visual_axis_{self.eye}'
+        if visual_key in s:
+            visual_axis_ccs = np.array(s[visual_key], dtype=np.float64)
+            va_norm = np.linalg.norm(visual_axis_ccs)
+            if va_norm > 1e-8:
+                visual_axis_ccs = visual_axis_ccs / va_norm
+        else:
+            # Fall back to optical axis when visual axis is unavailable.
+            visual_axis_ccs = optical_axis_ccs.copy()
 
         # Pupil boundary: 4 iris points closest to pupil center
         pupil_2d = np.array(s['pupil_center_2D'][eye_idx], dtype=np.float64)  # (2,)
@@ -378,6 +394,12 @@ class GazeGeneDataset(Dataset):
             'head_t': torch.from_numpy(np.array(s['head_t'], dtype=np.float64)).float(),  # (3,) head translation
             'eyeball_center_3d': torch.from_numpy(t_eye).float(),           # (3,) eye center in CCS
             'pupil_center_3d': torch.from_numpy(t_pupil).float(),           # (3,) pupil center in CCS
+            # 3DGazeNet M-target — full 100-vertex iris contour in CCS (cm)
+            'iris_mesh_3d': torch.from_numpy(iris_mesh_3d_eye).float(),     # (100, 3)
+            # Visual axis (kappa-corrected gaze GT) — used by visual_axis_loss
+            'visual_axis': torch.from_numpy(visual_axis_ccs).float(),       # (3,) unit, CCS
+            # Macro (head) gaze GT — used by macro_gaze_loss. GazeGene `gaze_C`.
+            'gaze_c': torch.from_numpy(np.array(s['gaze_C'], dtype=np.float64)).float(),  # (3,) unit, CCS
             # GazeGene gaze labels
             'gaze_target': torch.from_numpy(gaze_target).float(),           # (3,) 3D target, CCS
             'gaze_depth': torch.tensor(gaze_depth).float(),                 # scalar, vergence depth
@@ -412,7 +434,12 @@ class GazeGeneDataset(Dataset):
 
 class MultiViewBatchSampler(Sampler):
     """
-    Batch sampler that groups all 9 camera views of the same (subject, frame).
+    Batch sampler that groups all N camera views of the same (subject, frame).
+
+    N is inferred from the dataset's camera_ids — 9 for the full GazeGene
+    rig, smaller (e.g. 3) when the dataset is restricted to a TriCam
+    subset. This lets the same sampler serve both regimes without an
+    explicit hardcoded camera count.
     """
 
     def __init__(self, dataset, batch_size=1, shuffle=True, ensure_multiview=True):
@@ -421,8 +448,18 @@ class MultiViewBatchSampler(Sampler):
         self.shuffle = shuffle
         self.batch_size = batch_size
 
+        # Infer the active view count from the dataset. When a TriCam
+        # filter was applied, each (subject, frame) carries fewer than 9
+        # samples; require the count to be uniform so the batch shape
+        # stays predictable for CrossViewAttention's reshape.
+        view_counts = {len(v) for v in self.index_by_key.values()}
+        self.n_views = (
+            max(view_counts) if view_counts else 1
+        )
+
         if ensure_multiview:
-            self.keys = [k for k in self.keys if len(self.index_by_key[k]) == 9]
+            self.keys = [k for k in self.keys
+                         if len(self.index_by_key[k]) == self.n_views]
 
     def __iter__(self):
         keys = self.keys.copy()
@@ -432,7 +469,7 @@ class MultiViewBatchSampler(Sampler):
         batch = []
         for k in keys:
             batch.extend(self.index_by_key[k])
-            if len(batch) >= 9 * self.batch_size:
+            if len(batch) >= self.n_views * self.batch_size:
                 yield batch
                 batch = []
         if batch:
@@ -449,10 +486,11 @@ def gazegene_collate_fn(batch):
 
     collated = {}
     tensor_keys = ['image', 'landmark_coords', 'landmark_coords_px',
-                   'optical_axis', 'R_kappa',
+                   'optical_axis', 'visual_axis', 'gaze_c', 'R_kappa',
                    'K', 'intrinsic_original', 'face_bbox_gt',
                    'R_cam', 'T_cam', 'head_R', 'head_t',
                    'eyeball_center_3d', 'pupil_center_3d',
+                   'iris_mesh_3d',
                    'gaze_target', 'gaze_depth',
                    'iris_mask', 'eyeball_mask']
     scalar_keys = ['subject', 'cam_id', 'frame_idx']
@@ -471,11 +509,19 @@ def gazegene_collate_fn(batch):
 def create_dataloaders(base_dir, train_subjects, val_subjects,
                        batch_size=4, num_workers=4,
                        samples_per_subject=None, eye='L',
-                       ensure_multiview=False):
-    """Create train and validation dataloaders."""
+                       ensure_multiview=False, camera_ids=None):
+    """Create train and validation dataloaders.
+
+    `camera_ids`: optional iterable of int cam_ids (0-8). When provided,
+    the GazeGeneDataset only ingests those cameras — used to switch from
+    the full 9-cam rig to a TriCam subset (e.g. (1, 6, 8)).
+    """
+    cam_list = list(camera_ids) if camera_ids is not None else None
+
     train_dataset = GazeGeneDataset(
         base_dir=base_dir,
         subject_ids=train_subjects,
+        camera_ids=cam_list,
         samples_per_subject=samples_per_subject,
         eye=eye,
         augment=True,
@@ -484,6 +530,7 @@ def create_dataloaders(base_dir, train_subjects, val_subjects,
     val_dataset = GazeGeneDataset(
         base_dir=base_dir,
         subject_ids=val_subjects,
+        camera_ids=cam_list,
         samples_per_subject=samples_per_subject,
         eye=eye,
         augment=False,
