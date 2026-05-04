@@ -595,6 +595,18 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
             if gt_pupil is not None:
                 gt_pupil = gt_pupil.to(device, non_blocking=True)
 
+            # Adding missing head gaze (gaze_c)
+            gt_gaze_c = batch.get('gaze_c')
+            if gt_gaze_c is not None:
+                gt_gaze_c = gt_gaze_c.to(device, non_blocking=True)
+                if torch.isnan(gt_gaze_c).any():
+                    gt_gaze_c = None
+            # Added missing eyeball gt
+            gt_eyeball_radius = batch.get('eyeball_radius')
+            if gt_eyeball_radius is not None:
+                gt_eyeball_radius = gt_eyeball_radius.to(device, non_blocking=True)
+                if torch.isnan(gt_eyeball_radius).any():
+                    gt_eyeball_radius = None
             loss, components = total_loss(
                 pred_hm, pred_coords, pred_gaze,
                 gt_landmarks, gt_optical_axis,

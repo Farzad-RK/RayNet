@@ -32,8 +32,16 @@ from RayNet.streaming.eye_masks import render_all_masks, extract_subject_attrs
 # Indices to subsample 100 iris points down to 10 evenly-spaced points
 IRIS_SUBSAMPLE_IDX = list(range(0, 100, 10))  # [0, 10, 20, ..., 90]
 
-# AERI mask spatial resolution (matches P2 feature map: stride-4 of 224)
-MASK_SIZE = 56
+# AERI mask spatial resolution (always P2 feature map: stride-4 of input).
+# Keeps in sync with the model's heatmap/mask output: at 224 input → 56,
+# at 448 input → 112. Hardcoding 56 silently broke 448 reshards because
+# the GT mask shape no longer matched the model's prediction shape.
+MASK_STRIDE = 4
+
+
+def _mask_size(img_size: int) -> int:
+    """Resolution-coupled AERI mask side length (P2 = img_size / 4)."""
+    return img_size // MASK_STRIDE
 
 # Eye-patch fraction of the face crop. v6.2 ships a high-resolution
 # RGB eye-region patch as the bridge between the GazeGene Macro-Locator
@@ -395,11 +403,14 @@ class GazeGeneDataset(Dataset):
         # renderer rescales from native_size → img_size internally, then
         # area-downsamples from img_size → MASK_SIZE.
         subj_attrs_mask = extract_subject_attrs(subject_attrs, eye_idx)
+        # Mask side length scales with face size (stride-4 of input) so
+        # GT masks match the model's P2 feature map at any resolution.
+        mask_size = _mask_size(self.img_size)
         iris_mask_np, eyeball_mask_np = render_all_masks(
             iris_2d, t_eye, t_pupil, intrinsic_cropped,
             subject_attrs=subj_attrs_mask,
             face_size=self.img_size, native_size=orig_w,
-            out_size=MASK_SIZE)
+            out_size=mask_size)
 
         # --- Convert image to tensor (uint8, normalized in train.py) ---
         img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)

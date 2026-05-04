@@ -93,14 +93,20 @@ def _sample_to_mds(sample):
     }
 
 
-def image_to_jpeg_bytes(img_tensor, quality=90, resize_to=(224, 224)):
+def image_to_jpeg_bytes(img_tensor, quality=90, resize_to=None):
     """JPEG-encode a (3, H, W) uint8 or float tensor.
 
     Args:
         img_tensor: (3, H, W) torch tensor. Float [0, 1] or uint8.
         quality: JPEG quality factor.
-        resize_to: optional ``(w, h)`` target. ``None`` keeps native
-            resolution — used by the v6.2 high-resolution eye_patch.
+        resize_to: optional ``(w, h)`` target. **v6.2: default is None
+            — the JPEG is encoded at the dataset's native resolution.**
+            This was previously ``(224, 224)``, which silently downsized
+            the face image to 224 in MDS shards even when the dataset
+            was constructed with ``img_size=448`` — producing a shard
+            where the JPEG was 224 but ``K_cropped`` / ``landmark_coords``
+            were calibrated for 448. Pass an explicit ``(w, h)`` only
+            when you genuinely want a fixed-size shard image (rare).
     """
     if img_tensor.dtype == torch.uint8:
         img = img_tensor.permute(1, 2, 0).numpy()

@@ -742,14 +742,20 @@ class GazeBranch(nn.Module):
         scheduled_mask = (aeri_alpha * saliency_56
                           + (1.0 - aeri_alpha) * uniform_mask)
 
-        # 4. Global path — gate the 7x7 bottleneck. The GLOBAL_FLOOR
+        # 4. Global path — gate the stride-32 bottleneck. The GLOBAL_FLOOR
         #    baseline keeps non-eye context contributing FLOOR of the
         #    signal even when AERI collapses to an empty mask (e.g.
         #    eyelid covering sclera at inference). NB: no stochastic
         #    dropout here — keeping the global path identical between
         #    train and val fixes the asymmetry that drove P3 val drift.
-        eye_attn_7 = F.adaptive_avg_pool2d(scheduled_mask, 7)
-        global_gate = self.GLOBAL_FLOOR + (1.0 - self.GLOBAL_FLOOR) * eye_attn_7
+        #
+        # v6.2 — pool to ``gaze_s3``'s actual spatial dim instead of a
+        # hardcoded 7. At 224 input that's 7×7 (M1/M3 stride-32) and
+        # behaves identically to before; at 448 input it's 14×14, which
+        # is the bug that previously silently broke any non-224 forward.
+        s3_h, s3_w = gaze_s3.shape[-2], gaze_s3.shape[-1]
+        eye_attn = F.adaptive_avg_pool2d(scheduled_mask, (s3_h, s3_w))
+        global_gate = self.GLOBAL_FLOOR + (1.0 - self.GLOBAL_FLOOR) * eye_attn
         gaze_s3_gated = gaze_s3 * global_gate
         global_feat = self.pool(self.coord_att(gaze_s3_gated)).flatten(1)
         global_feat = self.global_norm(global_feat)

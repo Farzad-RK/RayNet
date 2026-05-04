@@ -10,6 +10,28 @@
 > segmenter + torsion stages). Also ships the OpenEDS MDS converter parallel
 > to the GazeGene one so both pipelines share streaming ergonomics.
 
+> **v6.2.1 hotfix (2026-05-05).** Two latent 448-resolution bugs found while
+> investigating the regression in `run_20260504_182102` (val_landmark_px=2.91 px
+> vs historical sub-pixel):
+> 1. **`raynet_v5.py:GazeBranch.forward`** hardcoded `eye_attn_7 =
+>    F.adaptive_avg_pool2d(scheduled_mask, 7)`. The literal `7` is the M1+224
+>    stride-32 spatial size; at 448 input `gaze_s3` is 14×14 and the multiply
+>    crashes. Fixed: pool to ``gaze_s3.shape[-2:]`` so the gate auto-adapts
+>    to any input resolution.
+> 2. **`streaming/convert_to_mds.py:image_to_jpeg_bytes`** defaulted to
+>    ``resize_to=(224, 224)``. When re-sharding with ``--img_size 448`` the
+>    dataset emits 448×448 tensors but the converter silently downsizes the
+>    JPEG to 224 — producing a shard with a 224 image alongside ``K_cropped``
+>    and ``landmark_coords`` calibrated for 448. Fixed: default ``resize_to=
+>    None`` (preserve native).
+> 3. **`dataset.py:MASK_SIZE = 56`** hardcoded, so the AERI mask GT was
+>    always rendered at 56×56 even when the model's P2 output was 112×112
+>    at 448 input. Replaced with ``_mask_size(img_size) = img_size // 4`` so
+>    GT masks stay aligned with model outputs at any resolution.
+>
+> **Reshard required** for v6.2.1 to take effect at 448. Shards written
+> with the previous broken converter must be regenerated.
+
 > **v6.2 update (2026-05-05).** Architecture simplification + bridge upgrade:
 > - **M3 default backbone** (M1 → M3, embed=64/128/256/512). `--backbone {m1,m3}` CLI flag, M3 default for v6.2.
 > - **448-pixel face crops** supported via `--img_size {224,448}` (reshard required for 448).
