@@ -413,6 +413,28 @@ def iris_edge_loss(pred_verts, gt_verts):
     return F.mse_loss(pred_edges, gt_edges)
 
 
+# ─── Per-subject eyeball radius (R_s) ──────────────────────────────
+
+def eyeball_radius_loss(pred_radius_cm: torch.Tensor,
+                        gt_radius_cm: torch.Tensor) -> torch.Tensor:
+    """L1 between predicted and GT per-subject eyeball radius (cm).
+
+    GazeGene's ``subject_label.pkl`` ships ``eyeball_radius`` per
+    subject (1.15-1.25 cm typical). The ``EyeballRadiusHead``
+    regresses a scalar in cm; supervising it lets the OpenEDS
+    torsion stage build the kinematic two-sphere model with the
+    correct globe radius rather than a population-average constant.
+
+    Args:
+        pred_radius_cm: (B,) predicted eyeball radius in cm.
+        gt_radius_cm:   (B,) GT eyeball radius in cm.
+
+    Returns:
+        scalar L1.
+    """
+    return F.l1_loss(pred_radius_cm, gt_radius_cm)
+
+
 # ─── Macro (head) gaze loss — GazeGene gaze_C ───────────────────────
 
 def macro_gaze_loss(pred_gaze_macro: torch.Tensor,
@@ -519,6 +541,10 @@ def total_loss(
     lam_gaze_macro=0.0,
     pred_gaze_macro=None,
     gt_gaze_c=None,
+    # Per-subject eyeball radius
+    lam_eyeball_radius=0.0,
+    pred_eyeball_radius=None,
+    gt_eyeball_radius=None,
 ):
     """
     Total training loss: landmarks + gaze + GazeGene 3D structure + pose.
@@ -660,6 +686,13 @@ def total_loss(
         gm_loss = macro_gaze_loss(pred_gaze_macro, gt_gaze_c)
         total = total + lam_gaze_macro * gm_loss
         components['gaze_macro_loss'] = gm_loss.detach()
+
+    # Per-subject eyeball radius (R_s, cm).
+    if (lam_eyeball_radius > 0 and pred_eyeball_radius is not None
+            and gt_eyeball_radius is not None):
+        er_loss = eyeball_radius_loss(pred_eyeball_radius, gt_eyeball_radius)
+        total = total + lam_eyeball_radius * er_loss
+        components['eyeball_radius_loss'] = er_loss.detach()
 
     components['landmark_loss'] *= 1.0 / (feat_H * feat_W)
     components['total_loss'] = total.detach()

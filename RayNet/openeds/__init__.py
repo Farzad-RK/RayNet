@@ -27,7 +27,12 @@ from RayNet.openeds.dataset import (
     OpenEDSSequenceDataset,
     OPENEDS_CLASS_MAP,
 )
-from RayNet.openeds.segmenter import RITnetStyleSegmenter
+from RayNet.openeds.segmenter import (
+    RITnetStyleSegmenter,
+    build_ritnet_full,
+    build_ritnet_tiny,
+    make_geometric_prior_channel,
+)
 from RayNet.openeds.torsion import IrisPolarTorsion
 from RayNet.openeds.temporal import TCNTemporalBlock
 
@@ -51,6 +56,9 @@ __all__ = [
     'OpenEDSSequenceDataset',
     'OPENEDS_CLASS_MAP',
     'RITnetStyleSegmenter',
+    'build_ritnet_full',
+    'build_ritnet_tiny',
+    'make_geometric_prior_channel',
     'IrisPolarTorsion',
     'TCNTemporalBlock',
     'StreamingOpenEDSSegDataset',

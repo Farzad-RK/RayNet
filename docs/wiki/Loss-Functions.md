@@ -323,6 +323,22 @@ The 100-vertex iris contour is a closed polygon; comparing edge lengths preserve
 
 ---
 
+## 14a. Eyeball Radius Loss (v6.2)
+
+**Source**: `RayNet/losses.py:eyeball_radius_loss`
+
+L1 between predicted and GT per-subject eyeball radius (cm):
+
+```
+L_eyeball_radius = L1(pred_radius_cm, gt_radius_cm)
+```
+
+The new `EyeballRadiusHead` (in `RayNet/raynet_v5.py`) regresses a scalar from the pooled gaze feature with bias init at 1.2 cm (population mean). GazeGene's `subject_label.pkl` ships `eyeball_radius` per subject (1.15-1.25 cm typical); making it a *predicted* scalar lets the OpenEDS torsion stage build the kinematic two-sphere model with the correct globe radius rather than a population-average constant.
+
+Active in Phase 2/3 at weight 0.2 (small because the L1 is in cm scale).
+
+---
+
 ## 14. Macro (Head) Gaze Loss (v6.1)
 
 **Source**: `RayNet/losses.py:macro_gaze_loss`

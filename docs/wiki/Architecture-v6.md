@@ -10,6 +10,14 @@
 > segmenter + torsion stages). Also ships the OpenEDS MDS converter parallel
 > to the GazeGene one so both pipelines share streaming ergonomics.
 
+> **v6.2 update (2026-05-05).** Architecture simplification + bridge upgrade:
+> - **M3 default backbone** (M1 → M3, embed=64/128/256/512). `--backbone {m1,m3}` CLI flag, M3 default for v6.2.
+> - **448-pixel face crops** supported via `--img_size {224,448}` (reshard required for 448).
+> - **EyeballRadiusHead** — predicts per-subject globe radius R_s in cm; supervised by GazeGene `subject_label.eyeball_radius`. Anchors the OpenEDS torsion two-sphere model.
+> - **High-resolution eye-patch crop** replaces binary AERI masks as the bridge to OpenEDS. Crop covers the eyelid + lashes vicinity (5/14 of face crop ≈ 80px @ 224, 160px @ 448) so the OpenEDS-style segmenter has the same field of view it sees during real-IR training.
+> - **Pose translation head removed** — global translation now comes from the predicted `eyeball_center_3d` (Macro-Locator). PoseBranch outputs rotation only.
+> - **Tiny RITnet variant** (`build_ritnet_tiny`, ~0.5M params) for the OpenEDS segmenter, plus a **geometric prior channel** helper (`make_geometric_prior_channel`) that turns the projected 3D eyeball centre into a 2D Gaussian ROI seeded into the segmenter's second input channel.
+
 ## Why v6
 
 The v5 pipeline trained gaze, segmentation, and pose **jointly** on synthetic GazeGene MetaHuman renderings. Two structural problems showed up at the 14-18° gaze plateau visible in `run_20260430_002809`:

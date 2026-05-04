@@ -135,7 +135,7 @@ PHASE_CONFIG = {
         'lam_reproj': 0.0,
         'lam_mask': 0.0,
         'lam_pose': 0.5,
-        'lam_trans': 0.5,
+        'lam_trans': 0.0,        # v6.2 — pose translation head removed
         'lam_iris_seg': 0.0,    # foveal texture → OpenEDS-only stage
         'lam_eyeball_seg': 0.0, # foveal texture → OpenEDS-only stage
         # 3DGazeNet M-target — iris contour mesh in CCS. Off in P1
@@ -150,6 +150,8 @@ PHASE_CONFIG = {
         # Macro (head) gaze (`gaze_C`) is owned by the gaze branch, so
         # its weight must follow the gaze freeze schedule. Off in P1.
         'lam_gaze_macro': 0.0,
+        # Per-subject eyeball radius head — same gaze-branch ownership.
+        'lam_eyeball_radius': 0.0,
         'lr': 0.001,
         'sigma': 2.0,
         'multiview': False,
@@ -198,6 +200,7 @@ PHASE_CONFIG = {
         # predicted eyeball anchor (detached) and is otherwise
         # independent of the optical/visual branches.
         'lam_gaze_macro': 1.0,
+        'lam_eyeball_radius': 0.2,        # cm-scale L1; small weight is plenty
         'lr': 3e-4,
         'sigma': 1.5,
         'multiview': False,
@@ -234,7 +237,7 @@ PHASE_CONFIG = {
         'lam_reproj': 0.1,
         'lam_mask': 0.05,
         'lam_pose': 0.3,
-        'lam_trans': 0.3,
+        'lam_trans': 0.0,        # v6.2 — pose translation head removed
         'lam_iris_seg': 0.0,    # foveal texture → OpenEDS-only stage
         'lam_eyeball_seg': 0.0, # foveal texture → OpenEDS-only stage
         # 3DGazeNet M-target — slightly lower than P2 to let multi-view
@@ -246,6 +249,7 @@ PHASE_CONFIG = {
         'lam_gaze_direct': 0.5,
         'lam_gaze_visual': 0.5,
         'lam_gaze_macro': 1.0,
+        'lam_eyeball_radius': 0.2,
         'lr': 5e-5,             # 6× lower than P2 (was 3e-4)
         'sigma': 1.0,
         'multiview': True,
@@ -640,6 +644,10 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                 lam_gaze_macro=cfg.get('lam_gaze_macro', 0.0),
                 pred_gaze_macro=predictions.get('gaze_macro'),
                 gt_gaze_c=gt_gaze_c,
+                # Per-subject eyeball radius (R_s, cm)
+                lam_eyeball_radius=cfg.get('lam_eyeball_radius', 0.0),
+                pred_eyeball_radius=predictions.get('eyeball_radius'),
+                gt_eyeball_radius=gt_eyeball_radius,
             )
 
             # Single-view pathway supervision: direct gaze L1 on pre-CrossViewAttn
@@ -864,6 +872,11 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
             gt_gaze_c = gt_gaze_c.to(device, non_blocking=True)
             if torch.isnan(gt_gaze_c).any():
                 gt_gaze_c = None
+        gt_eyeball_radius = batch.get('eyeball_radius')
+        if gt_eyeball_radius is not None:
+            gt_eyeball_radius = gt_eyeball_radius.to(device, non_blocking=True)
+            if torch.isnan(gt_eyeball_radius).any():
+                gt_eyeball_radius = None
 
         aeri_alpha = get_scheduled_alpha(epoch)
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
@@ -911,6 +924,10 @@ def validate(model, val_loader, device, epoch, cfg, amp_enabled=False,
                 lam_gaze_macro=cfg.get('lam_gaze_macro', 0.0),
                 pred_gaze_macro=predictions.get('gaze_macro'),
                 gt_gaze_c=gt_gaze_c,
+                # Per-subject eyeball radius (R_s, cm)
+                lam_eyeball_radius=cfg.get('lam_eyeball_radius', 0.0),
+                pred_eyeball_radius=predictions.get('eyeball_radius'),
+                gt_eyeball_radius=gt_eyeball_radius,
             )
 
         img_size = images.shape[-1]
@@ -1063,10 +1080,12 @@ def train(args):
     else:
         output_dir = None
 
-    # Create model
+    # Create model — backbone is selectable (m1 / m3). v6.2 default is m3
+    # for medical-grade gaze; pass --backbone m1 for ablation A/Bs.
     model = create_raynet_v5(
         backbone_weight_path=args.core_backbone_weight_path,
         n_landmarks=14,
+        backbone=args.backbone,
     )
 
     if hw['compile_model'] and hasattr(torch, 'compile'):
@@ -1714,6 +1733,7 @@ def _create_local_loaders(args, hw):
         samples_per_subject=args.samples_per_subject,
         eye=args.eye,
         camera_ids=list(TRICAM_IDS),
+        img_size=args.img_size,
     )
 
     train_loader_standard, val_loader = create_dataloaders(
@@ -1806,6 +1826,13 @@ def parse_args():
                         help='Output directory for checkpoints and logs')
     parser.add_argument('--samples_per_subject', type=int, default=200)
     parser.add_argument('--eye', type=str, default='L', choices=['L', 'R'])
+    parser.add_argument('--img_size', type=int, default=224,
+                        choices=[224, 448],
+                        help='Face-crop side length. v6.2 target is 448 — '
+                             'aligns with native GazeGene scale and unblocks '
+                             'sub-pixel iris precision. NOTE: requires a '
+                             'reshard at 448; existing 224 shards keep working '
+                             'with --img_size 224.')
     parser.add_argument('--eyelid_occlusion_p', type=float, default=0.30,
                         help='Per-sample probability of synthetic eyelid '
                              'occlusion in the train transform. The GT '
@@ -1823,10 +1850,18 @@ def parse_args():
     parser.add_argument('--mds_val', type=str, default=None,
                         help='MDS shard URL for validation (e.g. s3://gazegene/val)')
 
-    # Model — v5 uses RepNeXt-M1 for all branches (shared stem + 3 branches)
+    # Model — v6.2 uses RepNeXt-M3 for all branches by default
+    parser.add_argument('--backbone', type=str, default='m3',
+                        choices=['m1', 'm3'],
+                        help='RepNeXt variant for the four backbone instances '
+                             '(shared + landmark + gaze + pose). v6.2 default is '
+                             'M3 (embed_dim=64,128,256,512) — needed for the '
+                             'GLOBAL/FOVEAL_FLOOR=0.5 occlusion robustness and '
+                             '448-resolution sub-pixel iris precision. M1 '
+                             '(embed_dim=48,96,192,384) is preserved for ablation.')
     parser.add_argument('--core_backbone_weight_path', type=str, default=None,
-                        help='Path to pretrained RepNeXt-M1 weights '
-                             '(loaded into all 4 M1 instances: shared + landmark + gaze + pose). '
+                        help='Path to pretrained RepNeXt weights '
+                             '(loaded into all 4 backbone instances). '
                              'Pass None / empty to train from random init.')
 
     # Hardware profile

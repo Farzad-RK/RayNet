@@ -37,6 +37,21 @@ log = logging.getLogger(__name__)
 _Base = StreamingDataset if StreamingDataset is not None else object
 
 
+def _decode_eye_patch(raw: dict) -> dict:
+    """Decode the v6.2 eye_patch JPEG bytes to a (3, P, P) uint8 tensor.
+
+    The eye_patch is stored at native resolution (no shard-side resize)
+    so the decoded tensor preserves whatever face-crop scale the
+    converter was run with — 80×80 at 224, 160×160 at 448, etc.
+    """
+    nparr = np.frombuffer(raw['eye_patch'], np.uint8)
+    img_np = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    img_np = cv2.cvtColor(img_np, cv2.COLOR_BGR2RGB)
+    patch = torch.from_numpy(img_np).permute(2, 0, 1).contiguous()
+    bbox = torch.from_numpy(np.asarray(raw['eye_patch_bbox'], dtype=np.float32))
+    return {'eye_patch': patch, 'eye_patch_bbox': bbox}
+
+
 class StreamingGazeGeneDataset(_Base):
 
     """
@@ -156,6 +171,17 @@ class StreamingGazeGeneDataset(_Base):
                 raw['gaze_c'].astype(np.float32))
                 if 'gaze_c' in raw
                 else torch.full((3,), float('nan')),
+            # Per-subject eyeball radius in cm
+            'eyeball_radius': torch.tensor(
+                float(raw['eyeball_radius']), dtype=torch.float32)
+                if 'eyeball_radius' in raw
+                else torch.tensor(float('nan'), dtype=torch.float32),
+            # High-resolution eye-region patch + bbox (v6.2 bridge to OpenEDS).
+            # Eye_patch is JPEG-encoded RGB; decoded here to (3, P, P) uint8.
+            **(_decode_eye_patch(raw) if 'eye_patch' in raw else {
+                'eye_patch': torch.zeros(3, 1, 1, dtype=torch.uint8),
+                'eye_patch_bbox': torch.full((3,), float('nan')),
+            }),
             'head_R': torch.from_numpy(
                 raw['head_R'].astype(np.float32))
                 if 'head_R' in raw else torch.eye(3),
@@ -224,9 +250,11 @@ def _collate_fn(batch):
         'optical_axis', 'visual_axis', 'gaze_c', 'R_kappa',
         'K', 'intrinsic_original', 'face_bbox_gt',
         'R_cam', 'T_cam', 'eyeball_center_3d', 'pupil_center_3d',
+        'eyeball_radius',
         'iris_mesh_3d',
         'head_R', 'head_t', 'gaze_target', 'gaze_depth',
         'iris_mask', 'eyeball_mask',
+        'eye_patch', 'eye_patch_bbox',
     ]
     scalar_keys = ['subject', 'cam_id', 'frame_idx']
 

@@ -88,6 +88,14 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # RepNeXt-M1: embed_dim=(48, 96, 192, 384), depth=(3, 3, 15, 2)
 M1_CHANNELS = [48, 96, 192, 384]
+# RepNeXt-M3: embed_dim=(64, 128, 256, 512), depth=(3, 3, 13, 2)
+# Larger backbone for sub-pixel iris precision + drowsy-eye occlusion
+# robustness (GLOBAL/FOVEAL_FLOOR=0.5). v6.2 default.
+M3_CHANNELS = [64, 128, 256, 512]
+BACKBONE_CHANNELS = {
+    'm1': M1_CHANNELS,
+    'm3': M3_CHANNELS,
+}
 
 
 # ─── Shared Stem ────────────────────────────────────────────────────
@@ -294,11 +302,13 @@ class FPNLandmarkBranch(nn.Module):
     14 landmarks = 10 iris contour + 4 pupil boundary, GazeGene Sec 4.1.
     """
 
-    def __init__(self, n_landmarks=14, fpn_ch=FPN_CHANNELS):
+    def __init__(self, n_landmarks=14, fpn_ch=FPN_CHANNELS,
+                 backbone_channels=None):
         super().__init__()
         self.encoder = None  # set by factory
         self.n_landmarks = n_landmarks
-        self.fpn = FeaturePyramidNetwork(M1_CHANNELS, out_ch=fpn_ch)
+        in_ch = list(backbone_channels) if backbone_channels else M1_CHANNELS
+        self.fpn = FeaturePyramidNetwork(in_ch, out_ch=fpn_ch)
 
         self.refine = nn.Sequential(
             nn.Conv2d(fpn_ch, fpn_ch, 3, padding=1, bias=False),
@@ -385,9 +395,10 @@ class FPNAERIHead(nn.Module):
         top-down + bottom-up pyramid passes.
     """
 
-    def __init__(self, fpn_ch=FPN_CHANNELS):
+    def __init__(self, fpn_ch=FPN_CHANNELS, backbone_channels=None):
         super().__init__()
-        self.fpn = FeaturePyramidNetwork(M1_CHANNELS, out_ch=fpn_ch)
+        in_ch = list(backbone_channels) if backbone_channels else M1_CHANNELS
+        self.fpn = FeaturePyramidNetwork(in_ch, out_ch=fpn_ch)
         self.refine = nn.Sequential(
             nn.Conv2d(fpn_ch, fpn_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(fpn_ch),
@@ -527,6 +538,42 @@ class IrisMeshHead(nn.Module):
         return verts_flat.view(-1, self.N_VERTICES, 3)
 
 
+class EyeballRadiusHead(nn.Module):
+    """
+    Predicts the per-subject eyeball radius (R_s, cm) from the pooled
+    gaze feature.
+
+    GazeGene `subject_label.pkl` ships per-subject anatomy:
+    ``eyeball_radius`` (typical 1.15 - 1.25 cm), ``cornea_radius``,
+    ``cornea2center``. We currently treat ``eyeball_radius`` as a
+    fixed prior in the iris/eyeball mask renderer; v6.2 makes it a
+    *predicted* scalar so the Macro-Locator can refine it per-subject
+    at inference time, which the OpenEDS torsion stage consumes when
+    constructing the kinematic two-sphere eye model.
+
+    Output is unconstrained; supervise with ``eyeball_radius_loss``
+    (L1 against GazeGene's ground-truth scalar). The head ships a
+    sensible bias init (``DEFAULT_EYEBALL_RADIUS_CM = 1.2``) so the
+    initial prediction is anatomically plausible.
+    """
+
+    DEFAULT_EYEBALL_RADIUS_CM = 1.2
+
+    def __init__(self, d_model: int = 256, hidden_dim: int = 64):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        nn.init.zeros_(self.fc[-1].weight)
+        nn.init.constant_(self.fc[-1].bias, self.DEFAULT_EYEBALL_RADIUS_CM)
+
+    def forward(self, pooled: torch.Tensor) -> torch.Tensor:
+        # Squeeze the trailing dim so callers get (B,) not (B, 1).
+        return self.fc(pooled).squeeze(-1)
+
+
 class MacroGazeHead(nn.Module):
     """
     Macro (head) gaze head — GazeGene `gaze_C` paradigm.
@@ -629,13 +676,17 @@ class GazeBranch(nn.Module):
     FOVEAL_FLOOR = 0.50   # was effectively 0.00 (gate = M; pure suppression)
     # ── Eyelid-occlusion robustness floors ───────────────────────────
 
-    def __init__(self, d_model=256, fpn_ch=FPN_CHANNELS):
+    def __init__(self, d_model=256, fpn_ch=FPN_CHANNELS,
+                 backbone_channels=None):
         super().__init__()
         self.encoder = None  # set by factory (BranchEncoder)
-        self.aeri = FPNAERIHead(fpn_ch=fpn_ch)
+        bb = list(backbone_channels) if backbone_channels else M1_CHANNELS
+        self.aeri = FPNAERIHead(fpn_ch=fpn_ch, backbone_channels=bb)
 
-        # M1 s3 = 384 channels at 7x7
-        self.coord_att = CoordinateAttention(384)
+        # Backbone s3 channel count (M1=384, M3=512). Drives the
+        # coordinate-attention input width below.
+        s3_ch = bb[-1]
+        self.coord_att = CoordinateAttention(s3_ch)
         self.pool = nn.AdaptiveAvgPool2d(1)
 
         # --- AERI / HRFH-α fusion ---
@@ -652,10 +703,10 @@ class GazeBranch(nn.Module):
             nn.Linear(fpn_ch, 96),
             nn.GELU(),
         )
-        self.global_norm = nn.LayerNorm(384)
+        self.global_norm = nn.LayerNorm(s3_ch)
         self.foveal_norm = nn.LayerNorm(96)
-        # 384 (global) + 96 (foveal_proj) = 480
-        self.proj = nn.Linear(480, d_model)
+        # global (s3_ch) + foveal_proj (96) → d_model
+        self.proj = nn.Linear(s3_ch + 96, d_model)
         # --- AERI / HRFH-α fusion ---
 
         self.fusion_block = GazeFusionBlock(d_model)
@@ -664,6 +715,9 @@ class GazeBranch(nn.Module):
         self.iris_mesh_head = IrisMeshHead(d_model)
         # GazeGene gaze_C — macro (head) gaze from pose + 3D eyeball anchor
         self.macro_gaze_head = MacroGazeHead(d_model)
+        # Per-subject eyeball radius (R_s, cm) — anchors the OpenEDS
+        # torsion two-sphere model.
+        self.eyeball_radius_head = EyeballRadiusHead(d_model)
 
     def forward(self, s0_detached, s1_detached, pose_feat,
                     cross_view_attn=None, n_views=1, cam_embed=None,
@@ -748,6 +802,9 @@ class GazeBranch(nn.Module):
         # supervision (and vice versa).
         gaze_macro = self.macro_gaze_head(pose_feat, eyeball_center)
 
+        # Per-subject eyeball radius (R_s, cm) — anchors torsion stage.
+        eyeball_radius = self.eyeball_radius_head(pooled)
+
         # Single-view gaze prediction (no CrossViewAttention).
         # Only computed when multi-view fusion is actually active (n_views > 1)
         # so there is no overhead in single-view inference / validation.
@@ -757,7 +814,7 @@ class GazeBranch(nn.Module):
 
         return (eyeball_center, pupil_center,
                 gaze_geom, gaze_direct, gaze_fused, gaze_angles,
-                iris_mesh_3d, gaze_macro,
+                iris_mesh_3d, gaze_macro, eyeball_radius,
                 iris_logits, eyeball_logits, sv_gaze_fused)
 
 
@@ -775,16 +832,21 @@ class PoseBranch(nn.Module):
     Outputs:
       pose_feat (B, d_model): embedding consumed by GazeBranch
       pred_pose_6d (B, 6): 6D rotation → Gram-Schmidt → SO(3)
-      pred_pose_t  (B, 3): translation in meters (raw linear head)
+
+    v6.2: head translation is no longer regressed here. The Macro-
+    Locator (predicted ``eyeball_center_3d`` in CCS) carries global
+    translation, so the dedicated translation head was redundant and
+    its absence reduces PoseBranch by one Linear output dim.
     """
 
-    def __init__(self, d_model=256):
+    def __init__(self, d_model=256, backbone_channels=None):
         super().__init__()
         self.encoder = None  # set by factory (BranchEncoder)
-        # M1 s3 = 384 channels at 7x7
-        self.coord_att = CoordinateAttention(384)
+        bb = list(backbone_channels) if backbone_channels else M1_CHANNELS
+        s3_ch = bb[-1]
+        self.coord_att = CoordinateAttention(s3_ch)
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.proj = nn.Linear(384, d_model)
+        self.proj = nn.Linear(s3_ch, d_model)
 
         self.box_encoder = BoxEncoder(d_model)
         self.fuse = nn.Sequential(
@@ -797,7 +859,7 @@ class PoseBranch(nn.Module):
         nn.init.zeros_(self.fuse[2].weight)
         nn.init.zeros_(self.fuse[2].bias)
 
-        self.head = nn.Linear(d_model, 9)  # 6D rot + 3D translation
+        self.head = nn.Linear(d_model, 6)  # 6D rotation only (v6.2)
 
     def forward(self, s1_detached, face_bbox=None):
         s2, s3 = self.encoder(s1_detached)
@@ -811,10 +873,8 @@ class PoseBranch(nn.Module):
         residual = self.fuse(torch.cat([cnn_feat, box_feat], dim=-1))
         pose_feat = cnn_feat + residual
 
-        out = self.head(pose_feat)
-        pred_pose_6d = out[:, :6]
-        pred_pose_t = out[:, 6:]  # meters
-        return pose_feat, pred_pose_6d, pred_pose_t
+        pred_pose_6d = self.head(pose_feat)
+        return pose_feat, pred_pose_6d
 
 
 # ─── Cross-View and Camera Modules ─────────────────────────────────
@@ -920,8 +980,9 @@ class RayNetV5(nn.Module):
         landmark_coords, landmark_heatmaps = self.landmark_branch(
             s0, s1, lm_s2, lm_s3)
 
-        # Pose branch — gradient-isolated + bbox fusion.
-        pose_feat, pred_pose_6d, pred_pose_t = self.pose_branch(
+        # Pose branch — gradient-isolated + bbox fusion. v6.2 removed
+        # the translation head; head pose carries rotation only.
+        pose_feat, pred_pose_6d = self.pose_branch(
             s1.detach(), face_bbox=face_bbox)
 
         # Gaze branch — gradient-isolated + AERI attention.
@@ -933,7 +994,7 @@ class RayNetV5(nn.Module):
 
         (eyeball_center, pupil_center,
          gaze_geom, gaze_direct, gaze_fused, gaze_angles,
-         iris_mesh_3d, gaze_macro,
+         iris_mesh_3d, gaze_macro, eyeball_radius,
          iris_mask_logits, eyeball_mask_logits,
          sv_gaze_fused) = self.gaze_branch(
             s0.detach(), s1.detach(), pose_feat,
@@ -966,11 +1027,12 @@ class RayNetV5(nn.Module):
             'iris_mesh_3d': iris_mesh_3d,              # (B, 100, 3)
             # GazeGene macro (head) gaze — fused from pose + eyeball anchor
             'gaze_macro': gaze_macro,                  # (B, 3) unit, CCS
+            # Per-subject eyeball radius (R_s, cm) — feeds OpenEDS torsion
+            'eyeball_radius': eyeball_radius,          # (B,) cm
             # Single-view fused gaze (pre-CrossViewAttention); None when n_views==1
             'gaze_vector_sv': sv_gaze_fused,           # (B, 3) unit or None
-            # Pose
+            # Pose (v6.2 — rotation only, translation handled by Macro-Locator)
             'pred_pose_6d': pred_pose_6d,              # (B, 6)
-            'pred_pose_t': pred_pose_t,                # (B, 3) m
         }
 
 
@@ -981,52 +1043,60 @@ def _split_m1_backbone(m1):
 
 
 def create_raynet_v5(backbone_weight_path=None, cross_view_cfg=None,
-                     n_landmarks=14):
+                     n_landmarks=14, backbone='m1'):
     """
-    Triple-M1 factory.
+    RayNet v5/v6 factory with switchable backbone.
 
-    Four RepNeXt-M1 instances are created and split:
-      - m1_shared   → stem + s0 + s1          (SharedStem)
-      - m1_landmark → s2 + s3                  (LandmarkBranch enc)
-      - m1_pose     → s2 + s3                  (PoseBranch enc)
-      - m1_gaze     → s2 + s3                  (GazeBranch enc)
-    "Triple-M1" refers to the three task-specific s2+s3 branches above
-    the single shared stem. Each branch produces its own 7x7 / 14x14
-    feature pyramid, so training doesn't force one set of features
-    to satisfy three objectives at once.
+    Four RepNeXt instances are created and split:
+      - bb_shared   → stem + s0 + s1          (SharedStem)
+      - bb_landmark → s2 + s3                  (LandmarkBranch enc)
+      - bb_pose     → s2 + s3                  (PoseBranch enc)
+      - bb_gaze     → s2 + s3                  (GazeBranch enc)
+    Each branch produces its own 7x7 / 14x14 feature pyramid so training
+    doesn't force one set of features to satisfy three objectives.
 
-    M1 (embed_dim=48,96,192,384; depth=3,3,15,2) is the deliberately
-    smaller variant — the M3 A/B (Tripple_M3_run_20260428_130241)
-    showed no convergence advantage from the larger backbone, so the
-    bottleneck is dataset size, not capacity. Stick with M1 unless an
-    A/B confirms otherwise.
+    Args:
+        backbone_weight_path: optional pretrained checkpoint path.
+        cross_view_cfg: kwargs for CrossViewAttention.
+        n_landmarks: landmark count for the heatmap head.
+        backbone: 'm1' (default — embed_dim=(48,96,192,384), depth=
+            (3,3,15,2)) or 'm3' (embed_dim=(64,128,256,512), depth=
+            (3,3,13,2)). The v6.2 default for medical-grade gaze is
+            'm3'; M1 is preserved for ablation A/Bs.
     """
+    if backbone not in BACKBONE_CHANNELS:
+        raise ValueError(
+            f"backbone must be one of {sorted(BACKBONE_CHANNELS)}, "
+            f"got {backbone!r}")
+    backbone_name = f'repnext_{backbone}'
+    bb_channels = BACKBONE_CHANNELS[backbone]
 
-    def _make_m1(weight_path):
+    def _make_backbone(weight_path):
         if weight_path:
             from backbone.repnext_utils import load_pretrained_repnext
-            return load_pretrained_repnext('repnext_m1', weight_path)
-        return create_repnext('repnext_m1', pretrained=False)
+            return load_pretrained_repnext(backbone_name, weight_path)
+        return create_repnext(backbone_name, pretrained=False)
 
-    m1_shared = _make_m1(backbone_weight_path)
-    m1_landmark = _make_m1(backbone_weight_path)
-    m1_pose = _make_m1(backbone_weight_path)
-    m1_gaze = _make_m1(backbone_weight_path)
+    bb_shared = _make_backbone(backbone_weight_path)
+    bb_landmark = _make_backbone(backbone_weight_path)
+    bb_pose = _make_backbone(backbone_weight_path)
+    bb_gaze = _make_backbone(backbone_weight_path)
 
-    stem, s0, s1, _, _ = _split_m1_backbone(m1_shared)
-    _, _, _, lm_s2, lm_s3 = _split_m1_backbone(m1_landmark)
-    _, _, _, ps_s2, ps_s3 = _split_m1_backbone(m1_pose)
-    _, _, _, gz_s2, gz_s3 = _split_m1_backbone(m1_gaze)
+    stem, s0, s1, _, _ = _split_m1_backbone(bb_shared)
+    _, _, _, lm_s2, lm_s3 = _split_m1_backbone(bb_landmark)
+    _, _, _, ps_s2, ps_s3 = _split_m1_backbone(bb_pose)
+    _, _, _, gz_s2, gz_s3 = _split_m1_backbone(bb_gaze)
 
     shared_stem = SharedStem(stem, s0, s1)
 
-    landmark_branch = FPNLandmarkBranch(n_landmarks=n_landmarks)
+    landmark_branch = FPNLandmarkBranch(
+        n_landmarks=n_landmarks, backbone_channels=bb_channels)
     landmark_branch.encoder = BranchEncoder(lm_s2, lm_s3)
 
-    pose_branch = PoseBranch(d_model=256)
+    pose_branch = PoseBranch(d_model=256, backbone_channels=bb_channels)
     pose_branch.encoder = BranchEncoder(ps_s2, ps_s3)
 
-    gaze_branch = GazeBranch(d_model=256)
+    gaze_branch = GazeBranch(d_model=256, backbone_channels=bb_channels)
     gaze_branch.encoder = BranchEncoder(gz_s2, gz_s3)
 
     model = RayNetV5(
@@ -1042,7 +1112,7 @@ def create_raynet_v5(backbone_weight_path=None, cross_view_cfg=None,
         return sum(p.numel() for p in module.parameters()) / 1e6
 
     total = _count(model)
-    print(f"RayNet v5 (Triple-M1, FPANet landmark + AERI gaze) created:")
+    print(f"RayNet v6 (Triple-{backbone.upper()}, FPANet landmark + AERI gaze) created:")
     print(f"  SharedStem:      {_count(shared_stem):.2f}M")
     print(f"  LandmarkBranch:  {_count(landmark_branch):.2f}M "
           f"(encoder {_count(landmark_branch.encoder):.2f}M + PANet "

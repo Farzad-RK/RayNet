@@ -2,22 +2,30 @@
 RITnet-style semantic segmenter for the OpenEDS foveal stage.
 
 RITnet (Chaudhary et al., 2019) is the canonical light-weight U-Net
-variant for OpenEDS-class IR eye-segmentation. It uses dense blocks +
-pixel-shuffle upsampling with a parameter budget around 250k. The
-implementation here is faithful to that recipe but parametrises the
-input channel count (1 for OpenEDS grayscale) and class count (4 for
-the FovalNet preprocessed labels: background / sclera / iris / pupil).
+variant for OpenEDS-class IR eye-segmentation with a parameter budget
+around 250k. The implementation here is faithful to that recipe but
+parametrises the input channel count and class count.
 
 Key design choices:
-- 1-channel input (OpenEDS is grayscale IR). Callers can construct
-  with ``in_channels=3`` if they want to repeat a grayscale frame to
-  RGB for compatibility with an ImageNet-style trunk.
-- 4-class softmax output. The :func:`combined_loss` helper mixes
+- **1-channel input** for OpenEDS grayscale IR; ``in_channels=2``
+  enables the v6.2 *geometric prior* channel that seeds the
+  segmenter with a Gaussian ROI around the GazeGene-predicted 3D
+  eyeball centre. The prior channel is in [0, 1] and is concatenated
+  before the stem.
+- **4-class softmax output** matching FovalNet labels (background /
+  sclera / iris / pupil). The :func:`combined_loss` helper mixes
   weighted cross-entropy + soft Dice; cross-entropy alone collapses
   on the rare classes (pupil ~1% of pixels).
 - Stride-32-friendly: receptive-field down/up steps are factor-of-2
   so 416×640 inputs (the recommended pad for native 400×640) flow
   through cleanly.
+
+Two factory presets:
+- :func:`build_ritnet_full` (default ``base_channels=32``,
+  ``growth_rate=16``) — ~2.3M params, our higher-capacity variant.
+- :func:`build_ritnet_tiny` (``base_channels=16``, ``growth_rate=8``)
+  — ~0.5M params, faithful to the original RITnet budget. Use this
+  when the ~1.5k labelled OpenEDS frames overfit the larger variant.
 """
 
 from __future__ import annotations
@@ -155,6 +163,63 @@ def _soft_dice_loss(
     return 1.0 - dice_per_class[1:].mean()
 
 
+def build_ritnet_full(num_classes: int = 4, in_channels: int = 1
+                      ) -> 'RITnetStyleSegmenter':
+    """Higher-capacity variant (~2.3M params) — default v6 segmenter."""
+    return RITnetStyleSegmenter(in_channels=in_channels,
+                                num_classes=num_classes,
+                                base_channels=32, growth_rate=16)
+
+
+def build_ritnet_tiny(num_classes: int = 4, in_channels: int = 1
+                      ) -> 'RITnetStyleSegmenter':
+    """Tiny variant (~0.5M params) — faithful to the RITnet 250k-budget
+    spirit and recommended when the ~1.5k labelled OpenEDS frames
+    overfit the full variant. Use ``in_channels=2`` to also accept a
+    geometric prior channel from the GazeGene Macro-Locator."""
+    return RITnetStyleSegmenter(in_channels=in_channels,
+                                num_classes=num_classes,
+                                base_channels=16, growth_rate=8)
+
+
+# ── Geometric prior channel ─────────────────────────────────────────
+
+def make_geometric_prior_channel(
+    eyeball_center_2d_px: torch.Tensor,
+    img_size: tuple[int, int],
+    sigma_px: float = 60.0,
+) -> torch.Tensor:
+    """Build a 2D Gaussian prior channel centred at the projected 3D
+    eyeball centre.
+
+    Used by the v6.2 geometric bridge: the GazeGene Macro-Locator
+    predicts the 3D eyeball centre, projects it through ``K`` to 2D,
+    and this helper turns those pixel coordinates into a soft ROI
+    that seeds the OpenEDS segmenter (concatenated as channel 2 of a
+    2-channel input).
+
+    Args:
+        eyeball_center_2d_px: ``(B, 2)`` predicted eyeball centre in
+            pixel coordinates of the eye-patch frame.
+        img_size: ``(H, W)`` of the segmenter input.
+        sigma_px: Gaussian radius in pixels. Default 60 covers a
+            generous iris-region ROI without hard-cropping the sclera.
+
+    Returns:
+        ``(B, 1, H, W)`` float tensor in [0, 1].
+    """
+    H, W = img_size
+    device = eyeball_center_2d_px.device
+    ys = torch.arange(H, device=device, dtype=eyeball_center_2d_px.dtype)
+    xs = torch.arange(W, device=device, dtype=eyeball_center_2d_px.dtype)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
+    cx = eyeball_center_2d_px[:, 0:1].unsqueeze(-1)        # (B, 1, 1)
+    cy = eyeball_center_2d_px[:, 1:2].unsqueeze(-1)        # (B, 1, 1)
+    sq = (grid_x[None] - cx) ** 2 + (grid_y[None] - cy) ** 2
+    prior = torch.exp(-sq / (2.0 * sigma_px ** 2))
+    return prior.unsqueeze(1)                              # (B, 1, H, W)
+
+
 def combined_loss(
     logits: torch.Tensor,
     target: torch.Tensor,
@@ -180,5 +245,8 @@ def combined_loss(
 
 __all__ = [
     'RITnetStyleSegmenter',
+    'build_ritnet_full',
+    'build_ritnet_tiny',
+    'make_geometric_prior_channel',
     'combined_loss',
 ]

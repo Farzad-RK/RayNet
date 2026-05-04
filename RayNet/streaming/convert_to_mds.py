@@ -34,6 +34,7 @@ MDS_COLUMNS = {
     'optical_axis': 'ndarray',
     'visual_axis': 'ndarray',         # (3,) GT visual axis (kappa-corrected gaze)
     'gaze_c': 'ndarray',              # (3,) GT macro (head) gaze — GazeGene gaze_C
+    'eyeball_radius': 'float32',      # per-subject eyeball radius (cm)
     'R_kappa': 'ndarray',
     'K': 'ndarray',                   # K_cropped rescaled to 224
     'intrinsic_original': 'ndarray',  # K_orig (full camera) — for BoxEncoder GT / rederivation
@@ -49,6 +50,8 @@ MDS_COLUMNS = {
     'gaze_depth': 'float32',
     'iris_mask': 'ndarray',       # (56, 56) uint8 {0, 255} — AERI iris GT
     'eyeball_mask': 'ndarray',    # (56, 56) uint8 {0, 255} — AERI eyeball GT
+    'eye_patch': 'bytes',         # JPEG-encoded RGB eye-region crop (v6.2 bridge)
+    'eye_patch_bbox': 'ndarray',  # (3,) [x0, y0, patch_size] in face-crop pixels
     'subject': 'int',
     'cam_id': 'int',
     'frame_idx': 'int',
@@ -64,6 +67,7 @@ def _sample_to_mds(sample):
         'optical_axis': sample['optical_axis'].numpy(),
         'visual_axis': sample['visual_axis'].numpy(),
         'gaze_c': sample['gaze_c'].numpy(),
+        'eyeball_radius': float(sample['eyeball_radius']),
         'R_kappa': sample['R_kappa'].numpy(),
         'K': sample['K'].numpy(),
         'intrinsic_original': sample['intrinsic_original'].numpy(),
@@ -79,15 +83,30 @@ def _sample_to_mds(sample):
         'gaze_depth': float(sample['gaze_depth']),
         'iris_mask': sample['iris_mask'].numpy(),
         'eyeball_mask': sample['eyeball_mask'].numpy(),
+        'eye_patch': image_to_jpeg_bytes(
+            sample['eye_patch'], resize_to=None),
+        'eye_patch_bbox': sample['eye_patch_bbox'].numpy().astype(np.float32),
         'subject': sample['subject'],
         'cam_id': sample['cam_id'],
         'frame_idx': sample['frame_idx'],
     }
 
 
-def image_to_jpeg_bytes(img_tensor, quality=90):
-    img = (img_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-    img = cv2.resize(img, (224, 224), interpolation=cv2.INTER_LINEAR)
+def image_to_jpeg_bytes(img_tensor, quality=90, resize_to=(224, 224)):
+    """JPEG-encode a (3, H, W) uint8 or float tensor.
+
+    Args:
+        img_tensor: (3, H, W) torch tensor. Float [0, 1] or uint8.
+        quality: JPEG quality factor.
+        resize_to: optional ``(w, h)`` target. ``None`` keeps native
+            resolution — used by the v6.2 high-resolution eye_patch.
+    """
+    if img_tensor.dtype == torch.uint8:
+        img = img_tensor.permute(1, 2, 0).numpy()
+    else:
+        img = (img_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+    if resize_to is not None:
+        img = cv2.resize(img, resize_to, interpolation=cv2.INTER_LINEAR)
 
     encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
     _, buf = cv2.imencode(".jpg", img, encode_param)

@@ -35,6 +35,15 @@ IRIS_SUBSAMPLE_IDX = list(range(0, 100, 10))  # [0, 10, 20, ..., 90]
 # AERI mask spatial resolution (matches P2 feature map: stride-4 of 224)
 MASK_SIZE = 56
 
+# Eye-patch fraction of the face crop. v6.2 ships a high-resolution
+# RGB eye-region patch as the bridge between the GazeGene Macro-Locator
+# and the OpenEDS-style Foveal Segmenter. The patch is centred on the
+# active iris and sized so the eyelid + lashes + nasal/temporal margins
+# are included (matching the OpenEDS field of view). 5/14 of the face
+# crop ≈ 80px @ 224 / 160px @ 448 — empirically the smallest box that
+# fully contains the eyelid above and below the lid creases.
+EYE_PATCH_FRAC = 5.0 / 14.0
+
 
 def _intrinsic_delta_bbox(K_orig, K_crop_native, crop_w, crop_h):
     """
@@ -355,6 +364,32 @@ class GazeGeneDataset(Dataset):
         else:
             R_kappa = np.eye(3, dtype=np.float64)
 
+        # --- High-resolution eye-region patch (v6.2) ---
+        # Crop a square eye patch from the resized 3-channel face image,
+        # centred on the iris centroid (in the same pixel space as
+        # `landmarks_px`). The patch is the bridge between the GazeGene
+        # Macro-Locator and the OpenEDS-style Foveal Segmenter; OpenEDS
+        # crops show the eye plus eyelids/lashes, so we deliberately
+        # crop a generous square (EYE_PATCH_FRAC of the face crop) to
+        # include those vicinity regions instead of a tight iris-only
+        # bounding box.
+        patch_size = int(round(self.img_size * EYE_PATCH_FRAC))
+        iris_cx = float(landmarks_px[:, 0].mean())
+        iris_cy = float(landmarks_px[:, 1].mean())
+        half = patch_size // 2
+        # Clamp so we never sample outside the image. The clamp shifts
+        # the box rather than cropping smaller, which keeps tensor
+        # shapes uniform across the batch.
+        x0 = int(round(iris_cx - half))
+        y0 = int(round(iris_cy - half))
+        x0 = max(0, min(self.img_size - patch_size, x0))
+        y0 = max(0, min(self.img_size - patch_size, y0))
+        eye_patch_np = img_resized[y0:y0 + patch_size,
+                                   x0:x0 + patch_size, :].copy()
+        # Track patch origin (in face-crop pixels) so the geometric
+        # bridge can map back into the full face frame at inference.
+        eye_patch_bbox_px = np.array([x0, y0, patch_size], dtype=np.float32)
+
         # --- AERI binary masks (iris + eyeball at stride-4 resolution) ---
         # Native iris contour size matches the raw JPG before resize; the
         # renderer rescales from native_size → img_size internally, then
@@ -400,11 +435,24 @@ class GazeGeneDataset(Dataset):
             'visual_axis': torch.from_numpy(visual_axis_ccs).float(),       # (3,) unit, CCS
             # Macro (head) gaze GT — used by macro_gaze_loss. GazeGene `gaze_C`.
             'gaze_c': torch.from_numpy(np.array(s['gaze_C'], dtype=np.float64)).float(),  # (3,) unit, CCS
+            # Per-subject eyeball radius (cm) — supervises EyeballRadiusHead.
+            # Falls back to the renderer's default constant when the
+            # subject_attrs entry is missing (rare; older shards).
+            'eyeball_radius': torch.tensor(
+                float(subject_attrs.get('eyeball_radius', 1.2))
+            ).float(),
             # GazeGene gaze labels
             'gaze_target': torch.from_numpy(gaze_target).float(),           # (3,) 3D target, CCS
             'gaze_depth': torch.tensor(gaze_depth).float(),                 # scalar, vergence depth
             'iris_mask': torch.from_numpy(iris_mask_np),                    # (56, 56) uint8 {0, 255}
             'eyeball_mask': torch.from_numpy(eyeball_mask_np),              # (56, 56) uint8 {0, 255}
+            # High-resolution eye-region RGB patch + bbox (v6.2 bridge).
+            # eye_patch is uint8 [0, 255] BGR — train.py applies the same
+            # ImageNet normalisation it uses for the face image.
+            'eye_patch': torch.from_numpy(
+                cv2.cvtColor(eye_patch_np, cv2.COLOR_BGR2RGB)
+            ).permute(2, 0, 1).contiguous(),                                # (3, P, P) uint8
+            'eye_patch_bbox': torch.from_numpy(eye_patch_bbox_px),          # (3,) [x0, y0, patch_size]
             'subject': subj_num,
             'cam_id': s['cam_id'],
             'frame_idx': s['frame_idx'],
@@ -489,10 +537,11 @@ def gazegene_collate_fn(batch):
                    'optical_axis', 'visual_axis', 'gaze_c', 'R_kappa',
                    'K', 'intrinsic_original', 'face_bbox_gt',
                    'R_cam', 'T_cam', 'head_R', 'head_t',
-                   'eyeball_center_3d', 'pupil_center_3d',
+                   'eyeball_center_3d', 'pupil_center_3d', 'eyeball_radius',
                    'iris_mesh_3d',
                    'gaze_target', 'gaze_depth',
-                   'iris_mask', 'eyeball_mask']
+                   'iris_mask', 'eyeball_mask',
+                   'eye_patch', 'eye_patch_bbox']
     scalar_keys = ['subject', 'cam_id', 'frame_idx']
 
     for key in tensor_keys:
@@ -509,12 +558,17 @@ def gazegene_collate_fn(batch):
 def create_dataloaders(base_dir, train_subjects, val_subjects,
                        batch_size=4, num_workers=4,
                        samples_per_subject=None, eye='L',
-                       ensure_multiview=False, camera_ids=None):
+                       ensure_multiview=False, camera_ids=None,
+                       img_size=224):
     """Create train and validation dataloaders.
 
     `camera_ids`: optional iterable of int cam_ids (0-8). When provided,
     the GazeGeneDataset only ingests those cameras — used to switch from
     the full 9-cam rig to a TriCam subset (e.g. (1, 6, 8)).
+
+    `img_size`: face-crop side length (224 or 448). 448 matches the
+    native GazeGene face-crop scale and is the v6.2 target for medical-
+    grade sub-pixel iris precision.
     """
     cam_list = list(camera_ids) if camera_ids is not None else None
 
@@ -524,6 +578,7 @@ def create_dataloaders(base_dir, train_subjects, val_subjects,
         camera_ids=cam_list,
         samples_per_subject=samples_per_subject,
         eye=eye,
+        img_size=img_size,
         augment=True,
     )
 
@@ -533,6 +588,7 @@ def create_dataloaders(base_dir, train_subjects, val_subjects,
         camera_ids=cam_list,
         samples_per_subject=samples_per_subject,
         eye=eye,
+        img_size=img_size,
         augment=False,
     )
 
