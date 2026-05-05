@@ -288,16 +288,24 @@ class FPNLandmarkBranch(nn.Module):
     Pipeline:
       BranchEncoder(s1) → (s2, s3)
       FPN([s0, s1, s2, s3]) → [P2, P3, P4, P5]   (all `fpn_ch`)
-      P2 (fpn_ch × 56 × 56) → 2× Conv-BN-SiLU refine
-      → heatmap (n_landmarks × 56 × 56)
-      → offset  (n_landmarks·2 × 56 × 56)
-      → soft-argmax + offset refinement → 14 sub-pixel coords.
+      P2 → CoordinateAttention (row/column spatial gating)
+      → heatmap (n_landmarks × H × W)
+      → offset  (n_landmarks·2 × H × W)
+      → soft-argmax (β=100) + offset refinement → 14 sub-pixel coords.
 
     The fused P2 is what the old U-Net's d1 used to be, but augmented
     with the global semantic context that P5 injects through the
     top-down path and the high-resolution emphasis that the bottom-up
-    path adds — that combination is what we attribute the
-    sub-pixel accuracy of the earlier FPANet runs to.
+    path adds. CoordinateAttention on top of P2 is what the
+    sub-pixel-accurate ablation/subpixel_landmark run used; it
+    encodes horizontal/vertical positional cues directly into the
+    feature map and was the head architecture that reached 0.53 px
+    val_landmark_px in run_20260405_025128.
+
+    Heatmap stride is 4: a 448×448 input produces a 112×112 heatmap
+    (one cell per native pixel) — required to recover the previous
+    sub-pixel result. A 224×224 input produces 56×56 (each cell spans
+    4 image pixels) and so caps achievable image-space precision.
 
     14 landmarks = 10 iris contour + 4 pupil boundary, GazeGene Sec 4.1.
     """
@@ -310,51 +318,29 @@ class FPNLandmarkBranch(nn.Module):
         in_ch = list(backbone_channels) if backbone_channels else M1_CHANNELS
         self.fpn = FeaturePyramidNetwork(in_ch, out_ch=fpn_ch)
 
-        self.refine = nn.Sequential(
-            nn.Conv2d(fpn_ch, fpn_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(fpn_ch),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(fpn_ch, fpn_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(fpn_ch),
-            nn.SiLU(inplace=True),
-        )
+        self.coord_att = CoordinateAttention(fpn_ch)
         self.heatmap = nn.Conv2d(fpn_ch, n_landmarks, 1)
         self.offset = nn.Conv2d(fpn_ch, n_landmarks * 2, 1)
 
     def forward(self, s0, s1, s2, s3):
         feats = self.fpn([s0, s1, s2, s3])
-        x = self.refine(feats[0])  # P2 fused
+        x = self.coord_att(feats[0])  # P2 fused, with row/column attention
         hm = self.heatmap(x)
         off = self.offset(x)
         coords = self._soft_argmax(hm, off)
         return coords, hm
 
     def _soft_argmax(self, hm, off):
-        # Canonical soft-argmax (Integral Pose Regression, Sun et al.):
-        # interpret softmax(logits) as a probability map and take the
-        # expected value of (x, y) under that distribution. With
-        # temperature β = 1 the gradient through the softmax is
-        # well-distributed, so the L1 coord loss back-propagates into
-        # the heatmap itself — that's what makes the coords
-        # differentiable down to sub-pixel resolution.
-        #
-        # The previous implementation used β = 100, which collapses the
-        # softmax to a near-hard argmax: softmax derivatives saturate
-        # at ~0, the coord L1 only ever updates the offset head, and
-        # the heatmap is supervised solely by its MSE term. Sub-pixel
-        # accuracy then depends entirely on the offset head learning
-        # the integer→float residual at the argmax cell. Dropping β
-        # to 1 lets the heatmap distribution itself encode the
-        # sub-pixel signal.
-        #
-        # The offset head is retained as a residual refinement: at the
-        # cell nearest the soft-argmax expectation, look up a small
-        # (dx, dy) correction. This is now a fine-grained tweak on top
-        # of an already-continuous base coord, not the sole source of
-        # sub-pixel precision.
+        # β = 100 collapses softmax(logits) into a near-hard argmax at
+        # the peak cell. Coord L1 then flows almost entirely into the
+        # offset head, which learns the (dx, dy) sub-pixel residual at
+        # that cell — the same scheme that produced 0.53 px in
+        # run_20260405_025128. β = 1 (Integral Pose Regression) was
+        # tried in v5/v6 but spreads the expectation across the heatmap
+        # tail and stalled landmark precision well above 1 px.
         B, N, H, W = hm.shape
         flat = hm.view(B, N, -1)
-        weight = F.softmax(flat, dim=-1).view(B, N, H, W)
+        weight = F.softmax(flat * 100.0, dim=-1).view(B, N, H, W)
 
         gx = torch.arange(W, dtype=torch.float32, device=hm.device)
         gy = torch.arange(H, dtype=torch.float32, device=hm.device)
