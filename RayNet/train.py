@@ -152,7 +152,12 @@ PHASE_CONFIG = {
         'lam_gaze_macro': 0.0,
         # Per-subject eyeball radius head — same gaze-branch ownership.
         'lam_eyeball_radius': 0.0,
-        'lr': 0.001,
+        # v6.2.2 (LR Rework): constant LR for the entire phase.
+        # Cosine decay to ~0 within the 15-epoch P1 budget starved
+        # geometry bootstrap of optimization energy and was the
+        # dominant cause of the landmark-loss plateau visible in
+        # run_20260504_230121.
+        'lr': 1e-3,
         'sigma': 2.0,
         'multiview': False,
         'freeze_set': 'gaze_only',  # see apply_phase_freeze
@@ -201,7 +206,14 @@ PHASE_CONFIG = {
         # independent of the optical/visual branches.
         'lam_gaze_macro': 1.0,
         'lam_eyeball_radius': 0.2,        # cm-scale L1; small weight is plenty
-        'lr': 3e-4,
+        # v6.2.2 (LR Rework): constant LR for the entire phase. P2 is
+        # the high-plasticity adaptation phase — newly unfrozen gaze
+        # branch + iris-mesh + macro-gaze + visual-axis heads all need
+        # sustained optimization energy, which cosine decay starved.
+        # 5e-4 matches the rework doc's OneCycleLR max_lr but is held
+        # constant throughout the phase per the user's note that
+        # constant LR is preferred for our learning process.
+        'lr': 5e-4,
         'sigma': 1.5,
         'multiview': False,
         'freeze_set': 'face_only',  # freeze stem + landmark + pose
@@ -250,7 +262,11 @@ PHASE_CONFIG = {
         'lam_gaze_visual': 0.5,
         'lam_gaze_macro': 1.0,
         'lam_eyeball_radius': 0.2,
-        'lr': 5e-5,             # 6× lower than P2 (was 3e-4)
+        # v6.2.2 (LR Rework): constant LR for P3. The previous cosine
+        # decay on top of the already-low 5e-5 baseline produced
+        # effective LRs in [1e-6, 1e-7] — well below useful, the
+        # "double attenuation" the rework doc calls out.
+        'lr': 5e-5,
         'sigma': 1.0,
         'multiview': True,
         'freeze_set': 'face_kept',  # freeze stem + landmark, keep pose trainable
@@ -415,46 +431,131 @@ def _unwrap_raynet(model):
 
 def _rebuild_scheduler_for_resume(optimizer, start_epoch, log_fn=print):
     """
-    Rebuild the LR scheduler from the CURRENT PHASE_CONFIG, advanced to
-    the cosine position implied by `start_epoch`. Always called after
-    a resume / continuation-fork — never trust the saved scheduler state.
+    v6.2.2: constant-LR mode. Resets each param group's LR to the
+    target value derived from PHASE_CONFIG (re-applying the per-group
+    multiplier set by ``build_param_groups``) and returns ``None``.
 
-    Why: torch's CosineAnnealingLR persists `T_max` and `last_epoch` in
-    its state_dict. If PHASE_CONFIG epoch counts changed between runs,
-    the loaded T_max becomes stale; `last_epoch` then increments past
-    the stale T_max and `cos(pi * last_epoch / T_max)` wraps past pi —
-    LR bounces back UP from 0 toward peak. This was the root cause of
-    the inverted-cosine pattern in run_20260427_205327 (P1 LR went
-    0 → 4.81e-4 over epochs 8 → 15 because the loaded T_max=8 from a
-    pre-edit checkpoint clashed with the new T_max=15 P1 budget).
+    Per the LR Management Rework, every phase now uses a constant
+    learning rate with no scheduler. Cosine annealing's near-zero
+    decay was the dominant source of the landmark-loss plateau and
+    of the optimization-energy starvation observed when curriculum
+    phases unfreeze new modules.
 
-    Resets `pg['lr']` and `pg['initial_lr']` from cfg before rebuilding
-    so the new cosine has the correct amplitude for the current phase.
+    The function is preserved (and still called by the resume + fork
+    paths) only to rebroadcast the phase LR onto the optimizer —
+    never to instantiate a scheduler.
     """
     cfg = get_phase_config(start_epoch)
-    phase_start, phase_end = cfg['epochs']
-    T_max = phase_end - phase_start + 1
     base_lr = cfg['lr']
 
+    # Re-apply the per-group multiplier captured by build_param_groups.
     for pg in optimizer.param_groups:
-        pg['lr'] = base_lr
-        pg['initial_lr'] = base_lr
+        mult = pg.get('_lr_multiplier', 1.0)
+        pg['lr'] = base_lr * mult
+        pg['initial_lr'] = pg['lr']
 
-    scheduler = CosineAnnealingLR(optimizer, T_max=T_max)
-    # After init, last_epoch=0 and lr==base_lr. We need to advance to the
-    # position within the current phase. start_epoch is the NEXT epoch to
-    # run; the cosine value used during that epoch is at last_epoch =
-    # (start_epoch - phase_start) — i.e. one cosine.step() per already-
-    # completed epoch within this phase.
-    offset = max(0, start_epoch - phase_start)
-    for _ in range(offset):
-        scheduler.step()
+    log_fn(f"  [scheduler] constant-LR mode (rework spec): "
+           f"start_epoch={start_epoch}, base_lr={base_lr:.2e}, "
+           f"groups={len(optimizer.param_groups)} (no scheduler)")
+    return None
 
-    log_fn(f"  [scheduler] rebuilt from current PHASE_CONFIG: "
-           f"phase epochs=({phase_start},{phase_end}), T_max={T_max}, "
-           f"base_lr={base_lr:.2e}, advanced {offset} step(s) → "
-           f"lr={optimizer.param_groups[0]['lr']:.2e}")
-    return scheduler
+
+# ── Parameter-group LR multipliers (LR Rework, Phase 2 of doc) ──────
+#
+# Each module gets a base-LR multiplier matched to its optimization
+# regime. Pretrained backbone weights need conservative updates;
+# newly initialised heads need aggressive updates; cross-view
+# attention is randomly initialised and must catch up to the
+# already-warm gaze geometry head.
+LR_MULTIPLIERS = {
+    'backbone': 0.1,        # shared_stem + every *_branch.encoder
+    'landmark': 0.2,        # FPN + heatmap/offset heads
+    'pose':     0.5,        # interpolated between landmark and gaze
+    'gaze':     1.0,        # GeometricGazeHead, IrisMeshHead, MacroGazeHead, ...
+    'crossview': 1.5,       # CrossViewAttention + CameraEmbedding
+}
+
+
+def _classify_param(name: str) -> str:
+    """Map a parameter's dotted name to one of the LR_MULTIPLIERS keys."""
+    # Backbone weights live in shared_stem AND each *_branch.encoder
+    # (the M3 s2+s3 stages); both share the pretrained-RepNeXt regime.
+    if name.startswith('shared_stem'):
+        return 'backbone'
+    if name.startswith('landmark_branch.encoder'):
+        return 'backbone'
+    if name.startswith('pose_branch.encoder'):
+        return 'backbone'
+    if name.startswith('gaze_branch.encoder'):
+        return 'backbone'
+    # Branch-specific heads (everything in the branch except the encoder)
+    if name.startswith('landmark_branch.'):
+        return 'landmark'
+    if name.startswith('pose_branch.'):
+        return 'pose'
+    if name.startswith('gaze_branch.'):
+        return 'gaze'
+    if name.startswith('cross_view_attn') or name.startswith('camera_embedding'):
+        return 'crossview'
+    # Fall back to gaze (1.0×) for any unclassified parameter — better
+    # than silently dropping it.
+    return 'gaze'
+
+
+def build_param_groups(model, base_lr):
+    """
+    Group ``model.named_parameters()`` by optimization regime and
+    attach an ``_lr_multiplier`` to each group so resume/fork paths
+    can rebroadcast the per-group LR after a checkpoint load.
+
+    Only ``requires_grad=True`` parameters are included — frozen
+    modules MUST NOT carry stale Adam moments across phase
+    transitions (rework doc, "Optimizer Reinitialization Across
+    Phases").
+
+    Returns a list compatible with ``torch.optim.AdamW(param_groups)``.
+    """
+    buckets: dict[str, list] = {k: [] for k in LR_MULTIPLIERS}
+    unwrapped = _unwrap_raynet(model)
+    for name, p in unwrapped.named_parameters():
+        if not p.requires_grad:
+            continue
+        cls = _classify_param(name)
+        buckets[cls].append(p)
+    groups = []
+    for name, params in buckets.items():
+        if not params:
+            continue
+        mult = LR_MULTIPLIERS[name]
+        groups.append({
+            'params': params,
+            'lr': base_lr * mult,
+            'initial_lr': base_lr * mult,
+            '_lr_multiplier': mult,
+            '_group_name': name,
+        })
+    return groups
+
+
+def build_phase_optimizer(model, cfg, log_fn=print):
+    """
+    Build a fresh AdamW for the current phase from ``trainable_only``
+    parameter groups with module-specific LR multipliers.
+
+    Per the rework doc: rebuild on every phase transition so frozen
+    modules don't carry stale Adam first/second moments and newly
+    unfrozen modules don't inherit decayed LRs.
+    """
+    groups = build_param_groups(model, base_lr=cfg['lr'])
+    opt = optim.AdamW(groups, betas=(0.5, 0.95), weight_decay=1e-4)
+    if log_fn is not None:
+        summary = ', '.join(
+            f"{g['_group_name']}={g['lr']:.2e}({len(g['params'])}p)"
+            for g in groups
+        )
+        log_fn(f"  [optimizer] rebuilt for phase (constant LR): "
+               f"base_lr={cfg['lr']:.2e}; {summary}")
+    return opt
 
 
 def _filter_compatible_state(src_sd, target_sd):
@@ -1218,19 +1319,13 @@ def train(args):
     if args.resume and ckpt_mgr is not None:
         if is_main:
             print(f"Resuming from run {ckpt_mgr.run_id} ...")
-        # We need an optimizer to exist before resume_state. Build a
-        # bare AdamW; the LR will be reset to the correct phase value by
-        # `_rebuild_scheduler_for_resume` below — the value passed here
-        # is irrelevant.
-        # NOTE: scheduler is intentionally NOT created here and NOT
-        # passed to resume_state. The saved scheduler state can be stale
-        # if PHASE_CONFIG epoch counts changed between runs (T_max in the
-        # checkpoint clashes with the new T_max, causing the cosine to
-        # wrap past pi — see _rebuild_scheduler_for_resume docstring).
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=get_phase_config(1)['lr'],
-            betas=(0.5, 0.95), weight_decay=1e-4,
+        # We need an optimizer to exist before resume_state. Build it
+        # with the v6.2.2 param-group multipliers; the per-group LR is
+        # rebroadcast from current PHASE_CONFIG by
+        # `_rebuild_scheduler_for_resume` below.
+        optimizer = build_phase_optimizer(
+            model, get_phase_config(1),
+            log_fn=(print if is_main else (lambda *_: None)),
         )
 
         resume_file = getattr(args, 'resume_from', None)
@@ -1331,9 +1426,10 @@ def train(args):
             start_epoch = 1
             current_phase = 0
             phase1_cfg = get_phase_config(1)
-            optimizer = optim.AdamW(model.parameters(),
-                                    lr=phase1_cfg['lr'],
-                                    betas=(0.5, 0.95), weight_decay=1e-4)
+            optimizer = build_phase_optimizer(
+                model, phase1_cfg,
+                log_fn=(print if is_main else (lambda *_: None)),
+            )
             # The param count may not match after an architecture change.
             # PyTorch's optimizer.load_state_dict asserts per-group param
             # count equality, so we check first and fall back to a fresh
@@ -1364,9 +1460,10 @@ def train(args):
             current_phase = get_phase(src_epoch)
             fork_phase_cfg = get_phase_config(src_epoch)
 
-            optimizer = optim.AdamW(model.parameters(),
-                                    lr=fork_phase_cfg['lr'],
-                                    betas=(0.5, 0.95), weight_decay=1e-4)
+            optimizer = build_phase_optimizer(
+                model, fork_phase_cfg,
+                log_fn=(print if is_main else (lambda *_: None)),
+            )
 
             # Same guard as the cross-stage path — if the model changed
             # shape the saved optimizer state can't load.
@@ -1505,33 +1602,27 @@ def train(args):
 
             phase_start, phase_end = cfg['epochs']
 
-            if optimizer is None:
-                # First phase of the stage: create fresh optimizer
-                optimizer = optim.AdamW(
-                    model.parameters(),
-                    lr=cfg['lr'],
-                    betas=(0.5, 0.95),
-                    weight_decay=1e-4,
-                )
-                if is_main:
-                    print(f"  Created new AdamW optimizer (lr={cfg['lr']})")
-            else:
-                # Subsequent phases: carry over optimizer state (momentum +
-                # adaptive second-moment estimates), only update the LR.
-                # Recreating AdamW here would zero out m and v, causing a
-                # destructive transient: raw-gradient steps at peak LR with
-                # no per-parameter scaling — the "phase shock" that wastes
-                # ~4 epochs recovering each time.
-                for pg in optimizer.param_groups:
-                    pg['lr'] = cfg['lr']
-                    pg['initial_lr'] = cfg['lr']  # CosineAnnealingLR reads this
-                if is_main:
-                    print(f"  Carried over optimizer state, updated LR → {cfg['lr']}")
-
-            scheduler = CosineAnnealingLR(
-                optimizer,
-                T_max=phase_end - phase_start + 1,
+            # v6.2.2 — LR Management Rework: rebuild a *fresh* AdamW on
+            # every phase transition over only the trainable params,
+            # using module-specific LR multipliers. This eliminates two
+            # historic failure modes:
+            #   1. Stale Adam moments on previously-frozen modules
+            #      driving destabilised gradients on unfreeze.
+            #   2. Newly-unfrozen modules inheriting cosine-decayed LRs
+            #      from the previous phase.
+            # The replaced "carry-over" path optimised for momentum
+            # continuity but routinely hurt the very modules a phase
+            # transition is meant to adapt — see the rework doc for
+            # the diagnosis.
+            optimizer = build_phase_optimizer(
+                model, cfg,
+                log_fn=(print if is_main else (lambda *_: None)),
             )
+
+            # Constant-LR mode (rework Preferred Option for P1/P3, plus
+            # the user's override extending it to P2). No scheduler is
+            # constructed; per-epoch scheduler.step() is gated below.
+            scheduler = None
 
         active_train_loader = train_loader_mv
         active_val_loader = val_loader
@@ -1578,8 +1669,9 @@ def train(args):
             n_views=active_n_views,
         )
 
-        # Step scheduler
-        scheduler.step()
+        # Step scheduler (constant-LR mode: scheduler is None; no-op).
+        if scheduler is not None:
+            scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
 
         # All ranks finish the epoch before the main process saves / uploads.

@@ -10,6 +10,32 @@
 > segmenter + torsion stages). Also ships the OpenEDS MDS converter parallel
 > to the GazeGene one so both pipelines share streaming ergonomics.
 
+> **v6.2.2 LR Management Rework (2026-05-05).** Fixes the landmark-loss
+> plateau identified in `run_20260504_230121` (val_landmark_px stalled at
+> ~2.28 px from epoch 7 onward). See `docs/learning_rate_management_rework_documentation.md`
+> for the full rationale; the implementation lives in `RayNet/train.py`:
+>
+> - **Constant LR per phase.** P1=1e-3, P2=5e-4, P3=5e-5 — held flat
+>   across the entire phase. Cosine annealing decayed effective LRs to
+>   ~0 within each short curriculum phase, starving the very modules a
+>   phase transition is meant to adapt.
+> - **Optimizer rebuild on every phase transition.** New helper
+>   `build_phase_optimizer` constructs a fresh `AdamW` over only the
+>   trainable params at phase boundaries. Frozen modules no longer
+>   carry stale Adam first/second moments across freeze/unfreeze
+>   cycles; newly unfrozen modules no longer inherit decayed LRs.
+> - **Per-module LR multipliers.** New helper `build_param_groups`
+>   assigns module-class multipliers: backbone 0.1×, landmark heads
+>   0.2×, pose heads 0.5×, gaze heads 1.0×, cross-view attention
+>   1.5×. Pretrained weights get conservative updates; randomly
+>   initialised attention catches up.
+> - **Scheduler stepping gated.** Per-epoch `scheduler.step()` is now
+>   conditional on `scheduler is not None`. Resume/fork paths broadcast
+>   per-group LRs from the current `PHASE_CONFIG` and return None
+>   instead of instantiating a stale cosine.
+>
+> No reshard required for this change — pure training-loop refactor.
+
 > **v6.2.1 hotfix (2026-05-05).** Two latent 448-resolution bugs found while
 > investigating the regression in `run_20260504_182102` (val_landmark_px=2.91 px
 > vs historical sub-pixel):
