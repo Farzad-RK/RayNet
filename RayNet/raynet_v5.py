@@ -319,8 +319,23 @@ class FPNLandmarkBranch(nn.Module):
         self.fpn = FeaturePyramidNetwork(in_ch, out_ch=fpn_ch)
 
         self.coord_att = CoordinateAttention(fpn_ch)
-        self.heatmap = nn.Conv2d(fpn_ch, n_landmarks, 1)
-        self.offset = nn.Conv2d(fpn_ch, n_landmarks * 2, 1)
+        # Per-head Conv-BN-ReLU refinement matches the
+        # ablation/4th_april IrisPupilLandmarkHead (heads.py:24-33)
+        # that hit 0.53 px val_landmark_px. Each head gets its own BN
+        # so heatmap and offset normalisation statistics don't share.
+        head_mid = 128
+        self.heatmap = nn.Sequential(
+            nn.Conv2d(fpn_ch, head_mid, 3, padding=1),
+            nn.BatchNorm2d(head_mid),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(head_mid, n_landmarks, 1),
+        )
+        self.offset = nn.Sequential(
+            nn.Conv2d(fpn_ch, head_mid, 3, padding=1),
+            nn.BatchNorm2d(head_mid),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(head_mid, n_landmarks * 2, 1),
+        )
 
     def forward(self, s0, s1, s2, s3):
         feats = self.fpn([s0, s1, s2, s3])

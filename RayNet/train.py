@@ -134,7 +134,7 @@ PHASE_CONFIG = {
         'lam_ray': 0.0,
         'lam_reproj': 0.0,
         'lam_mask': 0.0,
-        'lam_pose': 0.5,
+        'lam_pose': 0.0,         # pose deferred — strict landmark warmup
         'lam_trans': 0.0,        # v6.2 — pose translation head removed
         'lam_iris_seg': 0.0,    # foveal texture → OpenEDS-only stage
         'lam_eyeball_seg': 0.0, # foveal texture → OpenEDS-only stage
@@ -160,9 +160,18 @@ PHASE_CONFIG = {
         'lr': 1e-3,
         'sigma': 2.0,
         'multiview': False,
-        'freeze_set': 'gaze_only',  # see apply_phase_freeze
-        'description': 'V6-P1: skeleton geometry (landmark + pose). '
-                       'Foveal seg deferred to OpenEDS stage.',
+        'freeze_set': 'landmark_only',  # strict isolation — pose+gaze frozen
+        # April reference (run_20260405_025128) trained the entire model
+        # at the full 1e-3 in Phase 1 — no per-module attenuation. The
+        # default LR_MULTIPLIERS bucket the M3 backbone at 0.1× and the
+        # landmark heads at 0.2×, dropping their effective LRs to 1e-4
+        # and 2e-4 respectively. That's a 5–10× starvation on exactly
+        # the params that need to fit the heatmap. Override to 1.0×
+        # uniformly for Phase 1 only; Phases 2/3 omit this key and
+        # inherit the tiered defaults.
+        'lr_multipliers': 'uniform',
+        'description': 'V6-P1: landmark-only warmup '
+                       '(pose + gaze branches frozen, BN stats stable).',
     },
     # ---- Phase 2 — monocular gaze fine-tune. Stem/lm/pose frozen. ----
     # Single-view only. Skeleton geometry only: gaze direction +
@@ -296,6 +305,20 @@ FREEZE_SETS = {
         # AERI head + cross_view_attn + camera_embedding intentionally
         # NOT frozen — AERI is supervised by seg loss; cross-view modules
         # see no gradient when n_views==1 anyway.
+    },
+    # P1-strict — landmark-only warmup. Mirrors ablation/4th_april where
+    # Phase 1 supervised landmarks alone and reached 0.60 px val by
+    # epoch 5. Both pose_branch and gaze_branch are frozen so their BN
+    # running stats stop drifting, no contention reaches the optimizer
+    # step, and weight decay can't shrink un-supervised pose params.
+    # Only shared_stem + landmark_branch (encoder + FPN + heads) train.
+    'landmark_only': {
+        'freeze_modules': [
+            'pose_branch',
+            'gaze_branch',
+            'cross_view_attn',
+            'camera_embedding',
+        ],
     },
     # P2 — face path frozen (stem + landmark + pose). Gaze + AERI train.
     'face_only': {
@@ -502,7 +525,7 @@ def _classify_param(name: str) -> str:
     return 'gaze'
 
 
-def build_param_groups(model, base_lr):
+def build_param_groups(model, base_lr, multipliers=None):
     """
     Group ``model.named_parameters()`` by optimization regime and
     attach an ``_lr_multiplier`` to each group so resume/fork paths
@@ -513,9 +536,17 @@ def build_param_groups(model, base_lr):
     transitions (rework doc, "Optimizer Reinitialization Across
     Phases").
 
+    Args:
+        multipliers: optional dict overriding ``LR_MULTIPLIERS`` for
+            this phase. Phase 1 (landmark warmup) passes an all-ones
+            map to match the April reference run, where the entire
+            model trained at the full ``cfg['lr']``. Later phases
+            omit this and inherit the tiered defaults.
+
     Returns a list compatible with ``torch.optim.AdamW(param_groups)``.
     """
-    buckets: dict[str, list] = {k: [] for k in LR_MULTIPLIERS}
+    mult_map = multipliers if multipliers is not None else LR_MULTIPLIERS
+    buckets: dict[str, list] = {k: [] for k in mult_map}
     unwrapped = _unwrap_raynet(model)
     for name, p in unwrapped.named_parameters():
         if not p.requires_grad:
@@ -526,7 +557,7 @@ def build_param_groups(model, base_lr):
     for name, params in buckets.items():
         if not params:
             continue
-        mult = LR_MULTIPLIERS[name]
+        mult = mult_map[name]
         groups.append({
             'params': params,
             'lr': base_lr * mult,
@@ -568,8 +599,20 @@ def build_phase_optimizer(model, cfg, log_fn=print):
     Per the rework doc: rebuild on every phase transition so frozen
     modules don't carry stale Adam first/second moments and newly
     unfrozen modules don't inherit decayed LRs.
+
+    Honors ``cfg['lr_multipliers']`` if present:
+      - 'uniform' (string sentinel): all groups → 1.0× (April reference,
+        Phase 1 landmark warmup runs the whole model at full base LR).
+      - dict: explicit per-bucket overrides.
+      - None / missing: inherit the tiered ``LR_MULTIPLIERS`` defaults.
     """
-    groups = build_param_groups(model, base_lr=cfg['lr'])
+    raw_mult = cfg.get('lr_multipliers', None)
+    if raw_mult == 'uniform':
+        multipliers = {k: 1.0 for k in LR_MULTIPLIERS}
+    else:
+        multipliers = raw_mult  # dict or None
+    groups = build_param_groups(model, base_lr=cfg['lr'],
+                                multipliers=multipliers)
     opt = optim.AdamW(groups, betas=(0.5, 0.95), weight_decay=1e-4)
     if log_fn is not None:
         summary = ', '.join(
