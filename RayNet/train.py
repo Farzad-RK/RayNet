@@ -537,6 +537,29 @@ def build_param_groups(model, base_lr):
     return groups
 
 
+def get_base_lr(optimizer) -> float:
+    """Return the optimizer's *base* LR (the 1.0× / 'gaze' group).
+
+    With v6.2.2 param-group multipliers, ``optimizer.param_groups[0]``
+    is the *backbone* group (0.1× multiplier), so logging it as the
+    canonical run LR was misleading — at base 1e-3 the CSV reported
+    1e-4 because backbone is group 0. This helper resolves to the
+    group whose multiplier is exactly 1.0 (the 'gaze' bucket); when no
+    such group exists (e.g. a freeze pattern that excludes gaze) it
+    falls back to the maximum LR across groups, which always equals
+    the configured ``cfg['lr']`` because no multiplier exceeds the
+    crossview 1.5× scaling for the same base LR.
+    """
+    base = None
+    max_lr = 0.0
+    for pg in optimizer.param_groups:
+        mult = pg.get('_lr_multiplier', 1.0)
+        max_lr = max(max_lr, pg['lr'] / max(mult, 1e-12))
+        if abs(mult - 1.0) < 1e-9 and base is None:
+            base = pg['lr']
+    return base if base is not None else max_lr
+
+
 def build_phase_optimizer(model, cfg, log_fn=print):
     """
     Build a fresh AdamW for the current phase from ``trainable_only``
@@ -892,7 +915,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, cfg,
                 f"{trans_val:.6f}",
                 f"{iris_seg_val:.6f}",
                 f"{eye_seg_val:.6f}",
-                f"{optimizer.param_groups[0]['lr']:.8f}",
+                f"{get_base_lr(optimizer):.8f}",
             ])
 
         # Progress logging
@@ -1672,7 +1695,9 @@ def train(args):
         # Step scheduler (constant-LR mode: scheduler is None; no-op).
         if scheduler is not None:
             scheduler.step()
-        current_lr = optimizer.param_groups[0]['lr']
+        # v6.2.2: report the BASE LR (gaze 1.0× group), not group 0
+        # which is the backbone bucket at 0.1× the configured cfg['lr'].
+        current_lr = get_base_lr(optimizer)
 
         # All ranks finish the epoch before the main process saves / uploads.
         accelerator.wait_for_everyone()
