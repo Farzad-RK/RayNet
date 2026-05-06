@@ -40,12 +40,13 @@ Usage:
 """
 
 import argparse
+import math
 import os
 import csv
 import logging
 import torch
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 from torch.amp import GradScaler, autocast
 import numpy as np
 from datetime import datetime
@@ -134,7 +135,14 @@ PHASE_CONFIG = {
         'lam_ray': 0.0,
         'lam_reproj': 0.0,
         'lam_mask': 0.0,
-        'lam_pose': 0.0,         # pose deferred — strict landmark warmup
+        # Pose trains alongside landmark in Phase 1. The
+        # run_20260505_210926 retrospective showed that disabling pose
+        # did NOT improve val_landmark_px (still plateaued at ~1.8 px),
+        # so the strict-isolation hypothesis is rejected. Pose has its
+        # own gradient-isolated branch + own BN modules; sharing the
+        # optimizer step with landmark does not contaminate the
+        # landmark-owned shared stem.
+        'lam_pose': 0.5,
         'lam_trans': 0.0,        # v6.2 — pose translation head removed
         'lam_iris_seg': 0.0,    # foveal texture → OpenEDS-only stage
         'lam_eyeball_seg': 0.0, # foveal texture → OpenEDS-only stage
@@ -152,26 +160,35 @@ PHASE_CONFIG = {
         'lam_gaze_macro': 0.0,
         # Per-subject eyeball radius head — same gaze-branch ownership.
         'lam_eyeball_radius': 0.0,
-        # v6.2.2 (LR Rework): constant LR for the entire phase.
-        # Cosine decay to ~0 within the 15-epoch P1 budget starved
-        # geometry bootstrap of optimization energy and was the
-        # dominant cause of the landmark-loss plateau visible in
-        # run_20260504_230121.
+        # Cosine decay from `lr` to `lr_min` over the phase, applied
+        # multiplicatively to each param-group's initial LR (so the
+        # backbone/head LR ratios from `lr_multipliers` are preserved
+        # all the way down). Floor at 1e-4 — the April reference held
+        # 1e-4–1e-3 throughout P1 and that's where landmark gains
+        # accumulated. Constant 1e-3 in run_20260505_210926 stalled at
+        # ~1.8 px because the model couldn't fine-tune past the
+        # initial coarse fit.
         'lr': 1e-3,
-        'sigma': 2.0,
+        'lr_min': 1e-4,
+        # Per-epoch sigma anneal across the phase: heatmap GT tightens
+        # from σ=2 (forgiving, geometry bootstrap) to σ=1 (sub-pixel
+        # target). Linear interpolation in get_phase_config(epoch).
+        # Replaces the constant σ=2 that capped achievable precision.
+        'sigma_start': 2.0,
+        'sigma_end': 1.0,
         'multiview': False,
-        'freeze_set': 'landmark_only',  # strict isolation — pose+gaze frozen
-        # April reference (run_20260405_025128) trained the entire model
-        # at the full 1e-3 in Phase 1 — no per-module attenuation. The
-        # default LR_MULTIPLIERS bucket the M3 backbone at 0.1× and the
-        # landmark heads at 0.2×, dropping their effective LRs to 1e-4
-        # and 2e-4 respectively. That's a 5–10× starvation on exactly
-        # the params that need to fit the heatmap. Override to 1.0×
-        # uniformly for Phase 1 only; Phases 2/3 omit this key and
-        # inherit the tiered defaults.
+        'freeze_set': 'gaze_only',  # gaze frozen; landmark + pose train
+        # April reference (run_20260405_025128) trained the entire
+        # model at the full 1e-3 in Phase 1 — no per-module
+        # attenuation. The default LR_MULTIPLIERS bucket the M3
+        # backbone at 0.1× and the landmark heads at 0.2×, dropping
+        # their effective LRs to 1e-4 and 2e-4 respectively (5–10×
+        # starvation on exactly the params that fit the heatmap).
+        # Phase 2/3 omit this key and inherit the tiered defaults.
         'lr_multipliers': 'uniform',
-        'description': 'V6-P1: landmark-only warmup '
-                       '(pose + gaze branches frozen, BN stats stable).',
+        'description': 'V6-P1: landmark + head-pose warmup '
+                       '(gaze frozen). Cosine LR 1e-3 → 1e-4, '
+                       'sigma 2.0 → 1.0.',
     },
     # ---- Phase 2 — monocular gaze fine-tune. Stem/lm/pose frozen. ----
     # Single-view only. Skeleton geometry only: gaze direction +
@@ -215,14 +232,14 @@ PHASE_CONFIG = {
         # independent of the optical/visual branches.
         'lam_gaze_macro': 1.0,
         'lam_eyeball_radius': 0.2,        # cm-scale L1; small weight is plenty
-        # v6.2.2 (LR Rework): constant LR for the entire phase. P2 is
-        # the high-plasticity adaptation phase — newly unfrozen gaze
-        # branch + iris-mesh + macro-gaze + visual-axis heads all need
-        # sustained optimization energy, which cosine decay starved.
-        # 5e-4 matches the rework doc's OneCycleLR max_lr but is held
-        # constant throughout the phase per the user's note that
-        # constant LR is preferred for our learning process.
+        # P2 LR schedule: cosine decay 5e-4 → 5e-5 over the 15-epoch
+        # phase. Floor is one decade down — enough decay to settle the
+        # newly-unfrozen heads without diminishing returns. Per-group
+        # multipliers (LR_MULTIPLIERS) preserve the backbone-vs-head
+        # ratio: backbone group decays 5e-5 → 5e-6, gaze group decays
+        # 5e-4 → 5e-5, etc.
         'lr': 5e-4,
+        'lr_min': 5e-5,
         'sigma': 1.5,
         'multiview': False,
         'freeze_set': 'face_only',  # freeze stem + landmark + pose
@@ -271,11 +288,15 @@ PHASE_CONFIG = {
         'lam_gaze_visual': 0.5,
         'lam_gaze_macro': 1.0,
         'lam_eyeball_radius': 0.2,
-        # v6.2.2 (LR Rework): constant LR for P3. The previous cosine
-        # decay on top of the already-low 5e-5 baseline produced
-        # effective LRs in [1e-6, 1e-7] — well below useful, the
-        # "double attenuation" the rework doc calls out.
+        # P3 LR schedule: cosine decay 5e-5 → 5e-6 over the 20-epoch
+        # phase. Floor preserves enough plasticity for the multi-view
+        # consistency loss to refine the basin discovered in P2
+        # without re-shaking it. The earlier "double attenuation" was
+        # caused by stacking cosine decay on top of an already-low
+        # base; here we keep the base modest (5e-5) and floor
+        # explicitly so per-group LRs never collapse below 5e-7.
         'lr': 5e-5,
+        'lr_min': 5e-6,
         'sigma': 1.0,
         'multiview': True,
         'freeze_set': 'face_kept',  # freeze stem + landmark, keep pose trainable
@@ -437,9 +458,29 @@ def get_scheduled_alpha(epoch):
 
 
 def get_phase_config(epoch):
-    """Get loss weights and hyperparams for the current epoch (returns a copy)."""
+    """Get loss weights and hyperparams for the current epoch (returns a copy).
+
+    If the phase config defines ``sigma_start`` + ``sigma_end`` (Phase 1
+    landmark warmup), the returned ``sigma`` is linearly interpolated
+    across the phase's epoch range:
+
+        sigma(e) = sigma_start + (sigma_end - sigma_start) * t
+        where t = (epoch - phase_start) / max(phase_end - phase_start, 1)
+
+    Tightening sigma during the warmup forces the heatmap GT to peak
+    progressively, which is required to drive sub-pixel localisation
+    — a constant σ=2 caps achievable precision regardless of LR.
+    """
     phase = get_phase(epoch)
-    return dict(PHASE_CONFIG[phase])
+    cfg = dict(PHASE_CONFIG[phase])
+
+    if 'sigma_start' in cfg and 'sigma_end' in cfg:
+        phase_start, phase_end = cfg['epochs']
+        span = max(phase_end - phase_start, 1)
+        t = max(0.0, min(1.0, (epoch - phase_start) / span))
+        cfg['sigma'] = cfg['sigma_start'] + t * (cfg['sigma_end'] - cfg['sigma_start'])
+
+    return cfg
 
 
 def _unwrap_raynet(model):
@@ -454,33 +495,40 @@ def _unwrap_raynet(model):
 
 def _rebuild_scheduler_for_resume(optimizer, start_epoch, log_fn=print):
     """
-    v6.2.2: constant-LR mode. Resets each param group's LR to the
-    target value derived from PHASE_CONFIG (re-applying the per-group
-    multiplier set by ``build_param_groups``) and returns ``None``.
+    Rebroadcast the resume phase's LR onto the optimizer and return a
+    fresh cosine-with-floor scheduler fast-forwarded to the resume
+    epoch. Returns None for phases that omit ``lr_min`` (constant-LR
+    mode), in which case the resumed LR is the phase's `lr` baseline.
 
-    Per the LR Management Rework, every phase now uses a constant
-    learning rate with no scheduler. Cosine annealing's near-zero
-    decay was the dominant source of the landmark-loss plateau and
-    of the optimization-energy starvation observed when curriculum
-    phases unfreeze new modules.
-
-    The function is preserved (and still called by the resume + fork
-    paths) only to rebroadcast the phase LR onto the optimizer —
-    never to instantiate a scheduler.
+    Resets each param group's LR to ``cfg['lr'] * multiplier`` so the
+    scheduler's LambdaLR multiplier (computed against ``initial_lr``)
+    starts from a known baseline regardless of what the saved
+    optimizer state set ``lr`` to. The fast-forward then advances the
+    scheduler by ``epoch_in_phase - 1`` steps so it sits where the
+    next training epoch expects.
     """
     cfg = get_phase_config(start_epoch)
     base_lr = cfg['lr']
 
-    # Re-apply the per-group multiplier captured by build_param_groups.
     for pg in optimizer.param_groups:
         mult = pg.get('_lr_multiplier', 1.0)
         pg['lr'] = base_lr * mult
         pg['initial_lr'] = pg['lr']
 
-    log_fn(f"  [scheduler] constant-LR mode (rework spec): "
-           f"start_epoch={start_epoch}, base_lr={base_lr:.2e}, "
-           f"groups={len(optimizer.param_groups)} (no scheduler)")
-    return None
+    sched = build_phase_scheduler(optimizer, cfg, log_fn=log_fn)
+    if sched is None:
+        log_fn(f"  [scheduler] constant-LR mode for resume: "
+               f"start_epoch={start_epoch}, base_lr={base_lr:.2e}, "
+               f"groups={len(optimizer.param_groups)} (no scheduler)")
+        return None
+
+    phase_start, _ = cfg['epochs']
+    steps_into_phase = max(0, start_epoch - phase_start)
+    for _ in range(steps_into_phase):
+        sched.step()
+    log_fn(f"  [scheduler] resume fast-forward: "
+           f"start_epoch={start_epoch}, advanced {steps_into_phase} steps")
+    return sched
 
 
 # ── Parameter-group LR multipliers (LR Rework, Phase 2 of doc) ──────
@@ -619,9 +667,59 @@ def build_phase_optimizer(model, cfg, log_fn=print):
             f"{g['_group_name']}={g['lr']:.2e}({len(g['params'])}p)"
             for g in groups
         )
-        log_fn(f"  [optimizer] rebuilt for phase (constant LR): "
+        lr_mode = 'cosine' if cfg.get('lr_min') is not None else 'constant'
+        log_fn(f"  [optimizer] rebuilt for phase ({lr_mode} LR): "
                f"base_lr={cfg['lr']:.2e}; {summary}")
     return opt
+
+
+def build_phase_scheduler(optimizer, cfg, log_fn=print):
+    """
+    Build a per-phase cosine-with-floor scheduler.
+
+    Returns a ``LambdaLR`` that multiplies each param group's
+    ``initial_lr`` by a single cosine factor decaying from 1.0 to
+    ``floor_ratio = lr_min / lr`` across the phase's epoch range.
+    Because the multiplier is shared across groups, the relative
+    backbone-vs-head LR ratios from ``LR_MULTIPLIERS`` are preserved
+    all the way down to the floor — backbone group decays from
+    ``lr * mult`` to ``lr_min * mult``, gaze group from ``lr`` to
+    ``lr_min``, etc.
+
+    Returns ``None`` if ``cfg['lr_min']`` is unset (callers treat
+    this as constant-LR mode).
+
+    The scheduler is stepped once per epoch in the main training
+    loop. It is rebuilt on every phase transition alongside the
+    optimizer; resume rebuilds it from the active phase config and
+    fast-forwards by ``last_epoch = epoch_in_phase - 1``.
+    """
+    lr_min = cfg.get('lr_min')
+    if lr_min is None:
+        return None
+
+    lr_max = cfg['lr']
+    if lr_max <= 0 or lr_min >= lr_max:
+        return None
+
+    phase_start, phase_end = cfg['epochs']
+    total_steps = max(phase_end - phase_start + 1, 1)
+    floor_ratio = lr_min / lr_max
+
+    def lr_lambda(step):
+        # `step` counts scheduler.step() calls (one per epoch). At
+        # step=0 we sit at lr_max; at step=total_steps-1 we sit at
+        # lr_min. Clamp to handle resume past phase end gracefully.
+        s = max(0, min(step, total_steps - 1))
+        cos = 0.5 * (1 + math.cos(math.pi * s / max(total_steps - 1, 1)))
+        return floor_ratio + (1 - floor_ratio) * cos
+
+    sched = LambdaLR(optimizer, lr_lambda)
+    if log_fn is not None:
+        log_fn(f"  [scheduler] cosine-with-floor: "
+               f"{lr_max:.2e} → {lr_min:.2e} over {total_steps} epochs "
+               f"(floor_ratio={floor_ratio:.3g})")
+    return sched
 
 
 def _filter_compatible_state(src_sd, target_sd):
@@ -1685,10 +1783,24 @@ def train(args):
                 log_fn=(print if is_main else (lambda *_: None)),
             )
 
-            # Constant-LR mode (rework Preferred Option for P1/P3, plus
-            # the user's override extending it to P2). No scheduler is
-            # constructed; per-epoch scheduler.step() is gated below.
-            scheduler = None
+            # Cosine-with-floor scheduler when ``cfg['lr_min']`` is set
+            # (current default for P1/P2/P3). Returns None for any
+            # phase that omits ``lr_min`` — the loop's per-epoch
+            # ``scheduler.step()`` is gated on `is not None` below, so
+            # constant-LR phases keep working.
+            scheduler = build_phase_scheduler(
+                optimizer, cfg,
+                log_fn=(print if is_main else (lambda *_: None)),
+            )
+
+            # Resume case: if we're entering this phase mid-way (e.g.
+            # restarting at epoch 5 of a phase that begins at 1),
+            # fast-forward the scheduler so it sits at the correct
+            # cosine point. `epoch` is the upcoming training epoch.
+            if scheduler is not None:
+                steps_into_phase = max(0, epoch - phase_start)
+                for _ in range(steps_into_phase):
+                    scheduler.step()
 
         active_train_loader = train_loader_mv
         active_val_loader = val_loader
@@ -1943,23 +2055,24 @@ def _create_mds_mv_loader(args, hw):
 
     from torchvision import transforms as T
 
-    # Normalize to ImageNet stats (applied to BOTH train and val so that
-    # the shared stem's BN running_mean/var — calibrated on ColorJitter'd
-    # training images — match the activation scale seen at val time.
-    # Without this, the jitter ±40% brightness/contrast widens the training
-    # pixel variance relative to clean val images; the stem's BN running_var
-    # grows to absorb that extra variance, then attenuates clean val
-    # activations by the corresponding factor — degrading both landmark and
-    # gaze metrics progressively with each epoch.
+    # Normalize to ImageNet stats (applied to BOTH train and val).
+    #
+    # Per the run_20260505_210926 retrospective: GazeGene face crops are
+    # already augmented at synthesis time (per the paper's Sec 4.1.3
+    # cross-domain protocol). Layering ColorJitter ±40% +
+    # RandomAffine(translate=0.05) on top introduces a train/val
+    # distribution shift that is the dominant cause of the Phase 2
+    # train_total ≫ val_total inversion (e.g. ep16: train 13.5 vs val
+    # 2.17). With both branches seeing the same Normalize-only
+    # pipeline, the shared-stem BN running stats track the val
+    # distribution and the gap collapses.
+    #
+    # Eyelid occlusion remains opt-in via --eyelid_occlusion_p — that
+    # is a targeted AERI-robustness augment, not generic colour jitter.
     normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
                             std=[0.229, 0.224, 0.225])
 
-    train_transform = T.Compose([
-        T.ColorJitter(brightness=0.4, contrast=0.4,
-                      saturation=0.2, hue=0.1),
-        T.RandomAffine(degrees=0, translate=(0.05, 0.05)),
-        normalize,
-    ])
+    train_transform = normalize
     val_transform = normalize
 
     # TriCam: keep only cams in TRICAM_IDS. The streaming loader fetches

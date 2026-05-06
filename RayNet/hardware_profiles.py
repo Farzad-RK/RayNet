@@ -170,7 +170,7 @@ HARDWARE_PROFILES = {
         'amp': True,
         'amp_dtype': 'bfloat16',    # BF16: same range as FP32
         'grad_accum_steps': 1,      # effective batch = 1152
-        'compile_model': False,
+        'compile_model': True,
         'tf32': True,
         'prefetch_factor': 4,
         'persistent_workers': True,
