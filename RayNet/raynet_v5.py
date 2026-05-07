@@ -227,15 +227,17 @@ class FeaturePyramidNetwork(nn.Module):
             )
             for c in in_channels
         ])
-        # Top-down smoothing — applied after lateral + upsample sum.
-        # The deepest level (T_5) also passes through one 3×3 for symmetry.
+        # Top-down smoothing — applied after each lateral + upsample
+        # sum. There are `len(in_channels) - 1` such sums (T4, T3, T2);
+        # T5 is the raw lateral L5 with no extra 3×3, matching the
+        # ablation/4th_april PANet that produced 0.53 px val_landmark.
         self.smooth_td = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
                 nn.BatchNorm2d(out_ch),
                 nn.SiLU(inplace=True),
             )
-            for _ in in_channels
+            for _ in range(len(in_channels) - 1)
         ])
         # Stride-2 3×3 downsampling for the bottom-up path. One per
         # level transition (P2→P3, P3→P4, P4→P5).
@@ -262,12 +264,18 @@ class FeaturePyramidNetwork(nn.Module):
         L = [self.lateral[i](f) for i, f in enumerate(feats)]
         n = len(L)
 
-        # Top-down: P5 → P4 → P3 → P2.
+        # Top-down: P5 → P4 → P3 → P2. T5 = L5 (no smoothing). The
+        # April reference upsamples with mode='nearest' — bilinear
+        # smears the localisation peak across cells and was the
+        # dominant FPN-side regression vs the reference. smooth_td is
+        # indexed 0→T2-fusion, 1→T3-fusion, 2→T4-fusion (April's
+        # `top_down_convs[len-2-i]` ordering), so the highest-
+        # resolution fusion gets index 0 — matching ablation/4th_april
+        # exactly.
         T = [None] * n
-        T[n - 1] = self.smooth_td[n - 1](L[n - 1])
+        T[n - 1] = L[n - 1]
         for i in range(n - 2, -1, -1):
-            up = F.interpolate(T[i + 1], size=L[i].shape[2:],
-                               mode='bilinear', align_corners=False)
+            up = F.interpolate(T[i + 1], size=L[i].shape[2:], mode='nearest')
             T[i] = self.smooth_td[i](L[i] + up)
 
         # Bottom-up: P2 → P3 → P4 → P5.

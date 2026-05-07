@@ -121,17 +121,18 @@ def _build_K_frame(args, img_w, img_h):
 
 def load_model(args):
     """
-    Build RayNet v5 (Triple-M1) and load the trained state dict from the
+    Build RayNet v5 (Triple-M*) and load the trained state dict from the
     checkpoint. Backbone .pth weights are NOT required at inference —
-    every parameter is in the checkpoint.
+    every parameter is in the checkpoint, but the *architecture* must
+    match the training run (M1: 48/96/192/384 channels vs
+    M3: 64/128/256/512). Auto-detects the variant from a representative
+    checkpoint key when --backbone is left at 'auto'; falls back to the
+    explicit flag otherwise.
     """
     from RayNet.raynet_v5 import create_raynet_v5, device
 
-    model = create_raynet_v5(
-        backbone_weight_path=None,
-        n_landmarks=14,
-    )
-
+    # Materialise the checkpoint state dict before constructing the
+    # model so we can probe channel widths for backbone auto-detection.
     if args.checkpoint:
         state = torch.load(args.checkpoint, map_location=device,
                            weights_only=False)
@@ -147,6 +148,42 @@ def load_model(args):
         raise ValueError(
             "Provide --checkpoint (local) or --run_id + --ckpt_bucket (MinIO)")
 
+    raw_sd = state['model_state_dict'] if 'model_state_dict' in state else state
+
+    backbone = getattr(args, 'backbone', 'auto')
+    if backbone == 'auto':
+        # Probe a stage-3 weight to read the embed dim. Stage 3 is
+        # 384 (M1) or 512 (M3) — unambiguous.
+        probe = None
+        for k, v in raw_sd.items():
+            if k.endswith('shared_stem.stages.0.blocks.0.norm.weight') \
+                    or k.endswith('landmark_branch.encoder.stage3.blocks.1.channel_mixer.2.norm.weight') \
+                    or k.endswith('pose_branch.encoder.stage3.blocks.1.channel_mixer.2.norm.weight') \
+                    or k.endswith('gaze_branch.encoder.stage3.blocks.1.channel_mixer.2.norm.weight'):
+                probe = (k, tuple(v.shape))
+                break
+        if probe is None:
+            raise RuntimeError(
+                "Could not auto-detect backbone variant from checkpoint. "
+                "Pass --backbone {m1,m3} explicitly.")
+        ch = probe[1][0]
+        if ch == 384:
+            backbone = 'm1'
+        elif ch == 512:
+            backbone = 'm3'
+        else:
+            raise RuntimeError(
+                f"Unrecognised backbone width {ch} in {probe[0]}. "
+                "Expected 384 (m1) or 512 (m3). Pass --backbone explicitly.")
+        print(f"[backbone] auto-detected '{backbone}' from checkpoint "
+              f"(stage-3 width = {ch}).")
+
+    model = create_raynet_v5(
+        backbone_weight_path=None,
+        n_landmarks=14,
+        backbone=backbone,
+    )
+
     target = model._orig_mod if hasattr(model, '_orig_mod') else model
     if 'model_state_dict' in state:
         missing, unexpected = target.load_state_dict(
@@ -160,6 +197,27 @@ def load_model(args):
         if unexpected:
             print(f"  unexpected keys: {len(unexpected)} "
                   f"(first: {unexpected[:3]})")
+
+        # AERI provenance check. If the checkpoint's saved phase config
+        # never trained iris/eyeball segmentation, the mask heads emit
+        # whatever helped gaze loss indirectly — typically nonsense
+        # blobs covering most of the face. Warn loudly when --show_masks
+        # is set against such a checkpoint.
+        lam_iris = cfg.get('lam_iris_seg', None)
+        lam_eb = cfg.get('lam_eyeball_seg', None)
+        aeri_trained = ((lam_iris is not None and lam_iris > 0)
+                        or (lam_eb is not None and lam_eb > 0))
+        if getattr(args, 'show_masks', False) and not aeri_trained:
+            print(
+                "\n[warn] --show_masks was requested but the checkpoint's\n"
+                "       PHASE_CONFIG shows lam_iris_seg / lam_eyeball_seg\n"
+                "       were 0 throughout training (AERI segmentation\n"
+                "       deferred to an OpenEDS-only stage). The displayed\n"
+                "       masks will not correspond to iris/eyeball regions —\n"
+                "       they reflect untargeted gradients from the gaze\n"
+                "       saliency gate. Pass --no_masks to hide them, or\n"
+                "       train an OpenEDS stage with non-zero seg weights\n"
+                "       before relying on these overlays.\n")
     else:
         target.load_state_dict(state, strict=False)
         print("Loaded raw state dict")
@@ -168,11 +226,24 @@ def load_model(args):
     return model, device
 
 
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
 def preprocess_crop(crop_bgr, img_size=224):
-    """BGR uint8 face crop → (1, 3, 224, 224) tensor in [-1, 1]."""
+    """BGR uint8 face crop → (1, 3, img_size, img_size) ImageNet-normalised
+    tensor.
+
+    Must match the training transform (RayNet/train.py: train_transform
+    = val_transform = T.Normalize(mean=[0.485, 0.456, 0.406],
+    std=[0.229, 0.224, 0.225])). The earlier (img-0.5)/0.5 [-1, 1]
+    pipeline produced a per-channel mean/std mismatch of ~0.06/0.20,
+    which the shared-stem BN had no chance to absorb at inference and
+    silently degraded every downstream head.
+    """
     img = cv2.resize(crop_bgr, (img_size, img_size))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    img = (img - 0.5) / 0.5
+    img = (img - _IMAGENET_MEAN) / _IMAGENET_STD
     return torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
 
 
@@ -288,7 +359,8 @@ def mage_bbox_from_pixels(x1, y1, x2, y2, img_w, img_h, K_frame=None):
 # ─── Inference ──────────────────────────────────────────────────────
 
 @torch.no_grad()
-def run_inference(model, image_tensor, device, face_bbox=None):
+def run_inference(model, image_tensor, device, face_bbox=None,
+                  aeri_alpha=0.7):
     """
     Single-view forward pass through RayNet v5.
 
@@ -297,6 +369,9 @@ def run_inference(model, image_tensor, device, face_bbox=None):
             to PoseBranch's BoxEncoder. If None, BoxEncoder zeros out
             (its residual is zero-init so the model still works, just
             without the bbox prior in pose features).
+        aeri_alpha: AERI saliency-gate strength fed into the gaze
+            branch. Must match what the checkpoint trained against
+            (typically 0.4 in P1 → 0.7 by P2/P3). Defaults to 0.7.
     """
     image_tensor = image_tensor.to(device)
     bbox_t = None
@@ -305,9 +380,11 @@ def run_inference(model, image_tensor, device, face_bbox=None):
             if isinstance(face_bbox, np.ndarray) else face_bbox.to(device)
 
     out = model(image_tensor, n_views=1, face_bbox=bbox_t,
-                aeri_alpha=0.9)
+                aeri_alpha=aeri_alpha)
 
     landmarks = out['landmark_coords'][0].cpu().numpy()
+    landmark_heatmaps = out['landmark_heatmaps']  # (B, 14, H, W)
+    feat_h, feat_w = int(landmark_heatmaps.shape[-2]), int(landmark_heatmaps.shape[-1])
     iris_logits = out['iris_mask_logits'][0].cpu().numpy()
     eyeball_logits = out['eyeball_mask_logits'][0].cpu().numpy()
     eyeball_center = out['eyeball_center'][0].cpu().numpy()
@@ -315,10 +392,16 @@ def run_inference(model, image_tensor, device, face_bbox=None):
     gaze_vector = out['gaze_vector'][0].cpu().numpy()
     gaze_angles = out['gaze_angles'][0].cpu().numpy()
     pose_6d = out['pred_pose_6d'][0].cpu().numpy()
-    pose_t = out['pred_pose_t'][0].cpu().numpy()
+    # v6.2 removed the pose translation head (handled by Macro-Locator
+    # downstream). pred_pose_t is only present on legacy checkpoints.
+    pose_t = (out['pred_pose_t'][0].cpu().numpy()
+              if 'pred_pose_t' in out and out['pred_pose_t'] is not None
+              else None)
 
     return {
         'landmarks': landmarks,
+        'feat_h': feat_h,
+        'feat_w': feat_w,
         'iris_mask': iris_logits,
         'eyeball_mask': eyeball_logits,
         'eyeball_center': eyeball_center,   # (3,) cm, CCS
@@ -326,7 +409,7 @@ def run_inference(model, image_tensor, device, face_bbox=None):
         'gaze_vector': gaze_vector,
         'gaze_angles': gaze_angles,
         'pose_6d': pose_6d,
-        'pose_t': pose_t,
+        'pose_t': pose_t,                    # may be None on v6.2+ ckpts
     }
 
 
@@ -451,9 +534,17 @@ def draw_info_overlay(canvas, gaze_angles, pose_t, fps=None,
 
 # ─── Visualisation pipeline ─────────────────────────────────────────
 
-def visualize(canvas, preds, x1, y1, x2, y2, feat_size=56, show_masks=True):
-    """Annotate `canvas` with predictions for one face crop."""
+def visualize(canvas, preds, x1, y1, x2, y2, show_masks=True):
+    """Annotate `canvas` with predictions for one face crop.
+
+    Heatmap feature size is read from the model output dict
+    (`preds['feat_h']`, `preds['feat_w']`), so 224-input runs (56×56
+    P2) and 448-input runs (112×112 P2) both project landmarks back
+    to crop space correctly without any caller-side math.
+    """
     crop_w, crop_h = x2 - x1, y2 - y1
+    feat_h = preds.get('feat_h', 56)
+    feat_w = preds.get('feat_w', feat_h)
 
     if show_masks:
         overlay_mask(canvas, preds['eyeball_mask'], x1, y1, x2, y2,
@@ -461,9 +552,9 @@ def visualize(canvas, preds, x1, y1, x2, y2, feat_size=56, show_masks=True):
         overlay_mask(canvas, preds['iris_mask'], x1, y1, x2, y2,
                      COLOR_IRIS_MASK, alpha=0.45)
 
-    # 14 landmarks: feature space (56) → crop space → frame space
-    sx = crop_w / feat_size
-    sy = crop_h / feat_size
+    # 14 landmarks: feature space (feat_w, feat_h) → crop → frame
+    sx = crop_w / feat_w
+    sy = crop_h / feat_h
     lm_px = preds['landmarks'].copy()
     lm_px[:, 0] = lm_px[:, 0] * sx + x1
     lm_px[:, 1] = lm_px[:, 1] * sy + y1
@@ -527,9 +618,10 @@ def process_frame(model, device, frame, args, K_frame=None, ema=None):
         if crop.size == 0:
             continue
 
-        tensor = preprocess_crop(crop)
+        tensor = preprocess_crop(crop, img_size=args.img_size)
         face_bbox = mage_bbox_from_pixels(x1, y1, x2, y2, w, h, K_frame)
-        preds = run_inference(model, tensor, device, face_bbox=face_bbox)
+        preds = run_inference(model, tensor, device, face_bbox=face_bbox,
+                              aeri_alpha=args.aeri_alpha)
 
         # EMA on gaze and masks to damp model-output jitter
         if ema is not None:
@@ -669,15 +761,45 @@ def main():
     parser.add_argument('--output', type=str, default=None,
                         help='Save annotated image / video here')
 
-    parser.add_argument('--show_masks', action='store_true', default=True,
-                        help='Overlay AERI iris+eyeball masks (default on)')
+    # AERI mask overlay is OFF by default. The mask heads are only
+    # meaningful if the loaded checkpoint was trained with
+    # lam_iris_seg / lam_eyeball_seg > 0 — runs that defer those
+    # losses to an OpenEDS-only stage produce visually nonsense
+    # masks (firing over most of the face) because the head only
+    # gets weak indirect gradient through the gaze saliency gate.
+    parser.add_argument('--show_masks', action='store_true', default=False,
+                        help='Overlay AERI iris+eyeball masks. OFF by '
+                             'default — only set when the checkpoint '
+                             'was trained with non-zero lam_iris_seg/'
+                             'lam_eyeball_seg (i.e. an OpenEDS stage).')
     parser.add_argument('--no_masks', dest='show_masks',
                         action='store_false',
-                        help='Disable AERI mask overlay')
+                        help='(no-op alias; masks are off by default)')
+    parser.add_argument('--aeri_alpha', type=float, default=0.7,
+                        help='Strength of the AERI saliency gate that '
+                             'modulates gaze-branch features. Training '
+                             'ramped 0.4 (P1) → 0.7 (P2/P3); inference '
+                             'should match the value the checkpoint '
+                             'was trained against. Hardcoded 0.9 in '
+                             'earlier inference produced an out-of-'
+                             'distribution input to the gaze head.')
     parser.add_argument('--crop_factor', type=float, default=1.3,
                         help='Square-crop expansion factor on the '
                              'detected face box (default 1.3 — matches '
                              'GazeGene face crop)')
+    parser.add_argument('--img_size', type=int, default=224,
+                        choices=[224, 448],
+                        help='Face-crop side length fed to the model. '
+                             'Must match the --img_size used to train '
+                             'the loaded checkpoint. 224 produces a '
+                             '56×56 heatmap; 448 produces 112×112.')
+    parser.add_argument('--backbone', type=str, default='auto',
+                        choices=['auto', 'm1', 'm3'],
+                        help='RepNeXt variant for the four backbone '
+                             'instances. Must match the --backbone '
+                             'used at training time. "auto" probes a '
+                             'stage-3 weight in the checkpoint to '
+                             'detect M1 (384) vs M3 (512) automatically.')
 
     # Camera intrinsics — if omitted a heuristic default is used
     parser.add_argument('--fx', type=float, default=None,

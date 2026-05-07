@@ -125,7 +125,7 @@ PHASE_CONFIG = {
     # alongside. The gaze branch (encoder, fusion, GeometricGazeHead)
     # is frozen (.eval() + requires_grad_(False)) by `apply_phase_freeze`.
     1: {
-        'epochs': (1, 15),
+        'epochs': (1, 20),
         'lam_lm': 1.0,
         'lam_gaze': 0.0,        # gaze branch frozen
         'lam_gaze_sv': 0.0,
@@ -163,13 +163,18 @@ PHASE_CONFIG = {
         # Cosine decay from `lr` to `lr_min` over the phase, applied
         # multiplicatively to each param-group's initial LR (so the
         # backbone/head LR ratios from `lr_multipliers` are preserved
-        # all the way down). Floor at 1e-4 — the April reference held
-        # 1e-4–1e-3 throughout P1 and that's where landmark gains
-        # accumulated. Constant 1e-3 in run_20260505_210926 stalled at
-        # ~1.8 px because the model couldn't fine-tune past the
-        # initial coarse fit.
+        # all the way down).
+        #
+        # run_20260506_232527 retrospective: 15-epoch phase with
+        # 1e-3 → 1e-4 stalled val_landmark_px at 1.99 px (vs 1.81 px
+        # in the constant-1e-3 baseline). The 10× decay starved the
+        # last 5 epochs of optimisation energy precisely while sigma
+        # was tightening from 1.3 → 1.0 — the regime where sub-pixel
+        # gains are supposed to accumulate. Less-aggressive cosine
+        # (1e-3 → 3e-4 over 20 epochs) keeps the final LR usable
+        # while sigma reaches its sub-pixel target.
         'lr': 1e-3,
-        'lr_min': 1e-4,
+        'lr_min': 3e-4,
         # Per-epoch sigma anneal across the phase: heatmap GT tightens
         # from σ=2 (forgiving, geometry bootstrap) to σ=1 (sub-pixel
         # target). Linear interpolation in get_phase_config(epoch).
@@ -198,7 +203,7 @@ PHASE_CONFIG = {
     # the single-view pathway IS the supervision pathway — there is no
     # CrossViewAttention to bypass.
     2: {
-        'epochs': (16, 30),
+        'epochs': (21, 35),
         'lam_lm': 0.0,          # landmark frozen
         'lam_gaze': 2.0,        # supervises the FUSED gaze (mean-of-two)
         'lam_gaze_sv': 0.0,     # n_views==1 → pooled_sv == pooled, no SV side path
@@ -215,11 +220,14 @@ PHASE_CONFIG = {
         # 3DGazeNet M-target — vertex L1 + edge length L2 (paper ratios).
         'lam_iris_mesh': 0.1,   # 3DGazeNet λ_v
         'lam_iris_edge': 0.01,  # 3DGazeNet λ_e
-        # Mean-of-two: supervise both sub-heads so neither collapses.
-        # Half the fused-gaze weight each, so the combined effective
-        # weight on direction (geom + direct + fused) is 2.0+0.5+0.5 = 3.0.
-        'lam_gaze_geom': 0.5,
-        'lam_gaze_direct': 0.5,
+        # Mean-of-two: weak supervision on both sub-heads so neither
+        # collapses, but well below the fused-gaze weight so they don't
+        # shout over the fusion target. run_20260506_232527 saw 10°-
+        # amplitude oscillation in val_angular_deg attributable to the
+        # geom and direct sub-heads disagreeing while fused was the
+        # average; dropping each from 0.5 to 0.25 lets fused dominate.
+        'lam_gaze_geom': 0.25,
+        'lam_gaze_direct': 0.25,
         # Visual-axis (kappa-corrected) supervision on the GEOMETRIC
         # branch only — applies kappa to optical (= gaze_geom) and
         # supervises against gt_visual_axis. Off until P2 because
@@ -264,7 +272,7 @@ PHASE_CONFIG = {
     # of the gaze representation. Pose still trains (it has no shared
     # parameters with gaze beyond the detached s1 input).
     3: {
-        'epochs': (31, 50),
+        'epochs': (36, 55),
         'lam_lm': 0.0,          # landmark frozen — see freeze_set
         'lam_gaze': 2.0,        # fused gaze
         'lam_gaze_sv': 1.0,     # close train/val gap when CrossViewAttn is on
@@ -283,8 +291,8 @@ PHASE_CONFIG = {
         'lam_iris_mesh': 0.05,
         'lam_iris_edge': 0.005,
         # Mean-of-two sub-supervisions held at P2 levels.
-        'lam_gaze_geom': 0.5,
-        'lam_gaze_direct': 0.5,
+        'lam_gaze_geom': 0.25,
+        'lam_gaze_direct': 0.25,
         'lam_gaze_visual': 0.5,
         'lam_gaze_macro': 1.0,
         'lam_eyeball_radius': 0.2,
@@ -661,7 +669,14 @@ def build_phase_optimizer(model, cfg, log_fn=print):
         multipliers = raw_mult  # dict or None
     groups = build_param_groups(model, base_lr=cfg['lr'],
                                 multipliers=multipliers)
-    opt = optim.AdamW(groups, betas=(0.5, 0.95), weight_decay=1e-4)
+    # WD 5e-5 (down from 1e-4): in AdamW the per-step shrinkage is
+    # `lr * wd * param`, so at our LR floors (1e-4–3e-4) the absolute
+    # decay is already small. Halving WD is "less aggressive" without
+    # disabling regularisation entirely — keeps a token L2 floor for
+    # the gaze sub-heads (which are the only modules with enough new
+    # parameters for WD to matter) while letting the landmark heads
+    # converge to fine detail without unnecessary shrinkage.
+    opt = optim.AdamW(groups, betas=(0.5, 0.95), weight_decay=5e-5)
     if log_fn is not None:
         summary = ', '.join(
             f"{g['_group_name']}={g['lr']:.2e}({len(g['params'])}p)"
@@ -1279,13 +1294,40 @@ def _init_checkpoint_manager(args):
 
 def train(args):
     """Main training function."""
-    # Auto-cap --epochs to the last epoch defined in PHASE_CONFIG
-    stage_max_epoch = max(cfg['epochs'][1] for cfg in PHASE_CONFIG.values())
-    if args.epochs > stage_max_epoch:
-        print(f"[auto-cap] --epochs={args.epochs} exceeds the phase "
-              f"schedule max epoch ({stage_max_epoch}). Capping to "
-              f"{stage_max_epoch}.")
-        args.epochs = stage_max_epoch
+    # Resolve --epochs against PHASE_CONFIG.
+    # - Default (None) → run through the last phase end.
+    # - Above last_end → auto-cap (no later phases exist; harmless).
+    # - Below current/effective phase entry start → fail fast so
+    #   Phase 3 cannot be silently skipped (the failure mode in
+    #   run_20260506_232527, where --epochs=30 ended training before
+    #   Phase 3 epoch 36 began).
+    last_end = max(cfg['epochs'][1] for cfg in PHASE_CONFIG.values())
+
+    if args.epochs is None:
+        args.epochs = last_end
+        print(f"[epochs] --epochs unset; defaulting to last phase end "
+              f"({last_end}).")
+    elif args.epochs > last_end:
+        print(f"[auto-cap] --epochs={args.epochs} exceeds last phase "
+              f"end ({last_end}); capping to {last_end}.")
+        args.epochs = last_end
+
+    # If the user has selected a warmstart phase, the run cannot
+    # complete unless --epochs reaches that phase's end. Refuse
+    # quietly-broken configs.
+    if args.warmstart_phase is not None:
+        ws_phase = PHASE_CONFIG[args.warmstart_phase]
+        ws_start, ws_end = ws_phase['epochs']
+        if args.epochs < ws_start:
+            raise SystemExit(
+                f"--warmstart_phase={args.warmstart_phase} starts at "
+                f"epoch {ws_start}, but --epochs={args.epochs} would "
+                f"exit before training begins. Set --epochs to at "
+                f"least {ws_end} to complete the phase, or "
+                f"{last_end} to run through Phase 3.")
+        if args.epochs < ws_end:
+            print(f"[warn] --epochs={args.epochs} stops mid-phase "
+                  f"{args.warmstart_phase} (ends at {ws_end}).")
 
     # HuggingFace Accelerate — handles DDP wrapping, rank-aware dataloaders,
     # and multi-node orchestration. AMP (autocast + GradScaler) is still
@@ -2164,7 +2206,14 @@ def parse_args():
 
     # Overrides (None = use profile default)
     parser.add_argument('--batch_size', type=int, default=None)
-    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument(
+        '--epochs', type=int, default=None,
+        help='Total training epochs. Default = last phase end in '
+             'PHASE_CONFIG (currently 55). Pass a smaller value to stop '
+             'training early; a value below the current phase end will '
+             'be rejected at startup so Phase 3 cannot be silently '
+             'skipped (run_20260506_232527 ended at epoch 30 with '
+             'Phase 3 unstarted because --epochs=30 < phase3_start=36).')
     parser.add_argument('--num_workers', type=int, default=None)
     parser.add_argument('--mv_groups', type=int, default=None,
                         help='Multi-view batch groups. Raw fetch = mv_groups * 9 '
