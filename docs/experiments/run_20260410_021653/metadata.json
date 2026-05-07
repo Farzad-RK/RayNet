@@ -1,0 +1,300 @@
+{
+  "run_id": "run_20260410_021653",
+  "created_at": "2026-04-10T02:16:54.154668+00:00",
+  "epochs": {
+    "1": {
+      "epoch": 1,
+      "phase": 1,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-10T02:39:36.848899+00:00",
+      "train_metrics": {
+        "total": 5.404358653918557,
+        "landmark": 0.0011545969072081473,
+        "angular": 1.545490950345993,
+        "angular_deg": 88.55010994620945,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.8025656245324922,
+        "translation": 2.764519726128682
+      },
+      "val_metrics": {
+        "total": 2.362008476257324,
+        "landmark": 0.0007531914612627588,
+        "angular": 0.7421468704938888,
+        "angular_deg": 42.52188415527344,
+        "landmark_px": 13.828713202476502,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "2": {
+      "epoch": 2,
+      "phase": 1,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-10T02:50:34.776231+00:00",
+      "train_metrics": {
+        "total": 4.019612817660622,
+        "landmark": 0.0008619406998268855,
+        "angular": 1.5701572590548059,
+        "angular_deg": 89.96338508440101,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.7393819229758304,
+        "translation": 1.8937515439870565
+      },
+      "val_metrics": {
+        "total": 2.460555058717728,
+        "landmark": 0.0007846157590392977,
+        "angular": 0.7422130718827248,
+        "angular_deg": 42.525677013397214,
+        "landmark_px": 14.375281429290771,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "3": {
+      "epoch": 3,
+      "phase": 1,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-10T03:01:35.286673+00:00",
+      "train_metrics": {
+        "total": 4.29033086610877,
+        "landmark": 0.0009465609859351231,
+        "angular": 1.5695322842701622,
+        "angular_deg": 89.9275769358096,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.7401382544118426,
+        "translation": 1.9036928229033947
+      },
+      "val_metrics": {
+        "total": 2.4605344593524934,
+        "landmark": 0.0007846091873943805,
+        "angular": 0.7422319993376731,
+        "angular_deg": 42.5267614364624,
+        "landmark_px": 14.378565883636474,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "4": {
+      "epoch": 4,
+      "phase": 1,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-10T03:12:42.024093+00:00",
+      "train_metrics": {
+        "total": 4.293320237294488,
+        "landmark": 0.0009487481384776006,
+        "angular": 1.5702873235163481,
+        "angular_deg": 89.97083755161451,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.7386142792909042,
+        "translation": 1.897477747467549
+      },
+      "val_metrics": {
+        "total": 2.458167630434036,
+        "landmark": 0.0007838544537662528,
+        "angular": 0.7422421783208847,
+        "angular_deg": 42.52734460830688,
+        "landmark_px": 14.364185428619384,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "5": {
+      "epoch": 5,
+      "phase": 1,
+      "filename": "checkpoint_epoch5.pt",
+      "saved_at": "2026-04-10T03:24:52.778433+00:00",
+      "train_metrics": {
+        "total": 4.284495198208353,
+        "landmark": 0.0009465858564236323,
+        "angular": 1.5697795651529147,
+        "angular_deg": 89.94174476291822,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.7403000052208486,
+        "translation": 1.8917037844657898
+      },
+      "val_metrics": {
+        "total": 2.461514574289322,
+        "landmark": 0.0007849217232433148,
+        "angular": 0.7422521725296974,
+        "angular_deg": 42.527917289733885,
+        "landmark_px": 14.381563115119935,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "6": {
+      "epoch": 6,
+      "phase": 1,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-10T03:35:59.149368+00:00",
+      "train_metrics": {
+        "total": 4.277860045433044,
+        "landmark": 0.0009444365195636435,
+        "angular": 1.5685285349255023,
+        "angular_deg": 89.87006585494332,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.7395784955309785,
+        "translation": 1.8926356219403122
+      },
+      "val_metrics": {
+        "total": 2.4618534684181212,
+        "landmark": 0.0007850297886761836,
+        "angular": 0.7422260954976082,
+        "angular_deg": 42.52642307281494,
+        "landmark_px": 14.377824592590333,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "7": {
+      "epoch": 7,
+      "phase": 1,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-10T03:47:07.400833+00:00",
+      "train_metrics": {
+        "total": 4.289803521788639,
+        "landmark": 0.000946590689557564,
+        "angular": 1.5659545018621113,
+        "angular_deg": 89.72258472442627,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": 0.7391868107344793,
+        "translation": 1.903403303221516
+      },
+      "val_metrics": {
+        "total": 2.46283420920372,
+        "landmark": 0.0007853425282519311,
+        "angular": 0.7422397494316101,
+        "angular_deg": 42.52720575332641,
+        "landmark_px": 14.388244891166687,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    },
+    "8": {
+      "epoch": 8,
+      "phase": 1,
+      "filename": "latest.pt",
+      "saved_at": "2026-04-10T03:59:04.528456+00:00",
+      "train_metrics": {
+        "total": 4.362903754922408,
+        "landmark": 0.0009557691054960972,
+        "angular": 1.5744664306882061,
+        "angular_deg": 90.21028243439108,
+        "reproj": 0.0,
+        "mask": 0.0,
+        "ray_target": 0.0,
+        "pose": NaN,
+        "translation": NaN
+      },
+      "val_metrics": {
+        "total": 0.0,
+        "landmark": 0.0,
+        "angular": 0.0,
+        "angular_deg": 0.0,
+        "landmark_px": 0.0,
+        "pose": 0.0,
+        "ray": 0.0,
+        "translation": 0.0
+      }
+    }
+  },
+  "best": {
+    "epoch": 8,
+    "val_loss": 0.0,
+    "val_metrics": {
+      "total": 0.0,
+      "landmark": 0.0,
+      "angular": 0.0,
+      "angular_deg": 0.0,
+      "landmark_px": 0.0,
+      "pose": 0.0,
+      "ray": 0.0,
+      "translation": 0.0
+    },
+    "saved_at": "2026-04-10T03:58:05.417709+00:00"
+  },
+  "config": {
+    "stage": 1,
+    "profile": "l4",
+    "core_backbone": "repnext_m3",
+    "pose_backbone": "repnext_m1",
+    "epochs": 20,
+    "eye": "L",
+    "hardware": {
+      "batch_size": 288,
+      "mv_groups": 32,
+      "num_workers": 8,
+      "pin_memory": true,
+      "amp": true,
+      "amp_dtype": "float16",
+      "grad_accum_steps": 1,
+      "compile_model": true,
+      "tf32": true,
+      "prefetch_factor": 2,
+      "persistent_workers": true
+    },
+    "phase_config": {
+      "1": {
+        "epochs": [
+          1,
+          10
+        ],
+        "lam_lm": 1.0,
+        "lam_gaze": 0.0,
+        "lam_reproj": 0.0,
+        "lam_mask": 0.0,
+        "lam_ray": 0.0,
+        "lam_pose": 0.5,
+        "lam_trans": 0.5,
+        "lr": 0.001,
+        "sigma": 2.0,
+        "multiview": false,
+        "no_bridge": true
+      },
+      "2": {
+        "epochs": [
+          11,
+          20
+        ],
+        "lam_lm": 1.0,
+        "lam_gaze": 0.0,
+        "lam_reproj": 0.0,
+        "lam_mask": 0.0,
+        "lam_ray": 0.0,
+        "lam_pose": 1.0,
+        "lam_trans": 1.0,
+        "lr": 0.0003,
+        "sigma": 1.5,
+        "multiview": false,
+        "no_bridge": true
+      }
+    },
+    "streaming": false,
+    "dataset_url": null,
+    "data_dir": null,
+    "core_backbone_weight_path": "../repnext_m3_distill_300e.pth",
+    "pose_backbone_weight_path": "../repnext_m1_distill_300e.pth",
+    "started_at": "2026-04-10T02:16:56.333411"
+  }
+}
