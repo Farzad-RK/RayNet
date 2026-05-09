@@ -64,52 +64,28 @@ def landmark_loss(pred_hm, pred_coords, gt_coords, feat_H, feat_W, sigma=2.0):
     return hm_loss + coord_loss
 
 
-def angular_loss(pred_gaze, gt_gaze):
-    """
-    Angular error loss in radians. L1 on angle -- more robust than cosine
-    for large errors early in training.
-
-    Args:
-        pred_gaze: (B, 3) predicted gaze direction (unit vector)
-        gt_gaze: (B, 3) ground-truth gaze direction (unit vector)
-
-    Returns:
-        loss: scalar tensor (mean angular error in radians)
-    """
-    cos_sim = F.cosine_similarity(pred_gaze, gt_gaze, dim=-1).clamp(-1.0, 1.0)
-    return torch.acos(cos_sim).mean()
-
-
-def total_loss(pred_hm, pred_coords, pred_gaze,
-               gt_coords, gt_gaze,
+def total_loss(pred_hm, pred_coords,
+               gt_coords,
                feat_H, feat_W,
-               lam_lm=1.0, lam_gaze=0.5, sigma=2.0):
+               lam_lm=1.0, sigma=2.0):
     """
     Total training loss combining landmarks and gaze.
 
     Args:
         pred_hm: (B, N, H, W) predicted logit heatmaps
         pred_coords: (B, N, 2) predicted landmark coordinates
-        pred_gaze: (B, 3) predicted optical axis (unit vector)
         gt_coords: (B, N, 2) GT landmark coordinates in feature map space
-        gt_gaze: (B, 3) GT optical axis (unit vector)
         feat_H, feat_W: feature map spatial dims
         lam_lm: landmark loss weight
-        lam_gaze: gaze loss weight
         sigma: heatmap Gaussian sigma
-
     Returns:
         total: scalar loss
         components: dict of individual loss values (detached, for logging)
     """
     lm = landmark_loss(pred_hm, pred_coords, gt_coords, feat_H, feat_W, sigma)
-    gz = angular_loss(pred_gaze, gt_gaze)
-    total = lam_lm * lm + lam_gaze * gz
-
+    total = lam_lm * lm
     components = {
         'landmark_loss': lm.detach(),
-        'angular_loss': gz.detach(),
-        'angular_loss_deg': torch.rad2deg(gz.detach()),
         'total_loss': total.detach(),
     }
     return total, components
