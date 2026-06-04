@@ -152,6 +152,73 @@ python test.py --backbone_type repnext_m4 --snapshot path/to/model.pth
 
 Available backbone types: `RepVGG-B1g2`, `repnext_m0`, `repnext_m1`, `repnext_m2`, `repnext_m3`, `repnext_m4`, `repnext_m5`.
 
+### For ONNX Export (`export_onnx.py`, run from the repo root):
+
+```bash
+python export_onnx.py --sixdrepnet \
+  --weights sixdrepnet/pretrained_models/repnext_m4/myexp_epoch_80.tar \
+  --backbone repnext_m4 \
+  --output sixdrepnet/pretrained_models/repnext_m4/head_pose_repnext_m4.onnx
+```
+
+The exported graph takes a `(N, 3, 224, 224)` ImageNet-normalized RGB tensor
+(same preprocessing as `demo.py`: `Resize(224)` → `CenterCrop(224)` → `ToTensor`
+→ ImageNet mean/std) and returns two outputs:
+
+* `rotation_matrix` — `(N, 3, 3)` head→camera rotation, and
+* `euler_angles` — `(N, 3)` = pitch, yaw, roll in **radians**.
+
+Key behaviours (important for mobile):
+
+* **`deploy=True` by default.** The model is built in the **reparameterized
+  (fused-conv)** structure — matching how the training checkpoints are saved and
+  what we want on device (fewer ops, lower latency). Use `--no-deploy` only to
+  export the unfused training graph. Loading is non-strict: the only expected
+  missing keys are the unused RepNeXt classifier head (`backbone.head.*`); any
+  other missing key hard-fails rather than exporting a half-initialized model.
+* **Parity check is automatic.** After export the script runs the PyTorch model
+  and the ONNX graph (ONNX Runtime) on identical random inputs and asserts the
+  max absolute difference is below `--parity-atol` (default `1e-4`; typical
+  observed ≈ `1e-6`). It refuses to bless a model that doesn't match. Disable
+  with `--no-verify`.
+* **Opset is honored exactly.** The script uses the legacy TorchScript exporter,
+  which emits precisely `--opset` (default `12`) — unlike the Torch 2.x dynamo
+  exporter, which emits opset 18 and silently fails to down-convert. (The legacy
+  exporter is deprecated in Torch ≥ 2.9 but still functional; if it is ever
+  removed, switch to `dynamo=True` and target opset ≥ 18.)
+
+**Mobile artifact (`--mobile`).** For ONNX Runtime Mobile, add `--mobile` to emit
+a leaner, device-ready graph and a `.ort` flatbuffer:
+
+```bash
+python export_onnx.py --sixdrepnet --mobile \
+  --weights sixdrepnet/pretrained_models/repnext_m4/myexp_epoch_80.tar \
+  --backbone repnext_m4 \
+  --output sixdrepnet/pretrained_models/repnext_m4/head_pose_repnext_m4_mobile.onnx
+```
+
+This (1) fixes the batch to **static 1** (no dynamic axes), so the dynamic-shape
+ops constant-fold away; (2) outputs **only the rotation matrix** — dropping the
+`euler_angles` output removes the mobile-awkward `ScatterND`/`Atan` ops (the
+device pipeline smooths in quaternion space and warps with R, never needing
+Euler); (3) runs `onnxsim` (**1878 → ~803 nodes**); and (4) converts to a `.ort`
+flatbuffer with mobile-safe ('Fixed') optimizations, also writing a
+`*.required_operators.config` for building a reduced-operator ORT if you want the
+smallest binary. Parity is checked before conversion (observed ≈ 1e-6). Requires
+`onnxsim` in addition to the deps above. We chose **ONNX Runtime Mobile over
+TFLite**: the graph's `ScatterND`/dynamic-shape/reparam-conv ops are exactly what
+ONNX→TFLite converters tend to break on, and one `.ort` ships to both Android and
+iOS.
+
+**Mobile pipeline note.** Only the head-pose net goes through ONNX. The full
+on-device eye-patch pipeline is three stages: (1) MediaPipe Face Landmarker
+(TFLite, native on Android/iOS) for canthi + iris landmarks; (2) this ONNX
+head-pose model; (3) the One Euro smoothing + data-normalization homography warp
+from `eye_norm.py`, which is pure linear algebra to reimplement with
+OpenCV-mobile `warpPerspective`. See `eye_norm.py` for the warp math.
+
+Requires `onnx`, `onnxruntime`, and `onnxscript` (`pip install onnx onnxruntime onnxscript`).
+
 ---
 
 ## 5. Hypothesis

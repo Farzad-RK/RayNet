@@ -61,3 +61,4 @@ checkpoints/
 # Local development
 .DS_Store
 Thumbs.db
+/sixdrepnet/3DeepVOG-main/
