@@ -403,6 +403,119 @@ class GazeEstimationExporter(ModelExporter):
 
 
 
+class SegVOGExporter(ModelExporter):
+    """
+    Exporter for the 3DeepVOG eye-feature SEGMENTATION net (the only ML model in
+    the gaze stage). Mirrors the SixDRepNet mobile path: static batch=1, sigmoid
+    baked in, onnxsim fold, .ort flatbuffer + parity check.
+
+    Default is SegResNet (MONAI, conv-only, ~6 MB) — the mobile-friendly backbone.
+    SegFormer-B0 is a transformer (heavier, more mobile-awkward ops) and is NOT
+    exported here by default; add it only if the accuracy gap justifies the cost.
+
+    Graph contract (what the Kotlin side must feed / read):
+      * INPUT  `input`  : (1, 3, 240, 320) float32. The 320x240 (WxH) eye patch,
+        converted to grayscale, min-max scaled to [0,1] (MONAI ScaleIntensity),
+        and the single channel REPEATED to 3 (MONAI Gray2Rgb). Do this in Kotlin.
+      * OUTPUT `seg`    : (1, 3, 240, 320) float32 in [0,1] AFTER sigmoid (baked
+        in here). Channel order: 0=pupil, 1=iris, 2=sclera. Threshold at 0.5.
+    """
+
+    # Exact config of SegResNet_3in3out_model() in
+    # threedeepvog/models/segmentation_model.py — must match the checkpoint.
+    _SEGRESNET_KW = dict(spatial_dims=2, in_channels=3, out_channels=3,
+                         init_filters=16, norm="batch", dropout_prob=0.2)
+
+    @staticmethod
+    def load_model(weights_path: str) -> nn.Module:
+        try:
+            import monai  # noqa: F401
+            from monai.networks.nets import SegResNet
+        except ImportError as e:
+            raise RuntimeError(
+                "MONAI is required to build SegResNet for export "
+                "(pip install monai). Original error: %s" % e)
+        model = SegResNet(**SegVOGExporter._SEGRESNET_KW)
+        state_dict = torch.load(weights_path, map_location="cpu",
+                                weights_only=False)
+        if isinstance(state_dict, dict) and "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            raise RuntimeError(
+                "SegResNet weights failed to load (missing keys: %s)." % missing)
+        if unexpected:
+            print("WARNING: unexpected keys ignored:", unexpected)
+        print("Loaded SegResNet weights (strict on missing).")
+        model.eval()
+        return model
+
+    @staticmethod
+    def export_mobile(
+        weights_path: str,
+        output_path: str,
+        input_shape: Tuple[int, int, int] = (3, 240, 320),
+        opset_version: int = 12,
+        parity_atol: float = 1e-4,
+        simplify: bool = True,
+    ) -> Tuple[str, str]:
+        """Export a mobile-ready SegResNet (.ort) — same recipe as the head pose."""
+        model = SegVOGExporter.load_model(weights_path)
+
+        class SigmoidSeg(nn.Module):
+            """Bake the sigmoid in so the device just thresholds the output."""
+            def __init__(self, m):
+                super().__init__()
+                self.m = m
+
+            def forward(self, x):
+                return torch.sigmoid(self.m(x))  # (1,3,240,320) in [0,1]
+
+        wrapped = SigmoidSeg(model).eval()
+
+        torch.onnx.export(
+            wrapped,
+            torch.randn(1, *input_shape),
+            output_path,
+            input_names=["input"],
+            output_names=["seg"],
+            opset_version=opset_version,
+            dynamo=False,
+        )
+        m = onnx.load(output_path)
+        onnx.checker.check_model(m)
+        n_raw = len(m.graph.node)
+        print(f"Exported static seg graph at opset "
+              f"{m.opset_import[0].version}: {n_raw} nodes")
+
+        if simplify:
+            try:
+                from onnxsim import simplify as onnxsim_simplify
+                sm, ok = onnxsim_simplify(m)
+                if ok:
+                    onnx.save(sm, output_path)
+                    print(f"onnxsim: {n_raw} -> {len(sm.graph.node)} nodes")
+                else:
+                    print("WARNING: onnxsim validation failed; keeping raw graph.")
+            except ImportError:
+                print("WARNING: onnxsim not installed; shipping unsimplified graph.")
+
+        verify_parity(wrapped, output_path, input_shape,
+                      output_names=["seg"], atol=parity_atol)
+
+        ort_path = os.path.splitext(output_path)[0] + ".ort"
+        print("Converting to ORT format (.ort, optimization_style=Fixed) ...")
+        subprocess.run(
+            [sys.executable, "-m",
+             "onnxruntime.tools.convert_onnx_models_to_ort",
+             output_path, "--optimization_style", "Fixed"],
+            check=True,
+        )
+        print(f"Mobile artifacts:\n  ONNX: {output_path}\n  ORT : {ort_path}")
+        return output_path, ort_path
+
+
 def verify_parity(torch_model: nn.Module, onnx_path: str,
                   input_shape: Tuple[int, ...], output_names: list,
                   n: int = 8, atol: float = 1e-4) -> Dict[str, float]:
@@ -451,6 +564,10 @@ def parse_args():
     model_group = parser.add_mutually_exclusive_group(required=True)
     model_group.add_argument('--sixdrepnet', action='store_true', help='Export SixDRepNet model')
     model_group.add_argument('--gaze-estimation', action='store_true', help='Export Gaze Estimation model')
+    model_group.add_argument('--segvog', action='store_true',
+                             help='Export the 3DeepVOG segmentation net (SegResNet) '
+                                  'for mobile (.ort). Implies a 240x320 seg graph; '
+                                  '--mobile recipe is always used.')
     
     # Model parameters
     parser.add_argument('--weights', type=str, required=True, help='Path to model weights')
@@ -519,6 +636,23 @@ def main():
                 )
                 print(f"SixDRepNet model exported to: {output_path}")
             
+        elif args.segvog:
+            # SegVOG defaults to a 240x320 input if the caller left the
+            # head-pose default (3,224,224) in place.
+            shape = tuple(args.input_shape)
+            if shape == (3, 224, 224):
+                shape = (3, 240, 320)
+            print(f"Exporting 3DeepVOG SegResNet (mobile .ort), input {shape}")
+            onnx_path, ort_path = SegVOGExporter.export_mobile(
+                weights_path=args.weights,
+                output_path=args.output,
+                input_shape=shape,
+                opset_version=args.opset,
+                parity_atol=args.parity_atol,
+                simplify=args.simplify,
+            )
+            print(f"SegVOG mobile model exported to: {ort_path}")
+
         elif args.gaze_estimation:
             print(f"Exporting Gaze Estimation model with backbone: {args.backbone}")
             output_path = GazeEstimationExporter.export(
